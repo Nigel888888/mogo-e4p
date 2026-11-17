@@ -21,7 +21,8 @@
 #define BOOK_VOCAB_DEF_MAX       1024
 #define BOOK_VOCAB_EXAMPLE_MAX    768
 #define BOOK_VOCAB_BOOK_MAX       160
-#define BOOK_VOCAB_MAX_ITEMS      512
+/* 列表常驻 PSRAM：单条约 2.2 KB，256 条约 560 KB。/ The list lives in PSRAM: ~2.2 KB per entry, 256 entries ≈ 560 KB. */
+#define BOOK_VOCAB_MAX_ITEMS      256
 
 typedef enum {
     BOOK_VOCABULARY_SAVED = 0,     ///< 新写入 / newly appended
