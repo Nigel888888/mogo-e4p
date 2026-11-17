@@ -179,7 +179,9 @@ static void render_detail(uint8_t *fb) {
     }
     unsigned detail_pages = (s_line_count + V_DETAIL_PER_PAGE - 1) / V_DETAIL_PER_PAGE;
     char meta[96];
-    snprintf(meta, sizeof(meta), "第%u章 · 第%u/%u页", it->chapter, s_selected + 1,
+    /* S31 上 uint32_t 是 long unsigned int，%u 会触发 -Werror=format；统一转成 unsigned long。
+     * On S31 uint32_t is long unsigned int, so %u trips -Werror=format; cast to unsigned long. */
+    snprintf(meta, sizeof(meta), "第%lu章 · 第%u/%u页", (unsigned long)it->chapter, s_selected + 1,
              detail_pages ? detail_pages : 1);
     ui_text_fixed(fb, 40, 900, 26, meta, EPD_DRAW_ALIGN_LEFT, false);
     ui_draw_button(fb, (EpdRect)V_BTN_DEL, "删除", false);
