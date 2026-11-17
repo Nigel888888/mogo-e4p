@@ -29,6 +29,22 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
           idf.py --preview size
+      # 生词本定制：保存可刷机固件。放在回归测试之前，确保测试失败也能取到固件。
+      - name: Save firmware artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mogo-vocabulary-firmware
+          if-no-files-found: error
+          path: |
+            build/Read_Pico.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/ota_data_initial.bin
+            build/flasher_args.json
+            build/flash_args
+            build/config/sdkconfig.h
+            build/project_description.json
 
       - name: Prepare strict host compiler
         shell: bash
