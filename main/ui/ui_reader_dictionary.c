@@ -135,7 +135,12 @@ size_t ui_reader_dictionary_page_end(const book_dictionary_result_t *r, size_t o
 int ui_reader_dictionary_action(const ui_reader_dictionary_t *v, int x, int y) {
     if (!v->open) return -1;
     if (y < v->top || y >= v->top + 584) return 0;
-    if (x >= 540 && y < v->top + 82) return 0;
+    /* 标题行右侧：保存按钮与关闭按钮分区。/ Title row: collect button left of the close button. */
+    if (y < v->top + 82) {
+        if (x >= 540) return 0;
+        if (x >= 445) return 4;
+        return -1;
+    }
     if (y >= v->top + 472 && y < v->top + 536) {
         if (!v->can_browse) return -1;
         return x < 228 ? 1 : x >= 456 ? 2 : 3;
@@ -150,8 +155,11 @@ void ui_reader_dictionary_draw(uint8_t *fb, const ui_reader_dictionary_t *v,
     ui_fill_rect_fast((EpdRect){0,top,UI_LOCK_WIDTH,584},UI_GRAY_WHITE,fb);
     ui_draw_separator(fb,top,0,UI_LOCK_WIDTH,UI_GRAY_BLACK);
     char title[320]; snprintf(title,sizeof(title),"%s",query);
-    while (ttf_text_width_px(42,title)>490 && strlen(title)>3) { size_t n=strlen(title)-1;while(n&&((unsigned char)title[n]&0xc0)==0x80)--n;title[n]=0; }
-    text(fb,40,top+22,42,title);text(fb,570,top+28,28,"关闭");
+    /* 标题让位于右上角的“保存/已存”与“关闭”。/ Reserve the title row's right edge for collect and close. */
+    while (ttf_text_width_px(42,title)>388 && strlen(title)>3) { size_t n=strlen(title)-1;while(n&&((unsigned char)title[n]&0xc0)==0x80)--n;title[n]=0; }
+    text(fb,40,top+22,42,title);
+    text(fb,455,top+28,28,v->saved?"已存":"保存");
+    text(fb,570,top+28,28,"关闭");
     char codes[192]="";
     if (!ttf_font_has_text(query)) {
         const unsigned char *q=(const unsigned char *)query;size_t n=0;

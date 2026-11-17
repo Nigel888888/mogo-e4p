@@ -176,6 +176,7 @@
  */
 #include "../book/reader_selection.h"
 #include "../book/reader_dictionary.h"
+#include "../book/book_vocabulary.h"
 #include "../ui/ui_reader_dictionary.h"
 #include "../diagnostics/reader_perf.h"
 #include "../diagnostics/reader_memory.h"
@@ -7075,6 +7076,39 @@ static void dictionary_query(const char *query) {
     s_dictionary_view.open = true; s_dictionary_view.offset = 0;
     s_dictionary_history_count = 0;
     s_dictionary_chapter = s_reader_session.position.chapter;
+    /* 收藏态只读查询；文件缺失或 IO 失败按未收藏处理。/ Read-only membership check; missing file means not collected. */
+    s_dictionary_view.saved = book_vocabulary_contains(saved);
+}
+/* 一键收藏当前查词结果；反馈走阅读提示条，不打断查词卡片。/ One-tap collect of the current lookup; feedback uses the reader notice without dismissing the sheet. */
+static void dictionary_save(void) {
+    if (usb_storage_active()) {
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "USB 传输中，暂不能收藏");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+        return;
+    }
+    const char *query = s_dictionary_result.query[0] ? s_dictionary_result.query : s_dictionary_selection.query;
+    if (!query[0]) return;
+    book_vocabulary_entry_t entry = {
+        .query = query,
+        .reading = s_dictionary_result.reading,
+        .definition = s_dictionary_result.definition,
+        .example = s_dictionary_result.example,
+        .book = s_reader_session.book.title[0] ? s_reader_session.book.title : NULL,
+        .chapter = (uint32_t)s_dictionary_chapter,
+    };
+    book_vocabulary_status_t status = book_vocabulary_save(&entry);
+    if (status == BOOK_VOCABULARY_SAVED) {
+        s_dictionary_view.saved = true;
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "已加入生词本");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 1600;
+    } else if (status == BOOK_VOCABULARY_DUPLICATE) {
+        s_dictionary_view.saved = true;
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "已在生词本中");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 1600;
+    } else {
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "收藏失败，请检查 TF 卡");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+    }
 }
 static EpdRect dictionary_union(EpdRect a, EpdRect b) {
     int right = a.x + a.width > b.x + b.width ? a.x + a.width : b.x + b.width;
@@ -7167,6 +7201,8 @@ static app_redraw_t dictionary_gesture(app_ctx_t *ctx, const ui_gesture_event_t 
             s_dictionary_character = reader_selection_character(s_dictionary_selection.query, s_dictionary_character, one);
             if (!one[0]) return APP_REDRAW_NONE;
             dictionary_query(one);
+        } else if (action == 4) {
+            dictionary_save();
         } else return APP_REDRAW_NONE;
         return APP_REDRAW_PAGE;
     }

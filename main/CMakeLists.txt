@@ -200,6 +200,7 @@ idf_component_register(
         "book/book_title.c"
         "book/book_ticket.c"
         "book/book_excerpt.c"
+        "book/book_vocabulary.c"
         "book/book_lock_collage.c"
         "book/book_lock_bookmark.c"
         "book/book_source.c"
