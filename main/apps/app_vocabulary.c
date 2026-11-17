@@ -11,6 +11,7 @@
 #include "ui_kit.h"
 #include "ui_menu.h"
 #include "ui_nav.h"
+#include "esp_attr.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -120,7 +121,9 @@ static void render_list(uint8_t *fb) {
 /* 详情把释义+例句拼成一个数组，按屏分页。/ Detail flattens definition+example into paged lines. */
 #define V_DETAIL_MAX_LINES 48
 #define V_DETAIL_LINE_BUF 128  /* 42 汉字 ≈ 126 字节 UTF-8 */
-static char s_lines[V_DETAIL_MAX_LINES][V_DETAIL_LINE_BUF];
+/* 6 KB 静态数组放片外 RAM：片内 RAM 只剩几 KB，放这里会挤爆链接期的 iram0 预算。
+ * 6 KB of static data goes to external RAM; internal RAM has no room left in the iram0 budget. */
+static EXT_RAM_BSS_ATTR char s_lines[V_DETAIL_MAX_LINES][V_DETAIL_LINE_BUF];
 static unsigned s_line_count;
 
 static void build_detail(const book_vocabulary_item_t *it) {
