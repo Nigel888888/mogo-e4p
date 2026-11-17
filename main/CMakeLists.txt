@@ -169,6 +169,7 @@ idf_component_register(
         "apps/app_dashboard.c"
         "apps/app_components.c"
         "apps/app_reading_journal.c"
+        "apps/app_vocabulary.c"
         "apps/app_files.c"
         "apps/file_tree.c"
         "apps/app_device_settings.c"
