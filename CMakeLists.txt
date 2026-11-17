@@ -1,44 +1,274 @@
-# The following lines of boilerplate have to be in your project's
-# CMakeLists in this exact order for cmake to work correctly
-cmake_minimum_required(VERSION 3.22)
-
-include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-# "Trim" the build. Include the minimal set of components, main, and anything it depends on.
-idf_build_set_property(MINIMAL_BUILD ON)
-
-# 本地测试沿用当前正式版号；仅正式发布或明确的 OTA 验证指定新版本。
-# Local tests keep the current release version; override only for publication or explicit OTA validation.
-if(DEFINED ENV{PICO_PROJECT_VER} AND NOT "$ENV{PICO_PROJECT_VER}" STREQUAL "")
-    set(PROJECT_VER "$ENV{PICO_PROJECT_VER}")
-else()
-    set(PROJECT_VER "1.1.3")
+# 产品只支持 S31；在组件依赖解析时拒绝其他目标，避免使用不匹配的板级配置。
+# The product supports S31 only; reject other targets during dependency discovery before selecting incompatible board settings.
+if(NOT IDF_TARGET STREQUAL "esp32s31")
+    message(FATAL_ERROR "mogo E-INK4 Plus requires IDF_TARGET=esp32s31")
 endif()
-project(Read_Pico)
 
-# 中文：检查最终链接位置，防止升级 SDK 或改动链接布局后重现缓存关闭时取指崩溃。
-# English: Check final placement to catch cache-off instruction fetch regressions after SDK/layout changes.
-idf_build_get_property(cache_check_python PYTHON)
-add_custom_command(TARGET ${CMAKE_PROJECT_NAME}.elf POST_BUILD
-    COMMAND "${cache_check_python}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_s31_cache_safe.py"
-        --objdump "${CMAKE_OBJDUMP}" --elf "$<TARGET_FILE:${CMAKE_PROJECT_NAME}.elf>"
-    VERBATIM)
-set_property(TARGET ${CMAKE_PROJECT_NAME}.elf APPEND PROPERTY LINK_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_s31_cache_safe.py")
+set(main_requires
+    http_parser
+    board_support
+    frontlight
+    wifi_transfer
+    book_search
+    mobi_codec
+    espressif__qrcode
+    espressif__esp_jpeg
+    # 渐进式 JPEG；基线仍走 esp_jpeg。/ Progressive JPEG; baseline stays on esp_jpeg.
+    jpegdec
+    espressif__libpng
+    webp_decoder
+    espressif__zlib
+    espressif__esp_tinyusb
+    # BLE HID 主机（蓝牙翻页器）。本仓库开了 MINIMAL_BUILD，组件不进依赖图的话连它的
+    # Kconfig 都不会加载，sdkconfig.defaults 里的 CONFIG_BT_* 会被判为未知符号而丢弃。
+    # BLE HID host (Bluetooth page-turner). This tree sets MINIMAL_BUILD, so a component
+    # outside the dependency graph does not even load its Kconfig and the CONFIG_BT_*
+    # entries in sdkconfig.defaults are dropped as unknown symbols.
+    bt
+    # 蓝牙翻页器本体。/ The page-turner itself.
+    ble_page_turner
+    e0470_epaper_waveform
+    e0470_page_turn
+    device_power
+    fatfs
+    wear_levelling
+    bootloader_support
+    spi_flash
+    heap
+    nvs_flash
+    esp_hw_support
+    esp_rom
+    esp_driver_gpio
+    esp_driver_usb_serial_jtag
+    esp_driver_jpeg
+    esp_app_format
+    app_update
+    esp_http_client
+    esp-tls
+    mbedtls
+    espressif__cjson
+    78__uart-uhci
+    espressif__iot_eth
+)
 
-# 固件描述时间统一为 UTC，与概览页标识一致；保留已有编译缓存启动器。
-# Compile app-description timestamps in UTC to match Overview; preserve any compiler-cache launcher.
-idf_component_get_property(app_desc_lib esp_app_format COMPONENT_LIB)
-get_target_property(app_desc_launcher ${app_desc_lib} C_COMPILER_LAUNCHER)
-if(NOT app_desc_launcher)
-    set(app_desc_launcher "")
+# One OTA image carries the modem transport on both hardware variants. The
+# service performs an asynchronous AT probe and hides cellular when absent.
+set(cellular_sources
+    "services/cellular/cellular_service.cc"
+    "services/cellular/uart_eth_modem.cc")
+# 原始位图保留在源码中，只把可复现的压缩资源嵌入 app。/ Retain source bitmaps and embed only reproducible compressed resources in the app.
+idf_build_get_property(image_python PYTHON)
+set(builtin_image_dir "${CMAKE_CURRENT_BINARY_DIR}/builtin_images")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/assets/lock_4bpp.bin"
+    "${CMAKE_CURRENT_LIST_DIR}/assets/weather_backgrounds.bin"
+    "${CMAKE_CURRENT_LIST_DIR}/../tools/compress_builtin_images.py")
+execute_process(COMMAND "${image_python}" "${CMAKE_CURRENT_LIST_DIR}/../tools/compress_builtin_images.py"
+    --source "${CMAKE_CURRENT_LIST_DIR}/assets" --output "${builtin_image_dir}"
+    RESULT_VARIABLE builtin_image_result)
+if(NOT builtin_image_result EQUAL 0)
+    message(FATAL_ERROR "Built-in image compression failed")
 endif()
-set(app_desc_utc_launcher "${CMAKE_COMMAND}" -E env TZ=UTC)
-if(app_desc_launcher)
-    list(APPEND app_desc_utc_launcher ${app_desc_launcher})
+file(SIZE "${CMAKE_CURRENT_LIST_DIR}/assets/weather_backgrounds.bin" weather_background_size)
+if(NOT weather_background_size EQUAL 310464)
+    message(FATAL_ERROR "Weather masks must be regenerated with tools/generate_weather_backgrounds.py")
 endif()
-set_property(TARGET ${app_desc_lib} PROPERTY C_COMPILER_LAUNCHER "${app_desc_utc_launcher}")
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "factory/epd_test.c"
+        "boot/boot_state.c"
+        "apps/app_boot_recovery.c"
+        "ota/ota_update.c"
+        "ota/ota_online.c"
+        "ota/ota_auto.c"
+        "ota/ota_release.c"
+        "display/display.c"
+        "display/display_orientation.c"
+        "book/reader_orientation.c"
+        "display/display_refresh.c"
+        "display/display_refresh_policy.c"
+        "display/display_refresh_context.c"
+        "display/display_waveform_catalog.c"
+        "diagnostics/reader_perf.c"
+        "diagnostics/network_diagnostics.c"
+        "diagnostics/lock_sleep_trace.c"
+        "display/display_main_waveform.c"
+        "display/display_reader_waveform.c"
+        "display/display_normalize.c"
+        "power/cache_wake_restore.c"
+        "power/s31_sleep_compat.c"
+        "services/storage_jobs.c"
+        "services/memory_manager.c"
+        "services/memory_inventory.c"
+        "services/network_policy.c"
+        "services/network_service.c"
+        "services/network_http.c"
+        ${cellular_sources}
+        "services/lock_style_images.c"
+        "services/weather_model.c"
+        "services/weather_service.c"
+        "services/reading_journal_model.c"
+        "services/reading_journal.c"
+        "services/home_library.c"
+        "power/sleep.c"
+        "time/time_service.c"
+        "lock/lock_pin.c"
+        "lock/lock_pin_flow.c"
+        "lock/lock_screen.c"
+        "lock/lock_calendar.c"
+        "lock/lock_clock.c"
+        "ui/ui_lock_clock.c"
+        "ui/ui_lock_style.c"
+        "time/calendar.c"
+        "ui/ui_calendar.c"
+        "settings/settings.c"
+        "settings/home_components.c"
+        "services/haptics.c"
+        "app/app_loop.c"
+        "app/app_lifecycle.c"
+        "app/app_input.c"
+        "app/app_media.c"
+        "app/app_navigation.c"
+        "platform/s31_input.c"
+        "app/app_quick_layer.c"
+        "app/touch_sampler.c"
+        "app/crash_note.c"
+        "app/app_registry.c"
+        "ui/ui_kit.c"
+        "ui/ui_weather.c"
+        "ui/ui_reading_journal.c"
+        "ui/ui_reading_streak.c"
+        "ui/ui_mini_library.c"
+        "ui/ui_reader_heading.c"
+        "ui/ui_reader_settings.c"
+        "ui/ui_reader_tap_grid.c"
+        "ui/ui_reader_notice.c"
+        "ui/ui_builtin_image.c"
+        "ui/ui_text_edit.c"
+        "ui/ui_text_input.c"
+        "ui/ui_ime.c"
+        "ui/ui_keyboard.c"
+        "ui/ui_gesture.c"
+        "ui/ui_pinpad.c"
+        "ui/ui_power_dialog.c"
+        "ui/ui_quick_menu.c"
+        "ui/ui_lock_feedback.c"
+        "ui/ui_quick_menu_input.c"
+        "ui/ui_click_feedback.c"
+        "ui/ui_wifi_qr.c"
+        "ui/datamatrix.c"
+        "ui/ui_menu.c"
+        "ui/ui_nav.c"
+        "ui/ui_image_dither.c"
+        "ui/ui_wallpaper.c"
+        "ui/ui_avatar.c"
+        "ui/ui_reader_background.c"
+        "apps/app_book.c"
+        "apps/book_toc.c"
+        "apps/app_dashboard.c"
+        "apps/app_components.c"
+        "apps/app_reading_journal.c"
+        "apps/app_vocabulary.c"
+        "apps/app_files.c"
+        "apps/file_tree.c"
+        "apps/app_device_settings.c"
+        "apps/settings_bluetooth.c"
+        "apps/app_image.c"
+        "apps/app_transfer.c"
+        "services/usb_storage.c"
+        "book/book_store.c"
+        "book/book_shelf_model.c"
+        "book/book_shelf_category_state.c"
+        "book/book_collection.c"
+        "book/book_shelf_cache.c"
+        "book/book_shelf_scan.c"
+        "book/book_mini_library.c"
+        "book/book_shelf_manage.c"
+        "book/reader_session.c"
+        "book/reader_chapter.c"
+        "book/reader_open.c"
+        "book/reader_prefetch.c"
+        "book/reader_present.c"
+        "book/reader_turn.c"
+        "book/reader_reflow.c"
+        "book/reader_chrome.c"
+        "book/book_progress.c"
+        "book/book_path_state.c"
+        "book/book_category_ops.c"
+        "apps/book_category_ui.c"
+        "book/book_history_backup.c"
+        "book/book_title.c"
+        "book/book_ticket.c"
+        "book/book_excerpt.c"
+        "book/book_vocabulary.c"
+        "book/book_lock_collage.c"
+        "book/book_lock_bookmark.c"
+        "book/book_source.c"
+        "book/book_index_cache.c"
+        "book/book_txt.c"
+        "book/book_epub.c"
+        "book/book_mobi.c"
+        "book/book_mobi_markup.c"
+        "book/book_metadata.c"
+        "book/book_cover.c"
+        "image/image_decode.c"
+        "image/image_webp.c"
+        "image/book_jpeg_hw.c"
+        "book/book_cover_jobs.c"
+        "book/book_shelf_covers.c"
+        "image/book_image_header.c"
+        "book/book_cover_auto.c"
+        "book/zip_reader.c"
+        "book/html_text.c"
+        "book/reader_selection.c"
+        "book/book_dictionary.c"
+        "book/reader_dictionary.c"
+        "ui/ui_reader_dictionary.c"
+        "book/book_layout.c"
+        "book/gbk.c"
+        "font/ttf_font.c"
+        "font/ttf_font_source.c"
+        "font/ttf_block_cache.c"
+        "font/ttf_glyph_cache.c"
+        "services/app_font_context.c"
+        "font/ui_font.c"
+        "font/ui_hanzi.c"
+        "factory/pmu_selftest.c"
+        "factory/vcom_setup.c"
+    REQUIRES ${main_requires}
+    LDFRAGMENTS "platform/s31_cache_safe.lf"
+    PRIV_INCLUDE_DIRS
+        "." "app" "apps" "book" "image" "font" "ui" "services" "services/cellular" "platform" "factory"
+        "boot" "display" "lock" "power" "ota" "settings" "time" "diagnostics"
+    EMBED_FILES
+        "${builtin_image_dir}/lock_4bpp.kbz"
+        "assets/avatar_4bpp.bin"
+        "assets/builtin.ttf"
+        "${builtin_image_dir}/weather_backgrounds.wbr"
+        "assets/ui-hanzi.bin"
+        "assets/display-test.png"
+)
 
-# panic 包装器的链接选项在 main/CMakeLists.txt 里挂到 main 组件上：写在 project() 之后
-# 用 idf_build_set_property 设全局链接选项已经太晚，链接器看不到 --wrap。
-# The panic wrapper's link option hangs off the main component in main/CMakeLists.txt: setting a
-# global link option after project() is too late for the linker to see --wrap.
+# 连接失败后 IDF 会关闭 socket；按需保留解析地址和连接阶段，正式默认关闭。
+# Failed sockets are closed inside IDF; opt in to address/progress logs locally.
+if(CONFIG_APP_NETWORK_CONNECT_TRACE)
+    idf_component_get_property(network_tls_lib esp-tls COMPONENT_LIB)
+    target_compile_definitions(${network_tls_lib} PRIVATE LOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
+endif()
+
+# 包住 IDF 的 panic 处理器：崩溃现场在重启前落进 RTC，没有串口时那是唯一的现场。
+# 链接选项挂在 main 上，INTERFACE 会带到最终链接；写在 project() 之后的全局属性则太晚。
+# Wrap the IDF panic handler so the crash scene reaches RTC before a restart; without a console
+# that is the only place it survives. The option hangs off main, whose INTERFACE carries it into
+# the final link; a global property set after project() is too late for the linker to see it.
+target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")
+
+# S31 浅睡时钟交接与唤醒校准。/ S31 sleep clock handoff and wake calibration.
+include("${CMAKE_CURRENT_LIST_DIR}/power/s31_sleep_compat.cmake")
+
+# 本地 A/B：强制软件封面解码，用来对比同一构建的硬件路径。
+# Local A/B: force software cover decode to compare against the hardware path in the same build.
+if("$ENV{KIIKO_DISABLE_HW_JPEG}" STREQUAL "1")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE BOOK_JPEG_HW_FORCE_SOFTWARE=1)
+endif()
