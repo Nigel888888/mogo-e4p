@@ -14,6 +14,15 @@
 
 #define BOOK_VOCABULARY_PATH "/sdcard/vocabulary.jsonl"
 
+/* 显示层字段上限；超过则截断，保证单条结构尺寸固定。
+ * Display field caps; longer values are truncated so each item has a fixed size. */
+#define BOOK_VOCAB_WORD_MAX       96
+#define BOOK_VOCAB_READING_MAX    192
+#define BOOK_VOCAB_DEF_MAX       1024
+#define BOOK_VOCAB_EXAMPLE_MAX    768
+#define BOOK_VOCAB_BOOK_MAX       160
+#define BOOK_VOCAB_MAX_ITEMS      512
+
 typedef enum {
     BOOK_VOCABULARY_SAVED = 0,     ///< 新写入 / newly appended
     BOOK_VOCABULARY_DUPLICATE,     ///< 已收藏（未写盘）/ already present, nothing written
@@ -35,3 +44,30 @@ book_vocabulary_status_t book_vocabulary_save(const book_vocabulary_entry_t *ent
 bool book_vocabulary_contains(const char *query);
 /// 统计已收藏词条数；读取失败返回 0。/ Count saved entries; zero on read failure.
 size_t book_vocabulary_count(void);
+
+/* ---- 浏览/复习用：读取、删除 ---- */
+/* ---- Browsing/review: load, remove ---- */
+
+typedef struct {
+    char word[BOOK_VOCAB_WORD_MAX];
+    char reading[BOOK_VOCAB_READING_MAX];
+    char definition[BOOK_VOCAB_DEF_MAX];
+    char example[BOOK_VOCAB_EXAMPLE_MAX];
+    char book[BOOK_VOCAB_BOOK_MAX];
+    uint32_t chapter;
+    int64_t ts;
+} book_vocabulary_item_t;
+
+typedef struct {
+    book_vocabulary_item_t *items;  ///< PSRAM 中分配的数组 / array allocated in PSRAM
+    size_t count;                    ///< 有效条目数 / number of valid entries
+    size_t capacity;                 ///< 数组容量 / allocated capacity
+} book_vocabulary_list_t;
+
+/// 读取全部生词到列表（文件顺序）；调用方负责用 list_free 释放。
+/// Load all entries into a list (file order); caller must free with list_free.
+bool book_vocabulary_load(book_vocabulary_list_t *out);
+/// 释放 load 分配的数组。/ Free the array allocated by load.
+void book_vocabulary_list_free(book_vocabulary_list_t *list);
+/// 按词头删除一条（整行重建文件，保持其余顺序）。/ Delete one entry by headword (rewrites file, preserving order).
+bool book_vocabulary_remove(const char *query);
