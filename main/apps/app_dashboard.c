@@ -683,7 +683,10 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
         if(restore){s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}
         return APP_REDRAW_NONE;
     }
-    if(hit((EpdRect){588,88,60,60},x,y)){ui_nav_request(ctx,3);return APP_REDRAW_NONE;}
+    /* 头像改为打开功能菜单入口：菜单含生词本等全部产品页。
+     * Avatar now opens the full function menu, which exposes the vocabulary notebook
+     * and every other product page. Settings stays reachable via the 4th bottom tab. */
+    if(hit((EpdRect){588,88,60,60},x,y)){ctx->request_menu=true;return APP_REDRAW_NONE;}
     for(unsigned slot=0;slot<APP_HOME_SLOT_COUNT;++slot) {
         EpdRect region=home_region(slot);
         if(!hit(region,x,y))continue;
