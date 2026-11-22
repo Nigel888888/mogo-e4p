@@ -26,6 +26,9 @@ extern const app_desc_t app_vocabulary;
 #define V_BTN_DEL  {36, 1000, 200, 72}
 #define V_BTN_PREV {256, 1000, 172, 72}
 #define V_BTN_NEXT {448, 1000, 200, 72}
+#define V_BTN_EXPORT {456, 168, 104, 52}
+#define V_BTN_MANAGE {572, 168, 92, 52}
+#define VOCAB_TSV_PATH "/sdcard/vocabulary.tsv"
 
 typedef enum { V_VIEW_LIST = 0, V_VIEW_DETAIL } vocab_view_t;
 
@@ -36,6 +39,9 @@ static unsigned s_page;      /* 列表页号 */
 static unsigned s_selected;  /* 详情显示的分页（释义按屏翻） */
 static unsigned s_detail;    /* 当前详情条目索引 */
 static char s_notice[80];
+static bool s_manage;                       /* 勾选批量管理模式 / checkbox bulk mode */
+static bool s_checked[BOOK_VOCAB_MAX_ITEMS];
+static unsigned s_checked_count;
 
 /* 每行矩形：列表条目命中与绘制共用。/ Row rect shared by drawing and hit-test. */
 static EpdRect row_rect(unsigned i) {
@@ -55,12 +61,16 @@ static void load_list(void) {
     s_loaded = true;
     if (!book_vocabulary_load(&s_list)) { s_list.items = NULL; s_list.count = 0; }
     s_page = 0; s_view = V_VIEW_LIST; s_notice[0] = 0;
+    s_manage = false; s_checked_count = 0;
+    memset(s_checked, 0, sizeof(s_checked));
 }
 
 static void unload_list(void) {
     if (s_loaded) book_vocabulary_list_free(&s_list);
     s_loaded = false;
     s_list.items = NULL; s_list.count = 0;
+    s_manage = false; s_checked_count = 0;
+    memset(s_checked, 0, sizeof(s_checked));
 }
 
 static void enter(app_ctx_t *ctx) {
@@ -87,9 +97,12 @@ static void render_list(uint8_t *fb) {
     ui_clear_page(fb);
     ui_nav_status(fb);
     char head[64];
-    snprintf(head, sizeof(head), "生词本 · 共 %u 词", (unsigned)s_list.count);
+    if (s_manage) snprintf(head, sizeof(head), "生词本 · 已选 %u 词", s_checked_count);
+    else snprintf(head, sizeof(head), "生词本 · 共 %u 词", (unsigned)s_list.count);
     ui_text_fixed_vc(fb, 342, 116, 46, "生词本", EPD_DRAW_ALIGN_CENTER, false);
     ui_text_fixed(fb, 36, 176, 26, head, EPD_DRAW_ALIGN_LEFT, false);
+    ui_draw_button(fb, (EpdRect)V_BTN_EXPORT, "导出", false);
+    ui_draw_chip(fb, (EpdRect)V_BTN_MANAGE, s_manage ? "删除" : "管理", s_manage);
 
     if (!s_list.count) {
         ui_text_fixed_vc(fb, 342, 560, 34, "还没有生词", EPD_DRAW_ALIGN_CENTER, false);
@@ -101,11 +114,15 @@ static void render_list(uint8_t *fb) {
             unsigned idx = first + i;
             if (idx >= s_list.count) break;
             EpdRect r = row_rect(i);
+            const int text_x = r.x + (s_manage ? 62 : 20);
+            const int text_w = s_manage ? 520 : 560;
+            if (s_manage && idx < BOOK_VOCAB_MAX_ITEMS)
+                ui_draw_choice_round_rect(fb, (EpdRect){r.x + 10, r.y + 58, 36, 36}, 6, s_checked[idx]);
             ui_draw_choice_round_rect(fb, r, 12, false);
             const book_vocabulary_item_t *it = &s_list.items[idx];
-            fit_text(fb, r.x + 20, r.y + 12, 40, it->word, 460);
-            if (it->reading[0]) fit_text(fb, r.x + 20, r.y + 62, 28, it->reading, 560);
-            fit_text(fb, r.x + 20, r.y + 100, 26, it->definition, 560);
+            fit_text(fb, text_x, r.y + 12, 40, it->word, text_w - 100);
+            if (it->reading[0]) fit_text(fb, text_x, r.y + 62, 28, it->reading, text_w);
+            fit_text(fb, text_x, r.y + 100, 26, it->definition, text_w);
         }
         char pager[48];
         snprintf(pager, sizeof(pager), "%u / %u", s_page + 1, pages);
@@ -215,7 +232,34 @@ static void do_delete(void) {
     }
 }
 
+static void do_export(void) {
+    if (book_vocabulary_export_tsv(VOCAB_TSV_PATH)) notice("已导出 vocabulary.tsv");
+    else notice("导出失败，请检查 TF 卡");
+}
+
+static void do_delete_selected(void) {
+    unsigned removed = 0;
+    for (size_t i = 0; i < s_list.count && i < BOOK_VOCAB_MAX_ITEMS; ++i) {
+        if (s_checked[i] && book_vocabulary_remove(s_list.items[i].word)) ++removed;
+    }
+    unload_list();
+    load_list();
+    if (removed) {
+        char msg[48]; snprintf(msg, sizeof(msg), "已删除 %u 条", removed); notice(msg);
+    } else notice("没有可删除词条");
+}
+
 static app_redraw_t gesture_list(int x, int y) {
+    if (ui_rect_hit((EpdRect)V_BTN_EXPORT, x, y)) { do_export(); return APP_REDRAW_PAGE; }
+    if (ui_rect_hit((EpdRect)V_BTN_MANAGE, x, y)) {
+        if (s_manage) do_delete_selected();
+        else {
+            s_manage = true; s_checked_count = 0;
+            memset(s_checked, 0, sizeof(s_checked));
+            notice("点选词条后按删除");
+        }
+        return APP_REDRAW_PAGE;
+    }
     unsigned pages = page_count();
     if (ui_rect_hit(page_btn(false), x, y) && s_page) { --s_page; return APP_REDRAW_PAGE; }
     if (ui_rect_hit(page_btn(true), x, y) && s_page + 1 < pages) { ++s_page; return APP_REDRAW_PAGE; }
@@ -223,9 +267,16 @@ static app_redraw_t gesture_list(int x, int y) {
         unsigned idx = s_page * V_ROWS + i;
         if (idx >= s_list.count) break;
         if (ui_rect_hit(row_rect(i), x, y)) {
-            s_detail = idx; s_selected = 0;
-            build_detail(&s_list.items[s_detail]);
-            s_view = V_VIEW_DETAIL;
+            if (s_manage) {
+                if (idx < BOOK_VOCAB_MAX_ITEMS) {
+                    if (s_checked[idx]) { s_checked[idx] = false; if (s_checked_count) --s_checked_count; }
+                    else { s_checked[idx] = true; ++s_checked_count; }
+                }
+            } else {
+                s_detail = idx; s_selected = 0;
+                build_detail(&s_list.items[s_detail]);
+                s_view = V_VIEW_DETAIL;
+            }
             return APP_REDRAW_PAGE;
         }
     }
@@ -270,6 +321,11 @@ static app_redraw_t key_cb(app_ctx_t *ctx, int value) {
     /* 非 owns_keys 页面只在菜单关闭时收到 KEY_1：详情退回列表，列表按返回。
      * Non-owns_keys pages get KEY_1 only; KEY_2/KEY_3 stay with the loop (refresh/menu). */
     if (s_view == V_VIEW_DETAIL) { s_view = V_VIEW_LIST; return APP_REDRAW_PAGE; }
+    if (s_manage) {
+        s_manage = false; s_checked_count = 0;
+        memset(s_checked, 0, sizeof(s_checked));
+        return APP_REDRAW_PAGE;
+    }
     ctx->request_return = true;
     return APP_REDRAW_NONE;
 }

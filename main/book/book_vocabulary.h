@@ -45,6 +45,8 @@ book_vocabulary_status_t book_vocabulary_save(const book_vocabulary_entry_t *ent
 bool book_vocabulary_contains(const char *query);
 /// 统计已收藏词条数；读取失败返回 0。/ Count saved entries; zero on read failure.
 size_t book_vocabulary_count(void);
+/// 导出 Anki 友好的 TSV：词头/读音/释义/例句/书名/章节。/ Export an Anki-friendly TSV for desktop and AnkiDroid.
+bool book_vocabulary_export_tsv(const char *path);
 
 /* ---- 浏览/复习用：读取、删除 ---- */
 /* ---- Browsing/review: load, remove ---- */

@@ -118,6 +118,37 @@ book_vocabulary_status_t book_vocabulary_save(const book_vocabulary_entry_t *ent
     return error ? BOOK_VOCABULARY_ERROR : BOOK_VOCABULARY_SAVED;
 }
 
+/* Anki 导入用 TSV：制表符分隔，字段内换行折成空格，避免破坏行结构。
+ * Anki-friendly TSV: tab separated; embedded newlines become spaces so records stay on one line. */
+static void tsv_field(FILE *f, const char *text) {
+    if (!text) return;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        unsigned char c = *p;
+        if (c == '\t' || c == '\n' || c == '\r') c = ' ';
+        fputc(c, f);
+    }
+}
+
+bool book_vocabulary_export_tsv(const char *path) {
+    if (!path || !*path) return false;
+    book_vocabulary_list_t list;
+    if (!book_vocabulary_load(&list)) return false;
+    FILE *f = fopen(path, "w");
+    if (!f) { book_vocabulary_list_free(&list); return false; }
+    for (size_t i = 0; i < list.count; ++i) {
+        const book_vocabulary_item_t *it = &list.items[i];
+        tsv_field(f, it->word);       fputc('\t', f);
+        tsv_field(f, it->reading);    fputc('\t', f);
+        tsv_field(f, it->definition); fputc('\t', f);
+        tsv_field(f, it->example);    fputc('\t', f);
+        tsv_field(f, it->book);       fprintf(f, "\t%lu\n", (unsigned long)it->chapter);
+    }
+    int error = ferror(f);
+    if (fclose(f) != 0) error = 1;
+    book_vocabulary_list_free(&list);
+    return error ? false : true;
+}
+
 /* ==================== 浏览/复习：读取与删除 ==================== */
 
 /* 从一行 JSON 里提取字符串字段的值到 out（做反转义），返回是否找到。

@@ -181,7 +181,7 @@ idf_component_register(
         "apps/book_toc.c"
         "apps/app_dashboard.c"
         "apps/app_components.c"
-        "apps/app_reading_journal.c",
+        "apps/app_reading_journal.c"
         "apps/app_vocabulary.c"
         "book/book_vocabulary.c"
         "apps/app_files.c"
