@@ -118,7 +118,7 @@ static bool same_line(const book_layout_glyph_t *g, size_t a, size_t b) {
 bool reader_selection_word_at(reader_selection_t *s, const char *text, size_t length,
     const book_layout_glyph_t *g, size_t count, size_t page, uint32_t generation, int x, int y) {
     if (!s || !text || !g || !count) return false;
-    size_t i = hit(g, count, x, y, true);
+    size_t i = hit(g, count, x, y, false);
     uint32_t cp;
     size_t n = i == SIZE_MAX || g[i].start >= length ? 0 :
         scalar(text + g[i].start, length - g[i].start, &cp);
