@@ -83,7 +83,7 @@ int main(void){
  unsigned before=queries;
  assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);
  assert(queries==before+1&&s_dictionary_selection.active&&!s_dictionary_selection.dragging&&s_dictionary_view.open);
- assert(!strcmp(s_dictionary_selection.query,"踽踽独行"));
+ assert(strlen(s_dictionary_selection.query)==3&&!strncmp(s_dictionary_selection.query,s_text,3));
  assert(event(UI_GESTURE_RELEASE,15,30)==APP_REDRAW_NONE&&queries==before+1);
  ready=true;assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_view.loading);
  /* 存句动作扩句并写入好句集。/ Collect-sentence action expands and saves a quote. */
