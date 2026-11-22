@@ -100,6 +100,7 @@ int main(void){
  assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);active_font="changed.ttf";
  assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);active_font="reader.ttf";
  // 空白长按没有目录副作用。/ A blank hold has no TOC side effect.
+ assert(dictionary_dismiss()==APP_REDRAW_PAGE);
  ui_gesture_event_t blank={.type=UI_GESTURE_LONG_PRESS,.x0=400,.y0=400,.x=400,.y=400};bool handled=false;
  assert(dictionary_gesture(&ctx,&blank,&handled)==APP_REDRAW_NONE&&handled&&!s_dictionary_selection.active);
  // 无字模时保留提示，抬手后清除。/ Missing glyphs keep the notice until release.
