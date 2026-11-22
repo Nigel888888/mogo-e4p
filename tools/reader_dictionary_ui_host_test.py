@@ -29,7 +29,7 @@ static reader_selection_t s_dictionary_selection;static ui_reader_dictionary_t s
 static book_dictionary_result_t s_dictionary_result;static size_t s_dictionary_history[128],s_dictionary_history_count;
 static size_t s_dictionary_character,s_dictionary_chapter;static int64_t s_dictionary_feedback_ms;
 static bool s_dictionary_feedback_pending,s_dictionary_presented;static EpdRect s_area;
-static struct {struct {size_t page,chapter;}position;}s_reader_session;
+static struct {struct {size_t page,chapter;}position;struct {char title[160];}book;}s_reader_session;
 /* 生词本宿主桩：只验证查词面板的只读查询与一键收藏调用。
  * Vocabulary doubles: only the read-only membership check and one-tap save matter here. */
 static bool s_vocabulary_saved;static book_vocabulary_status_t s_vocabulary_status=BOOK_VOCABULARY_SAVED;
