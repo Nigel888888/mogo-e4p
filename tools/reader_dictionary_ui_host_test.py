@@ -18,6 +18,7 @@ unit=r'''
 #include "reader_selection.h"
 #include "book_dictionary.h"
 #include "book_vocabulary.h"
+#include "book_quotes.h"
 #include "ui_reader_dictionary.h"
 #include "reader_session_test.h"
 #define UI_LOCK_WIDTH 684
@@ -37,6 +38,9 @@ bool book_vocabulary_contains(const char *query){(void)query;return s_vocabulary
 book_vocabulary_status_t book_vocabulary_save(const book_vocabulary_entry_t *entry){(void)entry;s_vocabulary_saved=true;return s_vocabulary_status;}
 static char s_reader_notice[128];static int64_t s_reader_notice_until;
 static int64_t esp_timer_get_time(void){return 0;}
+static bool s_quote_saved;
+bool book_quotes_save(const char *text,const char *book,uint32_t chapter){(void)text;(void)book;(void)chapter;s_quote_saved=true;return true;}
+bool reader_selection_expand_sentence(reader_selection_t *s,const char *text,size_t length,const book_layout_glyph_t *g,size_t count){(void)s;(void)text;(void)length;(void)g;(void)count;return true;}
 static int64_t s_dictionary_notice_until;
 static unsigned generation=1,queries,cancels,draws;static bool pending,ready,map_missing;
 static book_layout_glyph_t glyphs[]={{0,3,10,20,30,40},{3,3,40,20,30,40},{6,3,70,20,30,40},{9,3,100,20,30,40}};
@@ -55,14 +59,19 @@ static const char *s_font_path="reader.ttf",*active_font="reader.ttf";
 static const char *ttf_font_path(void){return active_font;}
 static void render(app_ctx_t *ctx,uint8_t *fb){(void)ctx;(void)fb;++draws;}
 EpdRect ui_reader_dictionary_selection(uint8_t *fb,const reader_selection_t *s,const book_layout_glyph_t *g,size_t n){(void)fb;uint32_t a,b;assert(reader_selection_range(s,g,n,&a,&b));return(EpdRect){10,20,120,40};}
-int ui_reader_dictionary_action(const ui_reader_dictionary_t *v,int x,int y){(void)x;return y<v->top?0:-1;}
+int ui_reader_dictionary_action(const ui_reader_dictionary_t *v,int x,int y){
+ if(!v->open)return -1;
+ if(y<v->top||y>=v->top+584)return 0;
+ if(y<v->top+82){if(x>=540)return 0;if(x>=445)return 4;if(x>=350)return 5;return -1;}
+ return -1;
+}
 size_t ui_reader_dictionary_page_end(const book_dictionary_result_t *r,size_t off){(void)r;return off;}
 size_t ui_reader_dictionary_content_size(const book_dictionary_result_t *r){return strlen(r->definition);}
 static app_redraw_t dictionary_dismiss(void);
 '''
 # 真实 app_ctx_t 的轻量宿主契约。/ Lightweight host contract for the actual page context.
 unit=unit.replace('#include "reader_session_test.h"','')
-for name in ('dictionary_cancel','dictionary_save','dictionary_dismiss','dictionary_long_drag','dictionary_query','dictionary_union','dictionary_handle','dictionary_gesture','dictionary_tick'):
+for name in ('dictionary_cancel','dictionary_save','dictionary_quote','dictionary_dismiss','dictionary_long_drag','dictionary_query','dictionary_union','dictionary_handle','dictionary_gesture','dictionary_tick'):
     unit+=function(name,BOOK)+'\n'
 unit+=r'''
 static uint8_t fb[684*1216/2];static app_touch_t touch;
@@ -71,43 +80,39 @@ static app_redraw_t event(ui_gesture_type_t type,int x,int y){ui_gesture_event_t
 int main(void){
  ctx.fb=fb;ctx.touch=&touch;ctx.now_ms=500;memset(fb,255,sizeof(fb));
  assert(dictionary_long_drag(&ctx));s_toolbar=true;assert(!dictionary_long_drag(&ctx));s_toolbar=false;
- unsigned before=queries;assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA);
- assert(s_dictionary_selection.active&&s_dictionary_selection.dragging&&queries==before);
- ctx.now_ms=650;assert(event(UI_GESTURE_MOVE,115,30)==APP_REDRAW_AREA);assert(!strcmp(s_dictionary_selection.query,"踽踽独行")&&queries==before);
- assert(event(UI_GESTURE_RELEASE,115,30)==APP_REDRAW_PAGE&&queries==before+1&&s_dictionary_view.open);
- assert(event(UI_GESTURE_RELEASE,115,30)==APP_REDRAW_NONE&&queries==before+1);
+ /* 长按整词立即查词：一次查询、无拖动态、卡片打开。/ One query on hold, no drag state, sheet opens at once. */
+ unsigned before=queries;
+ assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);
+ assert(queries==before+1&&s_dictionary_selection.active&&!s_dictionary_selection.dragging&&s_dictionary_view.open);
+ assert(!strcmp(s_dictionary_selection.query,"踽踽独行"));
+ assert(event(UI_GESTURE_RELEASE,15,30)==APP_REDRAW_NONE&&queries==before+1);
  ready=true;assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_view.loading);
+ /* 存句动作扩句并写入好句集。/ Collect-sentence action expands and saves a quote. */
+ size_t gc=0;const book_layout_glyph_t *gg=book_layout_glyphs(0,&gc);bool first=false;
+ assert(dictionary_handle(gg,gc,360,660,&first));
+ assert(s_quote_saved&&strstr(s_reader_notice,"好句集"));
  assert(event(UI_GESTURE_SWIPE_L,15,30)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);
- assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA);assert(event(UI_GESTURE_RELEASE,15,30)==APP_REDRAW_PAGE);
+ assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);
  assert(event(UI_GESTURE_TAP,15,30)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);
- assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA);before=queries;
- assert(event(UI_GESTURE_CANCEL,15,30)==APP_REDRAW_AREA&&!s_dictionary_selection.active&&queries==before);
- assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA);assert(event(UI_GESTURE_RELEASE,15,30)==APP_REDRAW_PAGE);
+ /* 版式与存储变化会让已显示选区失效。/ Stale layout and USB changes dismiss the sheet. */
  ++generation;ready=true;assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_selection.active&&!pending);
- --generation;assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA);storage=true;
+ --generation;assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);storage=true;
  assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);storage=false;
- assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA);active_font="changed.ttf";
+ assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);active_font="changed.ttf";
  assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);active_font="reader.ttf";
  // 空白长按没有目录副作用。/ A blank hold has no TOC side effect.
  ui_gesture_event_t blank={.type=UI_GESTURE_LONG_PRESS,.x0=400,.y0=400,.x=400,.y=400};bool handled=false;
  assert(dictionary_gesture(&ctx,&blank,&handled)==APP_REDRAW_NONE&&handled&&!s_dictionary_selection.active);
- // 失败提示等到抬手后才清除，保持长拖期间不整页推屏。/ Defer notice dismissal until release, without page output during a held contact.
+ // 无字模时保留提示，抬手后清除。/ Missing glyphs keep the notice until release.
  map_missing=true;ctx.now_ms=1000;touch.touched=true;
  assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA&&s_dictionary_notice_until==3400);
  ctx.now_ms=3500;assert(dictionary_tick(&ctx)==APP_REDRAW_NONE&&s_dictionary_notice_until);
  touch.touched=false;assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_notice_until);map_missing=false;
- // 已显示的字典在端点拖动取消后，等待抬手才补归一页请求。
- // A displayed dictionary waits for release before normalizing a cancelled endpoint drag.
- s_dictionary_presented=true;touch.touched=true;
- assert(dictionary_tick(&ctx)==APP_REDRAW_NONE);
- s_dictionary_selection.dragging=true;touch.touched=false;assert(dictionary_tick(&ctx)==APP_REDRAW_NONE);
- s_dictionary_selection.dragging=false;assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE);
- s_dictionary_presented=false;
- assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_AREA);assert(event(UI_GESTURE_RELEASE,15,30)==APP_REDRAW_PAGE);
+ assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);
  s_dictionary_view.loading=false;s_dictionary_view.can_browse=false;s_dictionary_view.top=0;
  before=queries;assert(event(UI_GESTURE_TAP,15,30)==APP_REDRAW_NONE&&queries==before);
  assert(dictionary_dismiss()==APP_REDRAW_PAGE&&!s_dictionary_selection.active);
- puts("PASS: actual reader orchestration, AREA drag, one query per release, cancel/no query, modal dismissal, stale layout and USB invalidation");
+ puts("PASS: whole-word hold lookup, one query, sentence collect, modal dismissal, stale layout and USB invalidation");
 }
 '''
 with tempfile.TemporaryDirectory(dir=ROOT/'build') as folder:

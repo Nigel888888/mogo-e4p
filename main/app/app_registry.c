@@ -17,6 +17,8 @@ extern const app_desc_t app_device_settings;
 extern const app_desc_t app_components;
 extern const app_desc_t app_reading_journal;
 extern const app_desc_t app_vocabulary;
+extern const app_desc_t app_quotes;
+extern const app_desc_t app_xiaozhi;
 
 // 正式产品页面清单；工厂测试与历史示例不进入用户导航。
 // Production page registry; factory diagnostics and legacy examples are not user-navigable.
@@ -29,6 +31,8 @@ static const app_desc_t* const s_apps[] = {
     &app_components,
     &app_reading_journal,
     &app_vocabulary,
+    &app_quotes,
+    &app_xiaozhi,
 };
 
 #define APP_COUNT ((int)(sizeof(s_apps) / sizeof(s_apps[0])))

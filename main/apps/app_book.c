@@ -224,6 +224,7 @@
 #include "reader_reflow.h"
 #include "reader_orientation.h"
 #include "../book/book_vocabulary.h"
+#include "../book/book_quotes.h"
 #include "reader_open.h"
 #include "reader_session_layout.h"
 #include "reader_chapter.h"
@@ -7204,6 +7205,20 @@ static void dictionary_save(void) {
         s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
     }
 }
+/* 把当前选区扩到整句，收录到好句集。/ Expand the current selection to a sentence and collect it. */
+static void dictionary_quote(void) {
+    size_t count = 0;
+    const book_layout_glyph_t *g = book_layout_glyphs(s_reader_session.position.page, &count);
+    if (g) (void)reader_selection_expand_sentence(&s_dictionary_selection, s_text, s_text_len, g, count);
+    const char *title = s_reader_session.book.title[0] ? s_reader_session.book.title : NULL;
+    if (book_quotes_save(s_dictionary_selection.query, title, (uint32_t)s_dictionary_chapter)) {
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "已收入好句集");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 1600;
+    } else {
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "收录失败或已存在");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 1800;
+    }
+}
 static EpdRect dictionary_union(EpdRect a, EpdRect b) {
     int right = a.x + a.width > b.x + b.width ? a.x + a.width : b.x + b.width;
     int bottom = a.y + a.height > b.y + b.height ? a.y + a.height : b.y + b.height;
@@ -7257,12 +7272,19 @@ static app_redraw_t dictionary_gesture(app_ctx_t *ctx, const ui_gesture_event_t 
             s_mode = MODE_DU; s_dictionary_feedback_pending = true; return APP_REDRAW_AREA;
         }
         s_dictionary_notice_until = 0;
-        if (!reader_selection_begin(&s_dictionary_selection, s_text, s_text_len, g, count,
+        if (!reader_selection_word_at(&s_dictionary_selection, s_text, s_text_len, g, count,
             s_reader_session.position.page, book_layout_generation(), ev->x0, ev->y0)) return APP_REDRAW_NONE;
         s_dictionary_chapter = s_reader_session.position.chapter;
-        s_dictionary_feedback_ms = ctx->now_ms;
-        s_area = ui_reader_dictionary_selection(ctx->fb, &s_dictionary_selection, g, count);
-        s_mode = MODE_DU; s_dictionary_feedback_pending = true; return APP_REDRAW_AREA;
+        /* 整词命中后立即弹出释义，不再等待拖动或抬手。/ Open the lookup sheet as soon as the whole word is hit. */
+        uint32_t dict_start, dict_end; int max_y = 0;
+        if (reader_selection_range(&s_dictionary_selection, g, count, &dict_start, &dict_end))
+            for (size_t i = 0; i < count; ++i)
+                if (g[i].start >= dict_start && g[i].start < dict_end && g[i].y + g[i].height > max_y)
+                    max_y = g[i].y + g[i].height;
+        s_dictionary_view.top = max_y >= READER_HEIGHT / 2 ? 0 : READER_HEIGHT - 584;
+        s_dictionary_character = 0;
+        dictionary_query(s_dictionary_selection.query);
+        return APP_REDRAW_PAGE;
     }
     if (ev->type == UI_GESTURE_MOVE && s_dictionary_selection.dragging && ctx->now_ms - s_dictionary_feedback_ms >= 120) {
         reader_selection_t previous = s_dictionary_selection;
@@ -7297,6 +7319,8 @@ static app_redraw_t dictionary_gesture(app_ctx_t *ctx, const ui_gesture_event_t 
             dictionary_query(one);
         } else if (action == 4) {
             dictionary_save();
+        } else if (action == 5) {
+            dictionary_quote();
         } else return APP_REDRAW_NONE;
         return APP_REDRAW_PAGE;
     }

@@ -16,6 +16,12 @@ typedef struct {
 /// 单字起选、拖动扩选；所有指针仅本次调用借用。/ Start or extend selection; pointers are borrowed only for the call.
 bool reader_selection_begin(reader_selection_t *selection, const char *text, size_t length,
     const book_layout_glyph_t *glyphs, size_t count, size_t page, uint32_t generation, int x, int y);
+/// 落点直接选中整词（英文）或单字（中文），不进入拖动态。/ Select the whole word under the point without entering drag mode.
+bool reader_selection_word_at(reader_selection_t *selection, const char *text, size_t length,
+    const book_layout_glyph_t *glyphs, size_t count, size_t page, uint32_t generation, int x, int y);
+/// 把当前选区扩到整句（同行内的标点边界）。/ Extend the current selection to the sentence boundary on the same line.
+bool reader_selection_expand_sentence(reader_selection_t *selection, const char *text, size_t length,
+    const book_layout_glyph_t *glyphs, size_t count);
 bool reader_selection_move(reader_selection_t *selection, const char *text, size_t length,
     const book_layout_glyph_t *glyphs, size_t count, int x, int y);
 bool reader_selection_range(const reader_selection_t *selection, const book_layout_glyph_t *glyphs,

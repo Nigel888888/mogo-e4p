@@ -139,6 +139,7 @@ int ui_reader_dictionary_action(const ui_reader_dictionary_t *v, int x, int y) {
     if (y < v->top + 82) {
         if (x >= 540) return 0;
         if (x >= 445) return 4;
+        if (x >= 350) return 5;
         return -1;
     }
     if (y >= v->top + 472 && y < v->top + 536) {
@@ -156,8 +157,9 @@ void ui_reader_dictionary_draw(uint8_t *fb, const ui_reader_dictionary_t *v,
     ui_draw_separator(fb,top,0,UI_LOCK_WIDTH,UI_GRAY_BLACK);
     char title[320]; snprintf(title,sizeof(title),"%s",query);
     /* 标题让位于右上角的“保存/已存”与“关闭”。/ Reserve the title row's right edge for collect and close. */
-    while (ttf_text_width_px(42,title)>388 && strlen(title)>3) { size_t n=strlen(title)-1;while(n&&((unsigned char)title[n]&0xc0)==0x80)--n;title[n]=0; }
+    while (ttf_text_width_px(42,title)>300 && strlen(title)>3) { size_t n=strlen(title)-1;while(n&&((unsigned char)title[n]&0xc0)==0x80)--n;title[n]=0; }
     text(fb,40,top+22,42,title);
+    text(fb,360,top+28,28,"存句");
     text(fb,455,top+28,28,v->saved?"已存":"保存");
     text(fb,570,top+28,28,"关闭");
     char codes[192]="";

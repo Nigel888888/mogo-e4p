@@ -3,6 +3,7 @@
  * English: Source-ordered selection preserving combining marks and variation selectors. */
 #include "reader_selection.h"
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 static size_t scalar(const char *text, size_t n, uint32_t *cp) {
@@ -107,6 +108,65 @@ bool reader_selection_move(reader_selection_t *s, const char *text, size_t lengt
     if (!update(s, text, length, g, count)) { *s = old; return false; }
     return true;
 }
+static bool word_cp(uint32_t cp) {
+    return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') ||
+           (cp >= '0' && cp <= '9') || cp == '_' || cp == '\'' || cp == '-';
+}
+static bool same_line(const book_layout_glyph_t *g, size_t a, size_t b) {
+    return abs(g[a].y - g[b].y) <= 2;
+}
+bool reader_selection_word_at(reader_selection_t *s, const char *text, size_t length,
+    const book_layout_glyph_t *g, size_t count, size_t page, uint32_t generation, int x, int y) {
+    if (!s || !text || !g || !count) return false;
+    size_t i = hit(g, count, x, y, true);
+    uint32_t cp;
+    size_t n = i == SIZE_MAX || g[i].start >= length ? 0 :
+        scalar(text + g[i].start, length - g[i].start, &cp);
+    if (!n || whitespace(cp)) return false;
+    size_t lo = i, hi = i;
+    if (word_cp(cp)) {
+        while (lo > 0 && g[lo - 1].start + (size_t)g[lo - 1].length == g[lo].start &&
+               same_line(g, lo - 1, lo)) {
+            uint32_t prev;
+            if (!scalar(text + g[lo - 1].start, length - g[lo - 1].start, &prev) || !word_cp(prev)) break;
+            --lo;
+        }
+        while (hi + 1 < count && g[hi].start + (size_t)g[hi].length == g[hi + 1].start &&
+               same_line(g, hi, hi + 1)) {
+            uint32_t next;
+            if (!scalar(text + g[hi + 1].start, length - g[hi + 1].start, &next) || !word_cp(next)) break;
+            ++hi;
+        }
+    }
+    *s = (reader_selection_t){.active = true, .dragging = false, .anchor = lo, .focus = hi,
+        .generation = generation, .page = page};
+    if (update(s, text, length, g, count)) return true;
+    reader_selection_cancel(s); return false;
+}
+static bool sentence_end(uint32_t cp) {
+    return cp == '.' || cp == '!' || cp == '?' || cp == ';' || cp == ':' ||
+           cp == 0x3002 || cp == 0xff01 || cp == 0xff1f || cp == 0xff1b || cp == '\n';
+}
+bool reader_selection_expand_sentence(reader_selection_t *s, const char *text, size_t length,
+    const book_layout_glyph_t *g, size_t count) {
+    if (!s || !s->active || !text || !g || !count) return false;
+    size_t lo = s->anchor < s->focus ? s->anchor : s->focus;
+    size_t hi = s->anchor > s->focus ? s->anchor : s->focus;
+    uint32_t cp;
+    while (lo > 0 && same_line(g, lo - 1, lo) &&
+           scalar(text + g[lo - 1].start, length - g[lo - 1].start, &cp) && !sentence_end(cp)) --lo;
+    while (hi + 1 < count && same_line(g, hi, hi + 1) &&
+           scalar(text + g[hi + 1].start, length - g[hi + 1].start, &cp)) {
+        bool end = sentence_end(cp);
+        ++hi;
+        if (end) break;
+    }
+    reader_selection_t old = *s;
+    s->anchor = lo; s->focus = hi;
+    if (update(s, text, length, g, count)) return true;
+    *s = old; return false;
+}
+
 bool reader_selection_range(const reader_selection_t *s, const book_layout_glyph_t *g,
     size_t count, uint32_t *start, uint32_t *end) {
     if (!s || !s->active || !g || s->anchor >= count || s->focus >= count) return false;

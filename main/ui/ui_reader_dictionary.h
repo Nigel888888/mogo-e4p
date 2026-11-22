@@ -15,7 +15,7 @@ EpdRect ui_reader_dictionary_selection(uint8_t *fb, const reader_selection_t *se
     const book_layout_glyph_t *glyphs, size_t count);
 void ui_reader_dictionary_draw(uint8_t *fb, const ui_reader_dictionary_t *view,
     const book_dictionary_result_t *result, const char *query);
-/// 动作：0关闭、1上一屏、2下一屏、3逐字查询、4收藏生词、-1空白。/ Actions: close, previous, next, per-character lookup, collect word, or blank.
+/// 动作：0关闭、1上一屏、2下一屏、3逐字查询、4收藏生词、5存句到好句集、-1空白。/ Actions: close, previous, next, per-character lookup, collect word, collect sentence, or blank.
 int ui_reader_dictionary_action(const ui_reader_dictionary_t *view, int x, int y);
 size_t ui_reader_dictionary_page_end(const book_dictionary_result_t *result, size_t offset);
 size_t ui_reader_dictionary_content_size(const book_dictionary_result_t *result);
