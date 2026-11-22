@@ -385,9 +385,11 @@ int main(void){
     }
     assert(layouts==13);s_press_pending=false;strcpy(s_current.path,"/book.epub");
     slots[0]=APP_HOME_WIDGET_READING;slots[1]=APP_HOME_WIDGET_EMPTY;
-    ui_gesture_event_t ev={UI_GESTURE_TAP,540,118,540,118};nav=-1;
-    assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&nav==-1);
-    ev.x0=618;assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&nav==3);
+    ui_gesture_event_t ev={UI_GESTURE_TAP,540,118,540,118};nav=-1;ctx.request_menu=false;
+    assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&nav==-1&&!ctx.request_menu);
+    // 头像现在打开完整功能菜单，不再直接切到设置页。/ Avatar opens the full function menu instead of jumping to Settings.
+    ev.x0=618;assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&nav==-1&&ctx.request_menu);
+    ctx.request_menu=false;
     ev.x0=400;ev.y0=1150;on_gesture(&ctx,&ev);assert(nav==2);
     minute=s_clock_minute=100;s_cover_next=1;
     assert(on_tick(&ctx)==APP_REDRAW_NONE&&!draws&&!pages&&!fulls&&!scan_calls&&!cover_calls);

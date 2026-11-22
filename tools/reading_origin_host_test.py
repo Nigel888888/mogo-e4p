@@ -18,7 +18,7 @@ unit=r'''
 #include "home_components.h"
 #include "weather_service.h"
 typedef struct {int x,y,width,height;} EpdRect;
-typedef struct {int now_ms,leaf;} app_ctx_t;
+typedef struct {int now_ms,leaf;bool request_menu;} app_ctx_t;
 typedef enum {APP_REDRAW_NONE,APP_REDRAW_AREA,APP_REDRAW_PAGE,APP_REDRAW_FULL} app_redraw_t;
 enum {HOME_ROOT,HOME_COMPONENT,HOME_GOAL,HOME_TIME,READING,SHELF};
 enum {UI_GESTURE_PRESS,UI_GESTURE_MOVE,UI_GESTURE_TAP,UI_GESTURE_LONG_PRESS,UI_GESTURE_SWIPE_L,UI_GESTURE_SWIPE_R,UI_GESTURE_SWIPE_U,UI_GESTURE_CANCEL};

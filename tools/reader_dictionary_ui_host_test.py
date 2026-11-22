@@ -17,6 +17,7 @@ unit=r'''
 #include "ui_gesture.h"
 #include "reader_selection.h"
 #include "book_dictionary.h"
+#include "book_vocabulary.h"
 #include "ui_reader_dictionary.h"
 #include "reader_session_test.h"
 #define UI_LOCK_WIDTH 684
@@ -29,6 +30,13 @@ static book_dictionary_result_t s_dictionary_result;static size_t s_dictionary_h
 static size_t s_dictionary_character,s_dictionary_chapter;static int64_t s_dictionary_feedback_ms;
 static bool s_dictionary_feedback_pending,s_dictionary_presented;static EpdRect s_area;
 static struct {struct {size_t page,chapter;}position;}s_reader_session;
+/* 生词本宿主桩：只验证查词面板的只读查询与一键收藏调用。
+ * Vocabulary doubles: only the read-only membership check and one-tap save matter here. */
+static bool s_vocabulary_saved;static book_vocabulary_status_t s_vocabulary_status=BOOK_VOCABULARY_SAVED;
+bool book_vocabulary_contains(const char *query){(void)query;return s_vocabulary_saved;}
+book_vocabulary_status_t book_vocabulary_save(const book_vocabulary_entry_t *entry){(void)entry;s_vocabulary_saved=true;return s_vocabulary_status;}
+static char s_reader_notice[128];static int64_t s_reader_notice_until;
+static int64_t esp_timer_get_time(void){return 0;}
 static int64_t s_dictionary_notice_until;
 static unsigned generation=1,queries,cancels,draws;static bool pending,ready,map_missing;
 static book_layout_glyph_t glyphs[]={{0,3,10,20,30,40},{3,3,40,20,30,40},{6,3,70,20,30,40},{9,3,100,20,30,40}};
@@ -54,7 +62,7 @@ static app_redraw_t dictionary_dismiss(void);
 '''
 # 真实 app_ctx_t 的轻量宿主契约。/ Lightweight host contract for the actual page context.
 unit=unit.replace('#include "reader_session_test.h"','')
-for name in ('dictionary_cancel','dictionary_dismiss','dictionary_long_drag','dictionary_query','dictionary_union','dictionary_handle','dictionary_gesture','dictionary_tick'):
+for name in ('dictionary_cancel','dictionary_save','dictionary_dismiss','dictionary_long_drag','dictionary_query','dictionary_union','dictionary_handle','dictionary_gesture','dictionary_tick'):
     unit+=function(name,BOOK)+'\n'
 unit+=r'''
 static uint8_t fb[684*1216/2];static app_touch_t touch;
