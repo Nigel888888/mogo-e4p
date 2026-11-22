@@ -51,7 +51,10 @@ static void load_cfg(void) {
         if (fgets(line, sizeof(line), f)) {
             size_t n = strlen(line);
             while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
-            if (n) snprintf(s_cfg[i], XZ_FIELD_CAP, "%s", line);
+            if (n) {
+                if (n >= XZ_FIELD_CAP) n = XZ_FIELD_CAP - 1;
+                memcpy(s_cfg[i], line, n); s_cfg[i][n] = 0;
+            }
         }
     }
     fclose(f);
@@ -67,10 +70,20 @@ static bool save_cfg(void) {
 static void enter(app_ctx_t *ctx) { (void)ctx; make_code(); load_cfg(); s_page = XZ_MAIN; s_notice[0] = 0; }
 static void leave(app_ctx_t *ctx) { (void)ctx; ui_keyboard_end(); }
 
-static void masked(char *out, size_t cap, const char *v) {
+static void set_text(char *out, size_t cap, const char *v) {
+    if (!cap) return;
     size_t n = strlen(v);
-    if (n > 6) snprintf(out, cap, "%.4s****%s", v, v + n - 4);
-    else snprintf(out, cap, "%s", v);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, v, n); out[n] = 0;
+}
+static void masked(char *out, size_t cap, const char *v) {
+    if (!cap) return;
+    size_t n = strlen(v);
+    if (n <= 6 || cap < 9) { set_text(out, cap, v); return; }
+    memcpy(out, v, 4); memcpy(out + 4, "****", 4);
+    size_t tail = 4, room = cap - 9;
+    if (tail > room) tail = room;
+    memcpy(out + 8, v + n - tail, tail); out[8 + tail] = 0;
 }
 
 static void render_main(uint8_t *fb) {
@@ -83,7 +96,7 @@ static void render_main(uint8_t *fb) {
         EpdRect r = (EpdRect){36, XZ_ROW_Y + i * XZ_ROW_H, 612, XZ_ROW_H - 8};
         ui_draw_choice_round_rect(fb, r, 10, false);
         char value[XZ_FIELD_CAP];
-        if (i == 2) masked(value, sizeof(value), s_cfg[i]); else snprintf(value, sizeof(value), "%s", s_cfg[i]);
+        if (i == 2) masked(value, sizeof(value), s_cfg[i]); else set_text(value, sizeof(value), s_cfg[i]);
         char line[2 * XZ_FIELD_CAP];
         snprintf(line, sizeof(line), "%s：%s", kLabels[i], value[0] ? value : "未设置");
         char shown[2 * XZ_FIELD_CAP];
