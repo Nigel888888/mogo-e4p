@@ -44,6 +44,7 @@ static void wifi_transfer_get_saved_wifi(char *ssid,bool *saved){ssid[0]=0;*save
 static void settings_prepare_profile(void){}
 static bool s_ble_shortcut_back,s_enter_ble_from_quick,s_haptics_shortcut_back,s_enter_haptics_from_quick;
 static bool s_enter_network_from_quick,s_network_shortcut_back;
+static const char *s_network_notice;
 typedef struct {
  bool cellular_capability_known,cellular_capable,cellular_enabled,cellular_ready;
  int cellular_signal; unsigned char cellular_state; char cellular_detail[96];

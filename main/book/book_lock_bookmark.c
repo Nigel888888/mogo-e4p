@@ -204,25 +204,26 @@ static uint32_t layer_path_hash(const char *path) {
 }
 // PackBits：0x00..0x7F 后跟 n+1 个原样字节，0x80..0xFF 后跟 1 字节重复 257-n 次。
 // PackBits: 0x00..0x7F then n+1 literal bytes; 0x80..0xFF then one byte repeated 257-n times.
-typedef struct { FILE *f; size_t used,written; uint32_t hash; bool ok; } rle_write_t;
-// 32KB 暂存把每次 fwrite 从1KB提到半个簇，SD写入快数倍；只有一个写者，静态即可。
-// A 32KB stage lifts each fwrite from 1KB to half a cluster, several times faster on SD; one writer only, so static is fine.
-static uint8_t s_rle_stage[LOCK_LAYER_STAGE];
+typedef struct { FILE *f; uint8_t *stage; size_t used,written; uint32_t hash; bool ok; } rle_write_t;
 static bool rle_flush(rle_write_t *w) {
     if(!w->ok||!w->used)return w->ok;
-    if(fwrite(s_rle_stage,1,w->used,w->f)!=w->used){w->ok=false;return false;}
-    w->hash=layer_hash(s_rle_stage,w->used,w->hash);
+    if(fwrite(w->stage,1,w->used,w->f)!=w->used){w->ok=false;return false;}
+    w->hash=layer_hash(w->stage,w->used,w->hash);
     w->written+=w->used;w->used=0;return true;
 }
 static void rle_put(rle_write_t *w,uint8_t b) {
     if(!w->ok)return;
-    s_rle_stage[w->used++]=b;
+    w->stage[w->used++]=b;
     if(w->used==LOCK_LAYER_STAGE)rle_flush(w);
 }
 static bool layer_encode(FILE *f,const uint8_t *src,size_t n,uint32_t *size,uint32_t *hash) {
-    rle_write_t w={.f=f,.hash=2166136261u,.ok=true};
+    // 缓存写入才申请 PSRAM，保留大块写；分配失败只跳过缓存。
+    // Allocate PSRAM only for cache writes, retaining large writes; allocation failure skips only the cache.
+    rle_write_t w={.f=f,.stage=heap_caps_malloc(LOCK_LAYER_STAGE,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT),
+                   .hash=2166136261u,.ok=true};
+    if(!w.stage)return false;
     size_t i=0;
-    while(i<n) {
+    while(w.ok&&i<n) {
         size_t run=1;
         while(i+run<n&&src[i+run]==src[i]&&run<129)++run;
         if(run>=3){rle_put(&w,(uint8_t)(257-run));rle_put(&w,src[i]);i+=run;continue;}
@@ -234,7 +235,9 @@ static bool layer_encode(FILE *f,const uint8_t *src,size_t n,uint32_t *size,uint
         rle_put(&w,(uint8_t)(i-start-1));
         for(size_t k=start;k<i;++k)rle_put(&w,src[k]);
     }
-    if(!rle_flush(&w))return false;
+    bool ok=rle_flush(&w);
+    free(w.stage);
+    if(!ok)return false;
     *size=(uint32_t)w.written;*hash=w.hash;return true;
 }
 static bool layer_decode(const uint8_t *src,size_t n,uint8_t *out,size_t out_n) {

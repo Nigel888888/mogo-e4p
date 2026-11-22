@@ -91,3 +91,5 @@ NVS
 全
 # 中文天气城市回归样本。/ Chinese weather-city regression sample.
 石家庄
+# 常规界面的必备轮廓字；固定文案不依赖 24 px 补充位图。/ Required UI outlines; fixed labels do not rely on 24 px supplemental bitmaps.
+万估八具净剪囊尾异归徽搭旋景材析框箭素繁纯胶裁观追遥震顾驻

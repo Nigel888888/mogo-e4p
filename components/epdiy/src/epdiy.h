@@ -545,6 +545,9 @@ enum EpdDrawError epd_draw_base(
 
 /// 下一次扫描按行选择相位 LUT；负相位表示该行保持。/ Select a phase LUT by line for the next scan; negative phases hold.
 void epd_set_line_phase_luts(const uint8_t* const* phase_luts, const int8_t* line_phase);
+/// 行错相仅用于 [x0,x1)；区外用独立的 1 KiB LUT，范围为原生列。
+/// Use staggered row phases inside native columns [x0,x1), an independent 1 KiB LUT outside.
+void epd_set_line_phase_outer_lut(const uint8_t* lut, int x0, int x1);
 /// 下一次扫描按物理列条带选择相位 LUT；范围为半开像素区间。/ Select phase LUTs by physical column bands for the next scan.
 void epd_set_col_phase_luts(const uint8_t* const* phase_luts, const int* x0, const int* x1,
                             const int8_t* phase, int nbands);
@@ -577,6 +580,9 @@ int epd_lcd_prefill_lines(void);
 /** 作废上一次差分顺手做的 (from, to) 统计。算了差分却没接着扫描时调，免得被后面
  *  别的绘制误用；`epd_draw_base` 自己用完也会作废。 */
 void epd_leading_skip_discard(void);
+
+/// 临时波形释放前作废前导相位缓存。/ Invalidate the leading-phase cache before releasing a temporary waveform.
+void epd_leading_skip_forget_waveform(void);
 
 /**
  * 差分实际计算的列范围：crop_to 的列区间向外对齐到 32 像素。`epd_difference_image_cropped`

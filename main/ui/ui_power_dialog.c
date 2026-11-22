@@ -1,11 +1,17 @@
 /* SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
- * 中文：长按电源的滑动关机层；实心灰阶控件，不分配、刷屏、写设置或调用硬件。
- * English: Slide-to-off layer for a power hold with solid grayscale controls; no allocation, presentation, settings writes or hardware calls.
+ * 中文：长按电源的滑动关机层与最终画面；控件纯绘制，独立准备入口可分配并读取TF关机图。
+ * English: Slide-to-off controls and final art; controls paint only, while the separate prepare entry may allocate and read SD-cached shutdown art.
  * 用户修订：恢复原实心滑轨与圆钮，不再生成液态玻璃或缓存控件底图。
  * User revision: restore the solid track and circle buttons without liquid glass or cached control backdrops.
  */
 #include "ui_power_dialog.h"
+#include "shutdown_wallpaper.h"
+#include "settings.h"
+#include "memory_manager.h"
+#include "book_ticket.h"
+#include "book_lock_collage.h"
+#include "lock_calendar.h"
 #include <stdlib.h>
 #include <string.h>
 #include "ui_kit.h"
@@ -180,4 +186,29 @@ void ui_power_final_draw(uint8_t *fb, bool restarting) {
     ui_draw_icon(fb, cx, 486, 72, restarting ? UI_ICON_ROTATE_CW : UI_ICON_POWER, UI_GRAY_BLACK);
     ui_text(fb, cx, 548, 48, restarting ? "正在重启" : "mogo 已关机", EPD_DRAW_ALIGN_CENTER, false);
     if (!restarting) ui_text(fb, cx, 624, 26, "长按电源键开机", EPD_DRAW_ALIGN_CENTER, false);
+}
+
+void ui_power_shutdown_prepare(uint8_t *fb) {
+    const app_shutdown_wallpaper_t *value = app_settings_shutdown_wallpaper();
+    if (value->style == APP_OFF_SYSTEM) { ui_power_final_draw(fb, false); return; }
+    ui_clear_page(fb);
+    bool ok = false;
+    if (value->style == APP_OFF_TICKET) ok = book_ticket_preview(fb, value->ticket_background == 1);
+    else if (value->style == APP_OFF_COLLAGE) ok = book_lock_collage_prepare(fb);
+    else if (value->style == APP_OFF_CALENDAR) ok = lock_calendar_draw_variant(fb, value->calendar_style == 1);
+    else if (value->style == APP_OFF_CUSTOM) {
+        uint8_t *pixels = mm_alloc(MM_OWNER_FILE_JOB, MM_POOL_PSRAM, SHUTDOWN_ART_BYTES, 0, 0);
+        ok = pixels && shutdown_wallpaper_read(value, pixels);
+        if (ok) for (unsigned y = 0; y < SHUTDOWN_ART_HEIGHT; ++y) for (unsigned x = 0; x < SHUTDOWN_ART_WIDTH; ++x) {
+            unsigned at = y * SHUTDOWN_ART_WIDTH + x;
+            epd_draw_pixel((int)x, (int)y, ((pixels[at / 2] >> ((at & 1u) * 4u)) & 15u) * 17u, fb);
+        }
+        mm_free(pixels);
+    }
+    if (!ok) { ui_power_final_draw(fb, false); return; }
+    if (value->show_hint) {
+        epd_fill_rect((EpdRect){132, 1080, 420, 100}, 255, fb);
+        ui_text(fb, 342, 1096, 27, "mogo 已关机", EPD_DRAW_ALIGN_CENTER, false);
+        ui_text(fb, 342, 1140, 24, "长按电源键开机", EPD_DRAW_ALIGN_CENTER, false);
+    }
 }

@@ -67,6 +67,8 @@ static int s_count,s_visible_count,s_view=0;
 enum {SHELF};
 static char s_query[65],s_latest_path[288],s_requested_open[288];
 static bool s_recent_sort=true,s_requested_open_home;
+static bool s_requested_resume;
+static int64_t s_resume_next_ms,s_resume_deadline_ms;
 typedef struct {shelf_entry_t **entries;int *count;size_t *capacity;} book_shelf_catalog_t;
 typedef struct book_shelf_cache book_shelf_cache_t;
 typedef struct {book_shelf_catalog_t catalog;const char *query;bool (*cancel)(void*);void *cancel_ctx;int (*category_add)(const char*);bool (*favorite_read)(nvs_handle_t,const char*);bool (*hidden_read)(nvs_handle_t,const char*);nvs_handle_t progress;bool progress_checked;book_shelf_cache_t *cache;bool metadata;} book_shelf_scan_t;

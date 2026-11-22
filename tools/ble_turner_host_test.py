@@ -17,7 +17,7 @@ PAGE = ROOT / 'main/apps/settings_bluetooth.c'
 
 def function(path, name):
     source = path.read_text()
-    match = re.search(r'^(?:static )?[^\n]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
+    match = re.search(r'^(?:static )?[A-Za-z_][^\n]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
     assert match, name
     start, pos, depth = match.start(), match.end(), 1
     # Remove comments while keeping byte positions, then count braces outside strings.
@@ -43,6 +43,7 @@ unit = r'''
 #include <strings.h>
 #include <stdint.h>
 #include "ble_page_turner.h"
+#include "memory_peak.h"
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
@@ -88,8 +89,10 @@ static int ble_hs_adv_parse_fields(struct ble_hs_adv_fields *out,const uint8_t *
 static uint16_t ble_uuid_u16(const uint16_t *uuid){return *uuid;}
 static void *bond_find(const char *addr){assert(addr);return NULL;}
 static atomic_flag s_lifecycle=ATOMIC_FLAG_INIT;
-static atomic_uint s_network_users;
-static atomic_bool s_running;
+static atomic_uint s_network_users, s_host_peak;
+static uint32_t s_host_start_ms;
+static char s_pending_addr[18];
+static atomic_bool s_running, s_cellular_pause;
 static bool s_connected=true,s_connecting,s_scanning,s_link_up;
 static char s_reconnect_addr[18];
 static uint32_t s_reconnect_at;
@@ -164,8 +167,8 @@ static void nvs_close(nvs_handle_t h){if(h==1)binding_handles--;}
 for name in ('addr_hash','bond_key','bindings_load','lifecycle_take','lifecycle_give','ble_pt_input_serial','key_push','raw_push','frame_of','frame_same',
              'frame_idle','raw_release','raw_reset','raw_frame','extract_primary_code',
              'usage_to_special','emit_usage','ingest_report','ble_pt_pop_key','ble_pt_pop_raw',
-             'ble_pt_learn_begin','ble_pt_bind','ble_pt_binding','start_locked','stop_locked','ble_pt_start','ble_pt_stop',
-             'ble_pt_stop_for_sleep','ble_pt_network_acquire','ble_pt_network_release','note_report','scan_cb','ble_pt_device_count',
+             'ble_pt_learn_begin','ble_pt_bind','ble_pt_binding','ble_start_heap','ble_check_start_heap','ble_pt_enable_block_reason','ble_pt_running','start_locked','stop_locked','ble_pt_start','ble_pt_stop',
+             'ble_pt_stop_for_sleep','network_conflict_locked','ble_pt_network_check','network_acquire','ble_pt_cellular_acquire','ble_pt_cellular_release','ble_pt_cellular_paused','ble_pt_network_acquire','ble_pt_network_release','ble_pt_network_paused','note_report','scan_cb','ble_pt_device_count',
              'ble_pt_device','ble_pt_action_for_frame','ble_pt_action_for_usage',
              'hint_key','hints_load','hints_save','hints_clear'):
     unit += '\n' + function(BLE, name)
@@ -384,19 +387,40 @@ int main(void){
  for(int kind=0;kind<3;kind++){
   free_internal=150*1024;largest_internal=60*1024;free_psram=2*1024*1024;
   if(kind==0)free_internal=55*1024;if(kind==1)largest_internal=19*1024;if(kind==2)free_psram=255*1024;
-  int before=init_count;assert(ble_pt_start()==ESP_ERR_NO_MEM && !s_running && init_count==before);
+  int before=init_count;
+  const esp_err_t expected=kind==1?MEMORY_PEAK_FRAGMENT:MEMORY_PEAK_CAPACITY;
+  assert(ble_check_start_heap(ble_start_heap())==expected);
+  assert(ble_pt_enable_block_reason()!=NULL && init_count==before);
+  assert(ble_pt_start()==ESP_ERR_NO_MEM && !s_running && init_count==before);
  }
  free_internal=150*1024;largest_internal=60*1024;free_psram=2*1024*1024;
  task_error=1;assert(ble_pt_start()==ESP_ERR_NO_MEM && !s_running && task_count==1 && deinit_count==1);
  task_error=0;assert(ble_pt_start()==ESP_OK && s_running);
- stop_error=1;assert(ble_pt_network_acquire()==ESP_FAIL && atomic_load(&s_network_users)==0 && s_running);
- stop_error=0;assert(ble_pt_network_acquire()==ESP_OK && !s_running && atomic_load(&s_network_users)==1);
- int before=init_count;assert(ble_pt_start()==ESP_ERR_INVALID_STATE && init_count==before);
+ s_connected=true;assert(ble_pt_network_check()==MEMORY_PEAK_CONFLICT);
+ assert(ble_pt_cellular_acquire()==MEMORY_PEAK_CONFLICT && !ble_pt_cellular_paused() && s_running);
+ assert(ble_pt_network_acquire()==MEMORY_PEAK_CONFLICT && atomic_load(&s_network_users)==0 && s_running);
+ s_connected=false;s_connecting=true;assert(ble_pt_network_acquire()==MEMORY_PEAK_CONFLICT);
+ s_connecting=false;s_scanning=true;assert(ble_pt_network_acquire()==MEMORY_PEAK_CONFLICT);
+ s_scanning=false;s_link_up=true;assert(ble_pt_network_acquire()==MEMORY_PEAK_CONFLICT);
+ s_link_up=false;s_pending_addr[0]='X';assert(ble_pt_network_acquire()==MEMORY_PEAK_CONFLICT);
+ assert(ble_pt_cellular_acquire()==MEMORY_PEAK_CONFLICT && !ble_pt_cellular_paused());
+ s_pending_addr[0]=0;
+ stop_error=1;assert(ble_pt_cellular_acquire()==ESP_FAIL && !ble_pt_cellular_paused() && s_running);assert(ble_pt_network_acquire()==ESP_FAIL && atomic_load(&s_network_users)==0 && s_running);
+ stop_error=0;assert(ble_pt_network_acquire()==ESP_OK && !s_running && ble_pt_network_paused());
+ int before=init_count;
+ assert(strstr(ble_pt_enable_block_reason(),"Wi-Fi 使用中") && init_count==before);
+ assert(ble_pt_start()==ESP_ERR_INVALID_STATE && init_count==before);
  assert(ble_pt_network_acquire()==ESP_OK && atomic_load(&s_network_users)==2);
  ble_pt_network_release();assert(ble_pt_start()==ESP_ERR_INVALID_STATE);
- ble_pt_network_release();ble_pt_network_release();assert(!atomic_load(&s_network_users));
+ ble_pt_network_release();ble_pt_network_release();assert(!ble_pt_network_paused());
+ assert(!ble_pt_enable_block_reason() && init_count==before);
+ assert(ble_pt_start()==ESP_OK);
+ assert(ble_pt_cellular_acquire()==ESP_OK && !s_running && ble_pt_network_paused());
+ assert(strstr(ble_pt_enable_block_reason(),"4G 使用中") && ble_pt_start()==ESP_ERR_INVALID_STATE);
+ ble_pt_network_release();assert(ble_pt_cellular_paused() && !s_running);
+ ble_pt_cellular_release();assert(!ble_pt_network_paused() && !ble_pt_enable_block_reason());
  assert(ble_pt_start()==ESP_OK);assert(ble_pt_stop(2000)==ESP_OK && !s_running);
- atomic_flag_test_and_set(&s_lifecycle);assert(ble_pt_start()==ESP_ERR_TIMEOUT && !s_running);lifecycle_give();
+ atomic_flag_test_and_set(&s_lifecycle);assert(ble_pt_start()==MEMORY_PEAK_BUSY && !s_running);lifecycle_give();
  for(int n=0;n<100;n++){assert(ble_pt_start()==ESP_OK);assert(ble_pt_network_acquire()==ESP_OK);ble_pt_network_release();}
  // 解码提示按对端缓存：两个页各占一位，别的地址读不到，忘掉设备后也查不到。
  // Decode hints are cached per peer with one bit per page; another address cannot read them and
@@ -424,13 +448,15 @@ assert 'drain_keys(); ble_pt_learn_begin();' in function(PAGE, 'settings_bluetoo
 # Entering the scan page drops the current link; the tick starts the scan once it is down.
 assert 'ble_pt_disconnect()' in function(PAGE, 'begin_scan')
 assert 'ble_pt_scan_start(BLE_PT_SCAN_FOREVER)' in function(PAGE, 'settings_bluetooth_tick')
-# 对时入口经 sync_time_run 落到持有 BLE 租约的 sync_time_impl；扫描与传输入口直接取租约。
-# The sync-time entry delegates through sync_time_run to the leased sync_time_impl; scan and
-# transfer start hold the lease directly.
-transfer = (ROOT / 'components/wifi_transfer/wifi_transfer.c').read_text()
-for name in ('wifi_transfer_start', 'wifi_transfer_scan_wifi', 'sync_time_impl'):
-    assert 'ble_pt_network_acquire()' in function(ROOT / 'components/wifi_transfer/wifi_transfer.c', name)
-assert 'sync_time_run(utc_seconds, false, false)' in function(ROOT / 'components/wifi_transfer/wifi_transfer.c', 'wifi_transfer_sync_time')
+# 对时和扫描独占；传输入口按模式申请，提前失败和停服走同一归还路径。
+# Time sync and scan are exclusive; transfer start reserves by mode and shares release on failure/stop.
+wifi = ROOT / 'components/wifi_transfer/wifi_transfer.c'
+transfer = wifi.read_text()
+for name in ('wifi_transfer_start_admitted', 'wifi_transfer_scan_admitted', 'sync_time_impl'):
+    assert 'ble_pt_network_acquire()' in function(wifi, name)
+start = function(wifi, 'wifi_transfer_start_admitted')
+assert 'wifi_release_ble()' in start and 'wifi_release_ble()' in function(wifi, 'wifi_transfer_stop')
+assert 'sync_time_run(utc_seconds, false, false, true)' in function(ROOT / 'components/wifi_transfer/wifi_transfer.c', 'wifi_transfer_sync_time')
 assert 'sync_time_impl(utc_seconds)' in function(ROOT / 'components/wifi_transfer/wifi_transfer.c', 'sync_time_run')
 assert transfer.count('ble_pt_network_acquire()') == 3
 # 描述符遍历只能在自己的特征定义范围内，Report Map 必须分段读全。

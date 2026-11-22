@@ -8,6 +8,7 @@ ROOT=Path(__file__).resolve().parents[1]
 BG=ROOT/'main/ui/ui_reader_background.c'
 unit=r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -16,31 +17,44 @@ unit=r'''
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#define READER_BG_CACHE_ROOT "background-cache"
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 #define BOOK_IMAGE_FILE_MAX (50u*1024u*1024u)
 typedef struct {int x,y,width,height;} EpdRect;
 enum {EPD_ROT_LANDSCAPE,EPD_ROT_PORTRAIT,EPD_ROT_INVERTED_LANDSCAPE,EPD_ROT_INVERTED_PORTRAIT};
 static int rotation,device_w=64,device_h=96;
-static bool missing,oom,decode_fail;
+static bool missing,oom,decode_fail,change_during_decode;
+static bool cache_enabled,write_short,close_fail,sync_fail,rename_fail;
+static unsigned cache_opens,stat_calls,change_at_stat,fail_on_allocation;
 static int gray_mode;
 static unsigned allocations,decodes,source_w=684,source_h=1216;
 static size_t available=3u*1024u*1024u,largest=3u*1024u*1024u,live,peak;
 static time_t modified=1;
-static int mock_stat(const char *p,struct stat *st){(void)p;if(missing)return -1;memset(st,0,sizeof(*st));st->st_mode=S_IFREG;st->st_size=100;st->st_mtime=modified;return 0;}
+static off_t source_bytes=100;
+static int mock_stat(const char *p,struct stat *st){(void)p;if(++stat_calls==change_at_stat)++modified;if(missing)return -1;memset(st,0,sizeof(*st));st->st_mode=S_IFREG;st->st_size=source_bytes;st->st_mtime=modified;return 0;}
 #define stat(p,s) mock_stat(p,s)
-static size_t heap_caps_get_free_size(unsigned caps){assert(caps==3);return available;}
+static size_t heap_caps_get_free_size(unsigned caps){assert(caps==3);return available>live?available-live:0;}
 static size_t heap_caps_get_largest_free_block(unsigned caps){assert(caps==3);return largest;}
-static void *plane_ptr,*out_ptr;
-static size_t plane_bytes,out_bytes;
-static void track(void *p,size_t bytes){if(!p)return;live+=bytes;if(live>peak)peak=live;++allocations;}
-static void *heap_caps_malloc(size_t bytes,unsigned caps){assert(caps==3);if(oom)return NULL;void *p=malloc(bytes);plane_ptr=p;plane_bytes=bytes;track(p,bytes);return p;}
-static void *heap_caps_calloc(size_t n,size_t bytes,unsigned caps){assert(caps==3);if(oom)return NULL;void *p=calloc(n,bytes);out_ptr=p;out_bytes=n*bytes;track(p,n*bytes);return p;}
-static void test_free(void *p){if(!p)return;if(p==plane_ptr){live-=plane_bytes;plane_ptr=NULL;}else if(p==out_ptr){live-=out_bytes;out_ptr=NULL;}free(p);}
+static struct {void *p;size_t bytes;} owned[4];
+static void *heap_caps_malloc(size_t bytes,unsigned caps){assert(caps==3);if(oom||allocations+1==fail_on_allocation)return NULL;void *p=malloc(bytes);if(!p)return NULL;for(unsigned i=0;i<4;++i)if(!owned[i].p){owned[i].p=p;owned[i].bytes=bytes;live+=bytes;if(live>peak)peak=live;++allocations;return p;}abort();}
+static void test_free(void *p){if(!p)return;for(unsigned i=0;i<4;++i)if(owned[i].p==p){live-=owned[i].bytes;owned[i].p=NULL;break;}free(p);}
 #define free(p) test_free(p)
+static FILE *cache_fopen(const char *p,const char *mode){++cache_opens;return cache_enabled?fopen(p,mode):NULL;}
+static size_t cache_fwrite(const void *p,size_t size,size_t count,FILE *f){return fwrite(p,size,write_short&&count?count-1:count,f);}
+static int cache_fclose(FILE *f){int result=fclose(f);return close_fail?-1:result;}
+static int cache_fsync(int fd){return sync_fail?-1:fsync(fd);}
+static int cache_rename(const char *from,const char *to){if(rename_fail||!access(to,F_OK)){errno=EIO;return -1;}return rename(from,to);}
+#define fopen cache_fopen
+#define fwrite cache_fwrite
+#define fclose cache_fclose
+#define fsync cache_fsync
+#define rename cache_rename
+static uint32_t esp_crc32_le(uint32_t crc,const uint8_t *p,uint32_t bytes){crc=~crc;while(bytes--){crc^=*p++;for(unsigned i=0;i<8;++i)crc=(crc>>1)^(0xedb88320u&-(crc&1u));}return ~crc;}
 static bool book_image_file_dimensions(const char *p,bool png,unsigned *w,unsigned *h){(void)p;(void)png;*w=source_w;*h=source_h;return true;}
 static uint8_t sample(unsigned x,unsigned y){return (uint8_t)(x*47u+y*37u);}
-static bool book_image_file_grayscale(const char *p,bool png,unsigned w,unsigned h,uint8_t *out){(void)p;(void)png;++decodes;if(decode_fail)return false;for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)out[(size_t)y*w+x]=gray_mode==1?250:gray_mode==2?239:sample(x,y);return true;}
+static bool book_image_file_grayscale(const char *p,bool png,unsigned w,unsigned h,uint8_t *out){(void)p;(void)png;++decodes;if(decode_fail)return false;for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x)out[(size_t)y*w+x]=gray_mode==1?250:gray_mode==2?239:sample(x,y);if(change_during_decode)++modified;return true;}
 static int epd_width(void){return device_w;}
 static int epd_height(void){return device_h;}
 static int epd_get_rotation(void){return rotation;}
@@ -59,8 +73,64 @@ s=BG.read_text();start=s.index('static uint8_t *s_gray;');end=s.index('void ui_r
 unit+=s[start:end]
 for n in ('ui_reader_background_release','panel_nibble','ui_reader_background_prepare','ui_reader_background_paint'):unit+=function(n,BG)+'\n'
 unit+=r'''
+#undef fopen
+#undef fwrite
+#undef fclose
+#undef fsync
+#undef rename
 static uint8_t read_pixel(const uint8_t *fb,int x,int y){size_t at=panel_nibble(x,y);return (uint8_t)(((fb[at>>1]>>((at&1)*4))&15)<<4);}
 static uint8_t expect_gray(unsigned x,unsigned y){uint8_t g=sample(x,y);if(g>=240)g=255;return ui_image_dither_gray(g,(int)x,(int)y)&0xf0;}
+static void poison_cache(long offset){FILE *f=fopen(READER_BG_CACHE_DIR "/0.bin","r+b");assert(f&&!fseek(f,offset,SEEK_SET));int byte=fgetc(f);assert(byte!=EOF&&!fseek(f,offset,SEEK_SET));assert(fputc(byte^1,f)!=EOF&&!fclose(f));}
+static void rebuild(const char *path){unsigned before=decodes;ui_reader_background_release();assert(ui_reader_background_prepare(path)&&decodes==before+1&&live==415872);}
+static void disk_tests(void){
+ const char *path="/sdcard/pictures/native.png";
+ device_w=684;device_h=1216;rotation=0;cache_enabled=true;peak=0;
+ rebuild(path);assert(peak==1247616);
+ // 退出后只分配成品；片段不足以容纳解码面时仍能命中缓存。
+ // After exit, allocate only the result; a heap too fragmented for decoding can still load cached art.
+ ui_reader_background_release();unsigned before=decodes,count=allocations;peak=0;
+ available=415872+1024u*1024u;largest=415872;decode_fail=true;
+ assert(ui_reader_background_prepare(path)&&decodes==before&&allocations==count+1&&peak==415872);
+ unsigned opened=cache_opens;assert(ui_reader_background_prepare(path)&&cache_opens==opened);
+ decode_fail=false;available=largest=3u*1024u*1024u;
+ // 完整像素比较四种旋转，第二轮全部从卡读取；内存始终只有一张。
+ // Compare every pixel in four rotations; reload all four from SD with only one live RAM result.
+ for(rotation=0;rotation<4;++rotation){ui_reader_background_release();assert(ui_reader_background_prepare(path));}
+ before=decodes;
+ for(rotation=0;rotation<4;++rotation){
+  ui_reader_background_release();assert(ui_reader_background_prepare(path)&&decodes==before&&live==415872);
+  for(int y=0;y<epd_rotated_display_height();++y)for(int x=0;x<epd_rotated_display_width();++x)assert(read_pixel(s_gray,x,y)==expect_gray(x,y));
+ }
+ rotation=0;
+ poison_cache((long)sizeof(background_cache_header_t)+17);rebuild(path);
+ poison_cache(offsetof(background_cache_header_t,version));rebuild(path);
+ poison_cache(offsetof(background_cache_header_t,path));rebuild(path);
+ poison_cache(offsetof(background_cache_header_t,rotation));rebuild(path);
+ assert(!truncate(READER_BG_CACHE_DIR "/0.bin",sizeof(background_cache_header_t)+10));rebuild(path);
+ FILE *extra=fopen(READER_BG_CACHE_DIR "/0.bin","ab");assert(extra&&fputc(7,extra)!=EOF&&!fclose(extra));rebuild(path);
+ ++modified;rebuild(path);++source_bytes;rebuild(path);
+ rebuild("/sdcard/pictures/other.png");rebuild(path);
+ missing=true;assert(!ui_reader_background_prepare(path)&&!live);missing=false;
+ // 缓存写入失败不能妨碍本次背景；短写/关闭/同步失败清临时文件，改名失败可重新生成。
+ // Cache-write faults retain this frame; short writes/close/sync faults clean temporaries, and rename faults rebuild later.
+ bool *faults[]={&write_short,&close_fail,&sync_fail,&rename_fail};
+ for(unsigned i=0;i<4;++i){
+  ++modified;*faults[i]=true;rebuild(path);assert(access(READER_BG_CACHE_DIR "/0.bin.tmp",F_OK));
+  *faults[i]=false;rebuild(path);ui_reader_background_release();before=decodes;
+  assert(ui_reader_background_prepare(path)&&decodes==before);
+ }
+ ++modified;cache_enabled=false;rebuild(path);cache_enabled=true;rebuild(path);
+ ui_reader_background_release();change_at_stat=stat_calls+2;
+ assert(!ui_reader_background_prepare(path)&&!live);change_at_stat=0;rebuild(path);
+ ui_reader_background_release();++modified;fail_on_allocation=allocations+2;
+ assert(!ui_reader_background_prepare(path)&&!live);fail_on_allocation=0;rebuild(path);
+ ui_reader_background_release();++modified;change_during_decode=true;
+ assert(!ui_reader_background_prepare(path)&&!live);change_during_decode=false;rebuild(path);
+ ui_reader_background_release();decode_fail=true;++modified;
+ assert(!ui_reader_background_prepare(path)&&!live);decode_fail=false;rebuild(path);
+ ui_reader_background_release();
+ puts("PASS: SD background survives RAM release in four bounded orientation slots; cached load uses one 415872B allocation and zero decodes; exact four-rotation pixels; path/size/mtime/version/rotation/CRC/truncation/trailing-data invalidation; missing/read-only media, short-write/close/sync/rename failures, source replacement and decode failure");
+}
 '''
 unit+=r'''
 int main(void){
@@ -112,6 +182,7 @@ int main(void){
  decode_fail=true;assert(!ui_reader_background_prepare("/sdcard/pictures/native.png")&&!live);decode_fail=false;
  device_w=63;device_h=95;assert(ui_reader_background_prepare("/sdcard/pictures/odd.png")&&live==(63u*95u+1)/2&&(s_gray[live-1]&15)==15);
  device_w=2000;assert(!ui_reader_background_prepare("/sdcard/pictures/odd.png")&&!live);
+ disk_tests();
  puts("PASS: native 684x1216/16-gray wallpaper; white-point clamp (250 -> pure white, 239 dithered); tones below the white point and single-pixel detail; preview matches reader; fixed partial repaints in four rotations; black/AA preserved; one 415872B cache plus 831744B decode plane (1247616B peak); reuse/modified file/low memory/fragmentation/OOM/decode failure and odd-size packing");
 }
 '''
@@ -163,7 +234,8 @@ typedef struct {uint32_t chapter,pct;} book_progress_t;
 enum {APP_TICKET_BACKGROUND_TRANSPARENT,APP_TICKET_BACKGROUND_COVER};
 static unsigned ticket_background;
 static unsigned app_settings_ticket_background(void){return ticket_background;}
-static bool history=true,cover_ok=true,alloc_ok=true;
+static bool history=true,cover_ok=true,list_cover_ok=false,alloc_ok=true;
+static unsigned list_cover_width=120,list_cover_height=240;
 static unsigned rotation,cover_loads,text_draws;
 static size_t live;
 static size_t offset(int x,int y){assert(x>=0&&x<684&&y>=0&&y<1216);return rotation?(size_t)(683-x)*1216+y:(size_t)y*684+x;}
@@ -184,7 +256,8 @@ static void *heap_caps_malloc(size_t n,unsigned caps){assert(caps==3&&n==BOOK_CO
 static void release(void *p){if(p){assert(live==BOOK_COVER_W*BOOK_COVER_H);live=0;free(p);}}
 #define free(p) release(p)
 static bool book_cover_load_gray(const char *path,const char *title,const char *author,uint8_t *gray,bool decode,bool *pending){assert(*path&&*title&&*author&&!decode&&!pending);++cover_loads;if(!cover_ok)return false;memset(gray,0,BOOK_COVER_W*BOOK_COVER_H);return true;}
-static uint8_t ui_contrast_gray(uint8_t gray){return gray;}
+static bool book_cover_load_list_gray(const char *path,const char *title,const char *author,uint8_t *gray,bool decode,bool *pending,unsigned *width,unsigned *height){(void)path;(void)title;(void)author;assert(!decode&&!pending&&width&&height);if(!list_cover_ok)return false;*width=list_cover_width;*height=list_cover_height;memset(gray,UI_GRAY_WHITE,BOOK_COVER_W*BOOK_COVER_H);for(unsigned y=0;y<*height;++y)for(unsigned x=0;x<*width;++x)gray[y*(*width)+x]=(uint8_t)((x+y)%200);return true;}
+static uint8_t app_settings_system_contrast(void){return 100;}
 static bool book_progress_last_path(char *path,size_t size){snprintf(path,size,"/missing.epub");return history;}
 static bool book_excerpt_load(const char *path,char out[BOOK_EXCERPT_CAP]){assert(!strcmp(path,"/missing.epub"));snprintf(out,BOOK_EXCERPT_CAP,"A sentence from the recent book.");return true;}
 static bool book_progress_load(const char *path,uint32_t size,book_progress_t *out){(void)path;(void)size;*out=(book_progress_t){.chapter=4,.pct=42};return true;}
@@ -195,8 +268,10 @@ static void stats_load(ticket_stats_t *stats){*stats=(ticket_stats_t){0};}
 static uint32_t local_day(void){return 0;}
 '''
 ticket_path=ROOT/'main/book/book_ticket.c'
+ticket_art += '#include "' + str(ROOT/'main/image/image_decode.h') + '"\n'
+ticket_art += '#include "' + str(ROOT/'main/ui/ui_image_dither.h') + '"\n'
 ticket_art+=function('ui_image_dither_gray',ROOT/'main/ui/ui_image_dither.c')+'\n'
-for name in ('text_fit','cover_load','cover_background_draw','notch_depth','ticket_paper_draw','ticket_shadow_draw','cover_draw','ticket_stat','ticket_heading','book_ticket_preview','book_ticket_draw'):
+for name in ('text_fit','cover_load_list_cache','cover_load','cover_background_draw','notch_depth','ticket_paper_draw','ticket_shadow_draw','cover_draw','ticket_stat','ticket_heading','book_ticket_preview','book_ticket_draw'):
  ticket_art+=function(name,ticket_path)+'\n'
 ticket_art+=r'''
 int main(void){
@@ -220,6 +295,12 @@ int main(void){
   assert(pixel(frame,638,600)==136);
   assert(pixel(frame,300,500)==(mode==0?0:238));
  }
+ list_cover_ok=true;cover_ok=false;alloc_ok=true;ticket_background=0;rotation=0;
+ uint8_t centered[BOOK_COVER_W*BOOK_COVER_H];assert(cover_load_list_cache("/missing.epub","Test title","Author",centered));
+ assert(centered[28]==0&&centered[176*120+28]==120%200&&centered[176*120+27]==UI_GRAY_WHITE&&centered[176*120+148]==UI_GRAY_WHITE);
+ for(size_t at=0;at<sizeof(frame);++at)frame[at]=0xff;
+ unsigned before=cover_loads;assert(book_ticket_draw(frame,false)&&cover_loads==before+1&&!live);
+ assert(pixel(frame,300,500)!=238);
  for(ticket_background=0;ticket_background<2;++ticket_background){
   history=false;memcpy(frame,original,BYTES);unsigned before=cover_loads;
   assert(!book_ticket_draw(frame,false)&&!memcmp(frame,original,BYTES)&&cover_loads==before&&!live);
@@ -231,4 +312,4 @@ with tempfile.TemporaryDirectory(dir=ROOT/'build') as directory:
  for name,code in [('background',unit),('ticket',ticket),('ticket_art',ticket_art)]:
   c=Path(directory)/(name+'.c');exe=Path(directory)/name;c.write_text(code)
   subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-sign-compare','-fsanitize=address,undefined',str(c),'-o',str(exe)],check=True)
-  subprocess.run([str(exe)],check=True)
+  subprocess.run([str(exe)],check=True,cwd=directory)

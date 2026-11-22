@@ -196,7 +196,7 @@ static void paint_words(uint8_t *fb, int top) {
         char text[UI_IME_RAW_MAX * 7 + 1]; composition_text(text);
         ui_text_input_composition(fb, text, rect(28, 57, 552, 35, top), 25);
     }
-    else if (!s_probe && !s_keys_only) ui_text_fixed_vc(fb, 28, top + 75, 22, s_chinese ? "连续输入拼音，选择词语" : "轻点输入，可切换大小写", EPD_DRAW_ALIGN_LEFT, false);
+    else if (!s_probe && !s_keys_only && !s_ascii) ui_text_fixed_vc(fb, 28, top + 75, 22, s_chinese ? "连续输入拼音，选择词语" : "轻点输入，可切换大小写", EPD_DRAW_ALIGN_LEFT, false);
     EpdRect boxes[5]; size_t count = visible(s_page, boxes, top);
     for (size_t i = 0; i < count; ++i) {
         char text[UI_IME_TEXT_MAX]; snprintf(text, sizeof(text), "%s", s_candidates->items[s_page + i].text);
@@ -238,7 +238,7 @@ void ui_keyboard_draw(uint8_t *fb, int top) {
             key_paint(fb, rect(536, 336, 56, 68, top), "重输", 21, false, true);
             key_paint(fb, rect(600, 336, 56, 68, top), "⌫", 28, false, true);
         } else {
-            key_paint(fb, rect(24, 336, 80, 68, top), s_upper ? "A" : "a", 30, s_upper, true);
+            key_paint(fb, rect(24, 336, 80, 68, top), s_upper ? "大写" : "小写", 26, s_upper, true);
             key_paint(fb, rect(578, 336, 82, 68, top), "⌫", 31, false, true);
         }
     } else {

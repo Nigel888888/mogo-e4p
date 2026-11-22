@@ -25,6 +25,7 @@
 #include "epdiy.h"
 #include "lcd_driver.h"
 #include "render_lcd.h"
+#include "epd_output_offset.h"
 
 // declare vector optimized line mask application.
 void epd_apply_line_mask_VE(uint8_t* line, const uint8_t* mask, int mask_len);
@@ -158,7 +159,13 @@ static void push_pixels_populate_line(RenderContext_t* ctx, int color) {
             dirtyness[i / 2] |= i % 2 ? 0xF0 : 0x0F;
         }
     }
-    epd_populate_line_mask(ctx->line_mask, dirtyness, ctx->display_width / 4);
+    // 盲刷直接使用面板位序，与上次 LUT 选择无关。/ Blind scans use panel order independently of the last LUT.
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    const bool msb_first = true;
+#else
+    const bool msb_first = false;
+#endif
+    epd_populate_line_mask(ctx->line_mask, dirtyness, ctx->display_width / 4, msb_first);
 
     // mask the line pattern with the populated mask
     memset(ctx->static_line_buffer, fill_byte, ctx->display_width / 4);
@@ -202,6 +209,37 @@ void epd_lcd_set_prefill_lines(int lines) {
 int epd_lcd_prefill_lines(void) {
     return s_prefill_lines;
 }
+// 列段按 16 像素查表；未对齐的正文边界只合并交界组，保持每个像素的 LUT 归属。
+// Use 16-pixel lookup runs; merge only boundary groups to select the proper LUT for each pixel.
+static void IRAM_ATTR lookup_line_with_outer(const RenderContext_t* ctx, const uint8_t* src,
+    uint8_t* dst, const uint8_t* inner) {
+    const int x0 = ctx->line_inner_x0, x1 = ctx->line_inner_x1;
+    const int first = x0 & ~15, end = (x1 + 15) & ~15;
+    const uint8_t* outer = ctx->line_outer_lut;
+    if (inner) ctx->lut_lookup_func((const uint32_t*)(src + first), dst + first / 4, inner, end - first);
+    else memset(dst + first / 4, 0, (size_t)(end - first) / 4);
+    if (first) ctx->lut_lookup_func((const uint32_t*)src, dst, outer, first);
+    if (end < ctx->display_width)
+        ctx->lut_lookup_func((const uint32_t*)(src + end), dst + end / 4, outer, ctx->display_width - end);
+    const int edges[] = {first, end - 16};
+    for (int edge = 0; edge < 2; ++edge) {
+        if (edge && edges[0] == edges[1]) break;
+        const int start = edges[edge];
+        if (start >= x0 && start + 16 <= x1) continue;
+        _Alignas(16) uint8_t patch[4];
+        ctx->lut_lookup_func((const uint32_t*)(src + start), patch, outer, 16);
+        for (int i = 0; i < 4; ++i) {
+            unsigned mask = 0;
+            for (int j = 0; j < 4; ++j) {
+                const int x = start + i * 4 + j;
+                if (x < x0 || x >= x1) mask |= 3u << (2 * (ctx->lut_msb_first ? 3 - j : j));
+            }
+            uint8_t* cell = dst + start / 4 + i;
+            *cell = (uint8_t)((*cell & ~mask) | (patch[i] & mask));
+        }
+    }
+}
+
 __attribute__((optimize("O3"))) void IRAM_ATTR
 lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
     assert(ctx->lut_lookup_func != NULL);
@@ -246,8 +284,11 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
             epd_lcd_start_frame();
         }
 
-        if (l < min_y || l >= max_y
-            || (ctx->drawn_lines != NULL && !ctx->drawn_lines[l - area.y])) {
+        // 调度和 DMA 仍按物理行推进；裁剪、脏行和相位查询使用对应源行。
+        // Scheduling and DMA keep physical rows; crops, dirty rows and phases use the source row.
+        const int source_y = l - ctx->offset_y;
+        if (l >= ctx->display_height || source_y < min_y || source_y >= max_y
+            || (ctx->drawn_lines != NULL && !ctx->drawn_lines[source_y - area.y])) {
             uint8_t* buf = NULL;
             while (buf == NULL) {
                 // break in case of errors or if the scan already finished
@@ -264,7 +305,7 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
         }
 
         uint32_t* lp = (uint32_t*)input_line;
-        const uint8_t* ptr = ptr_start + bytes_per_line * (l - min_y);
+        const uint8_t* ptr = ptr_start + bytes_per_line * (source_y - min_y);
 
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
         Cache_Start_L1_DCache_Preload((uint32_t)ptr, ctx->display_width, 0);
@@ -302,15 +343,20 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
             }
         } else {
             const uint8_t* lut = ctx->conversion_lut;
-            if (ctx->line_phase && ctx->phase_luts && l < ctx->display_height) {
-                int8_t phase = ctx->line_phase[l];
+            if (ctx->line_phase && ctx->phase_luts && source_y < ctx->display_height) {
+                int8_t phase = ctx->line_phase[source_y];
                 if (phase >= 0) lut = ctx->phase_luts[phase];
+                else if (ctx->line_outer_lut) lut = NULL;
             }
-            ctx->lut_lookup_func(lp, buf, lut, ctx->display_width);
+            if (ctx->line_outer_lut) lookup_line_with_outer(ctx, ptr, buf, lut);
+            else ctx->lut_lookup_func(lp, buf, lut, ctx->display_width);
         }
 
         // apply the line mask
         epd_apply_line_mask_VE(buf, ctx->line_mask, ctx->display_width / 4);
+        if (ctx->offset_x) {
+            epd_output_shift_line(buf, ctx->display_width / 4, ctx->offset_x, ctx->lut_msb_first);
+        }
 
         lq_commit(lq);
     }

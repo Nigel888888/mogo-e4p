@@ -29,17 +29,23 @@ typedef enum {
 } app_sleep_mode_t;
 
 void app_settings_init(void);
+#define APP_SCREEN_OFFSET_LIMIT 32
+/// 正常竖屏的显示平移，右/下为正；设备本地保存，不随备份迁移。
+/// Portrait display translation, positive right/down; device-local and excluded from backups.
+void app_settings_screen_offset(int *x, int *y);
+/// 两轴同一事务保存；越界或保存失败保留原值。/ Save both axes atomically; invalid values or save failure retain the prior values.
+bool app_settings_set_screen_offset(int x, int y);
 /// 快捷栏显隐与顺序；保存失败时保留原值。/ Quick-bar visibility/order; a failed save retains the previous value.
 const app_quick_layout_t *app_settings_quick_layout(void);
 bool app_settings_set_quick_layout(const app_quick_layout_t *layout);
 app_sleep_mode_t app_settings_sleep_mode(void);
 void app_settings_set_sleep_mode(app_sleep_mode_t mode);
 const char* app_sleep_mode_name(app_sleep_mode_t mode);
-/// 锁屏睡眠方式，默认仅浅睡。彻底关机：锁屏出图后立即按原厂脉冲彻底断电，长按电源键约 1 秒冷开机；仅浅睡：锁屏浅睡永不断电，按键/拿起返回关机前页面。
+/// 锁屏睡眠方式，默认仅浅睡。彻底关机：显示独立关机画面后按原厂脉冲断电，长按电源键约 1 秒冷开机；仅浅睡：显示锁屏且不断电，按键/拿起返回原页面。
 /// 电源菜单「关机」固定立即断电，与本设置无关。
 /// APP_SHUTDOWN_FULL 是旧档位：仅为 NVS/备份兼容保留编号，读取时并入彻底关机，界面不再提供。
 /// 定时档在每次锁屏浅睡开始后计时，唤醒取消本轮计时；到时彻底关机，长按电源键约 1 秒开机。
-/// Lock sleep style, light-only by default. Full off: the lock pulses off factory-style right after the lock art (a one-second power-key hold cold-boots); light-only: lock sleeps forever without powering off, key/pickup returns.
+/// Lock sleep style, light-only by default. Full off: show independent shutdown art then pulse off (a one-second hold cold-boots); light-only keeps the lock until key/pickup wake.
 /// The power menu's 关机 always powers off immediately and ignores this setting.
 /// APP_SHUTDOWN_FULL is a legacy value kept for NVS/backup compatibility; loads merge into full off and the UI no longer offers it.
 /// Timed styles count from each locked light-sleep entry; waking cancels that countdown. Expiry powers off fully, requiring a one-second power-key hold to boot.
@@ -99,7 +105,7 @@ void app_settings_set_auto_lock_minutes(uint8_t minutes);
 /// the interval, and only while the host runs; deep sleep cannot reach the network at all.
 bool app_settings_auto_time_sync(void);
 void app_settings_set_auto_time_sync(bool on);
-/// 自动 OTA 检查默认开启；设备本地保存，不随配置备份迁移。/ Automatic OTA checks default on; device-local, excluded from config backups.
+/// 自动 OTA 检查默认开启；v48 起随配置备份。/ Automatic OTA checks default on and are included from backup v48.
 bool app_settings_auto_ota(void);
 void app_settings_set_auto_ota(bool on);
 /// 4G 模组开关；统一固件按运行时能力决定是否生效，并与 Wi-Fi 互斥。
@@ -149,6 +155,27 @@ void app_settings_set_system_contrast(uint8_t percent);
 enum { APP_LOCK_STYLE_CLOCK = 5 };
 uint8_t app_settings_lock_style(void);
 void app_settings_set_lock_style(uint8_t style);
+typedef enum {
+    APP_OFF_SYSTEM = 0, ///< 系统关机画面 / Built-in shutdown face
+    APP_OFF_CUSTOM,     ///< 独立关机壁纸 / Independent shutdown wallpaper
+    APP_OFF_TICKET = 3, ///< 阅读票根；编号2为已移除的留白 / Reading ticket; retired white uses ID 2
+    APP_OFF_COLLAGE,    ///< 书架拼贴 / Library collage
+    APP_OFF_CALENDAR,   ///< 日历 / Calendar
+} app_off_style_t;
+typedef struct app_shutdown_wallpaper {
+    uint8_t style;      ///< 关机样式 / Shutdown style
+    uint8_t fit;        ///< 0裁剪、1完整显示 / Crop (0), contain (1)
+    uint8_t show_hint;  ///< 非默认关机画面上的开机提示 / Boot hint over non-default shutdown art
+    uint8_t slot;       ///< TF双槽之一 / SD cache slot
+    uint8_t ticket_background; ///< 关机票根背景，独立记忆 / Independently remembered shutdown ticket background
+    uint8_t calendar_style; ///< 关机日历版式，独立记忆 / Independently remembered shutdown calendar face
+    uint32_t image_id;  ///< 已保存像素身份 / Saved pixel identity
+    char path[288];    ///< 原始图片路径，用于重新选择 / Original path for reselection
+} app_shutdown_wallpaper_t;
+/// 与浅睡锁屏独立；单键提交成功后才更新内存值。/ Independent from light-sleep art; publish only after a single-key commit.
+const app_shutdown_wallpaper_t *app_settings_shutdown_wallpaper(void);
+bool app_settings_shutdown_wallpaper_valid(const app_shutdown_wallpaper_t *value);
+bool app_settings_set_shutdown_wallpaper(const app_shutdown_wallpaper_t *value);
 /// 阅读票根背景独立记忆，默认透明；仅在持久化成功后更新。/ Remember ticket backgrounds independently; default transparent and publish only after persistence.
 typedef enum {
     APP_TICKET_BACKGROUND_TRANSPARENT = 0,
@@ -312,13 +339,14 @@ app_reader_key_action_t app_settings_reader_key_action(unsigned key);
 bool app_settings_reader_key_action_allowed(unsigned key, app_reader_key_action_t action);
 /// 返回是否成功保存；失败不改变映射。/ Return successful persistence, leaving the mapping unchanged on failure.
 bool app_settings_set_reader_key_action(unsigned key, app_reader_key_action_t action);
-/// 中键长按，默认手动全刷；与短按独立保存。/ Middle hold defaults to full refresh and persists independently.
+/// 中键长按，默认返回主页；与短按独立保存。/ Middle hold defaults to Home and persists independently.
 app_reader_key_action_t app_settings_reader_hold_action(void);
 bool app_settings_set_reader_hold_action(app_reader_key_action_t action);
 /// 中键双击，默认不操作；绑定后单击需等双击窗口结束才生效。/ Middle double press defaults to no action; once bound, a single click waits for the double-press window.
 app_reader_key_action_t app_settings_reader_double_action(void);
 bool app_settings_set_reader_double_action(app_reader_key_action_t action);
-/// 上键单击（机身顶部实体键），默认不操作；「开关前光」绑定在阅读正文外的所有页面同样生效，其余动作仍只在阅读正文生效。/ Up-key single press (top physical key), no action by default; the frontlight toggle also works on every page outside the reader body, while other actions stay reader-body-only.
+/// 上键（AI键）单击默认不操作；所有按键映射中的返回主页、手动全刷和前光开关在普通页面全局生效。
+/// The AI key defaults to no action; mapped Home, full refresh and frontlight actions are global on ordinary pages.
 app_reader_key_action_t app_settings_reader_up_action(void);
 bool app_settings_set_reader_up_action(app_reader_key_action_t action);
 /// 一次提交整套推荐设置，1为翻页，2为首页/工具栏/工具栏。/ Commit preset 1 (page turns) or 2 (Home/tools/tools) together.
@@ -379,8 +407,8 @@ void app_settings_set_reader_vertical_turn(bool on);
 /// 书架排序偏好重启后保持。/ Persist the shelf's recent-reading sort across restarts.
 bool app_settings_shelf_recent_sort(void);
 void app_settings_set_shelf_recent_sort(bool on);
-/// 按只读书库身份保存稳定分类ID；未保存时返回UINT32_MAX（全部），不随设置备份迁移。
-/// Persist a stable category ID per read-only library identity; missing values return UINT32_MAX (all), outside settings backups.
+/// 按只读书库身份保存稳定分类ID；未保存时返回UINT32_MAX（全部），v48 起按身份恢复。
+/// Persist a stable category ID per read-only library identity; missing values return UINT32_MAX (all); v48 restores by identity.
 uint32_t app_settings_shelf_category(const char *library);
 bool app_settings_set_shelf_category(const char *library, uint32_t category);
 /// 蓝牙翻页器：启用 BLE HID 主机，好让蓝牙翻页器连上并翻页；默认关闭。
@@ -390,9 +418,9 @@ bool app_settings_set_shelf_category(const char *library, uint32_t category);
 bool app_settings_ble_turner(void);
 void app_settings_set_ble_turner(bool on);
 /// 前光：开关、亮度 1..100%、色温 0..100%（0 全暖，50 冷暖同开，100 全冷）。
-/// 设备本地硬件状态，不随设置备份迁移。
+/// v48 起作为用户偏好备份；只有支持前光的设备会应用。
 /// Frontlight: on/off, brightness 1..100%, colour temperature 0..100% (0 warm only,
-/// 50 both, 100 cool only). Device-local hardware state, excluded from settings backups.
+/// 50 both, 100 cool only). Backed up from v48; applied only on supported devices.
 bool app_settings_frontlight_on(void);
 void app_settings_set_frontlight_on(bool on);
 uint8_t app_settings_frontlight_brightness(void);
@@ -448,6 +476,11 @@ bool app_settings_set_book_styles(bool enabled);
 /// 书架样式：1 深色书轨、2 亚克力、5 列表；旧3/4安全回退2。/ Shelf styles: rail (1), acrylic (2), list (5); retired IDs 3/4 fall back to 2.
 uint8_t app_settings_shelf_style(void);
 void app_settings_set_shelf_style(uint8_t style);
+/// 深色书轨与亚克力独立记忆封面下书名，默认关闭；列表始终按原样绘制。
+/// Rail and acrylic remember captions separately (off by default); list rendering is unchanged.
+bool app_settings_shelf_show_titles(uint8_t style);
+/// 不支持的样式或保存失败返回 false，不修改内存状态。/ Unsupported styles or failed saves leave state unchanged.
+bool app_settings_set_shelf_show_titles(uint8_t style, bool show);
 /// 固定 TF 根目录：/sdcard/books 与 /sdcard/fonts；旧配置/备份不能修改。/ Fixed TF roots, unaffected by legacy settings/backups.
 const char* app_settings_books_dir(void);
 const char* app_settings_fonts_dir(void);

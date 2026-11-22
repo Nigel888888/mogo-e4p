@@ -3,11 +3,13 @@
  * English: Validate actual reader pulse boundaries; optical tone and ghosting need panel tests.
  */
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include "display_normalize.h"
 #include "display_reader_waveform.h"
 #include "e0470_epaper_waveform.h"
+#include "e0470_waveform_trim.h"
 
 // 主机替身：表构建会读背景路径设置；用例先跑无背景分支，再临时打开背景验证归一表。
 // Host stand-in: table builds read the background-path setting; cases run the
@@ -15,8 +17,75 @@
 static const char *s_bg_path = "";
 const char *app_settings_book_background_path(void) { return s_bg_path; }
 
+static void check_trim(void) {
+    uint8_t source[64][16][4] = {0}, dst[64][16][4], expected[64][16][4];
+    EpdWaveformPhases base = {.phases = 10, .luts = &source[0][0][0]};
+    e0470_trim_t trim = {.erase_max = 1, .sat_cut = 2, .white_sat_cut = 0, .hold = 2};
+    const uint8_t black[] = {0, 2, 2, 1, 1, 1, 0, 3, 2, 0};
+    const uint8_t white[] = {0, 0, 1, 2, 2, 0, 0, 0, 0, 0};
+    for (unsigned f = 0; f < sizeof(black); ++f) {
+        source[f][0][0] = (uint8_t)(black[f] << 6);
+        source[f][15][3] = white[f];
+    }
+
+    // 不同长度的黑白轨迹右对齐，灰阶尾的保持和动作 3 都保留；输出后方不改。
+    // Right-align different black/white tracks; preserve the tail hold and action 3, and leave bytes beyond the output untouched.
+    memset(dst, 0xa5, sizeof(dst));
+    memset(expected, 0xa5, sizeof(expected));
+    memset(expected, 0, 7 * sizeof(expected[0]));
+    expected[0][0][0] = 2 << 6;
+    expected[1][0][0] = 1 << 6;
+    expected[3][0][0] = 3 << 6;
+    expected[4][0][0] = 2 << 6;
+    expected[2][15][3] = 1;
+    expected[3][15][3] = 2;
+    expected[4][15][3] = 2;
+    assert(e0470_waveform_trim(&base, &trim, dst) == 7);
+    assert(!memcmp(dst, expected, sizeof(dst)));
+    assert(e0470_waveform_trim(&base, &trim, source) == 7);
+    assert(!memcmp(source, expected, 7 * sizeof(source[0])));
+
+    trim.hold = 6;
+    assert(e0470_waveform_trim(&base, &trim, dst) == 0);
+    trim.hold = INT_MAX;
+    assert(e0470_waveform_trim(&base, &trim, dst) == 0);
+    trim.hold = 0;
+    assert(e0470_waveform_trim(&base, &trim, dst) == 0);
+    assert(!memcmp(dst, expected, sizeof(dst)));
+
+    memset(source, 0, sizeof(source));
+    base.phases = 64;
+    trim.hold = 64;
+    assert(e0470_waveform_trim(&base, &trim, dst) == 64);
+    assert(!memcmp(dst, source, sizeof(dst)));
+    base.phases = 65;
+    assert(e0470_waveform_trim(&base, &trim, dst) == 0);
+    base.phases = 64;
+    base.luts = NULL;
+    assert(e0470_waveform_trim(&base, &trim, dst) == 0);
+    assert(!memcmp(dst, source, sizeof(dst)));
+}
+
 int main(void) {
+    check_trim();
     e0470_waveform_init();
+    const EpdWaveform *chrome_waves[] = {display_reader_water_base_waveform(), display_reader_bg_waveform()};
+    for (unsigned i = 0; i < sizeof(chrome_waves) / sizeof(*chrome_waves); ++i) {
+        const EpdWaveformPhases *p = e0470_waveform_phases(chrome_waves[i], MODE_GL16);
+        assert(p && p->phases < 40);
+        int pushes = 0;
+        for (int f = 7; f < p->phases; ++f) pushes += e0470_phase_action(p, f, 0, 15) == 1;
+        assert(pushes >= 4);
+        if (i == 1) {
+            int white_actions = 0;
+            for (int f = 0; f < p->phases; ++f) {
+                assert(!e0470_phase_action(p, f, 0, 0) && !e0470_phase_action(p, f, 14, 14));
+                white_actions += e0470_phase_action(p, f, 15, 15) != 0;
+            }
+            assert(white_actions > 0);
+        }
+    }
+
     const EpdWaveformPhases* old = e0470_waveform_phases(&E0470_TEXTTURN_WAVEFORM, MODE_GL16);
     uint8_t saved[E0470_GL16_FRAMES * 16 * 4];
     assert(old && old->phases == E0470_GL16_FRAMES && !old->phase_times);
@@ -166,22 +235,23 @@ int main(void) {
             black += e0470_phase_action(full_page, f, 0, from) == 1;
         assert(black == 18);
     }
-    // 背景派生表：二次裁剪会把白列削到 15 拍，旧字转白擦不净。这里必须补回主页水波纹
-    // 已验证的 24 拍，且不增加帧数——白列的形状能落进现有的尾部保持空间。
-    // Background derivative: the second trim would leave 15 white pushes and erased text
-    // would stay pale. It must carry the main water table's verified 24 pushes without
-    // adding frames—the column shape fits inside the existing trailing holds.
+    // 背景表固定 29 相：黑→白连续 21 拍，末尾 3 相保持。
+    // The background table keeps 29 phases: 21 consecutive white pushes from black, then three holds.
     s_bg_path = "card:/backgrounds/paper.bmp";
     const EpdWaveform* bg = display_reader_bg_waveform();
     const EpdWaveformPhases* bgp = e0470_waveform_phases(bg, MODE_GL16);
     assert(bgp && bgp->luts && !bgp->phase_times);
-    assert(bgp->phases <= E0470_GL16_FRAMES);
-    int bg_white = 0;
-    for (int f = 0; f < bgp->phases; ++f) bg_white += e0470_phase_action(bgp, f, 15, 0) == 2;
-    assert(bg_white == 24);
-    // 白列必须给尾部保持让位，不能把最后一相也拿去推白。
-    // The white column must leave the trailing hold alone instead of pushing on the last phase.
-    assert(e0470_phase_action(bgp, bgp->phases - 1, 15, 0) == 0);
+    assert(bgp->phases == 29);
+    for (int f = 0; f < bgp->phases; ++f)
+        assert(e0470_phase_action(bgp, f, 15, 0) == (f >= 5 && f < 26 ? 2 : 0));
+    // 逐相锁定旧版灰→白：前段单向推白、间隔 2 相、补 6 拍白、末尾保持 3 相。
+    // Check every phase of the old gray-to-white sequence: white pushes, 2 holds, 6 more pushes, 3 holds.
+    static const int first_push[15] = {0, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 11};
+    for (int from = 1; from < 15; ++from)
+        for (int f = 0; f < bgp->phases; ++f) {
+            const int expected = ((f >= first_push[from] && f < 18) || (f >= 20 && f < 26)) ? 2 : 0;
+            assert(e0470_phase_action(bgp, f, 15, from) == expected);
+        }
     // 插图页派生表：深色对保留前导擦白（旧字落到图片灰时从白轨落位，不留字形），相等对
     // 仍置保持（脏区膨胀带上的未变化像素不会被黑白往返推出一圈细线）。背景派生表只保
     // 前半段的裁剪，深色对的前导擦白为 0。
@@ -191,6 +261,18 @@ int main(void) {
     // outline. The background derivative keeps only the trim and drops the dark-pair erase.
     const EpdWaveformPhases* img = e0470_waveform_phases(display_reader_image_waveform(), MODE_GL16);
     assert(img && img->luts && !img->phase_times);
+    // 插图表继续使用无背景白列，右对齐到最后 3 相保持前。
+    // The illustration table still right-aligns the plain reader white column before its three holds.
+    for (int from = 0; from < 15; ++from) {
+        int last = ripple->phases - 1;
+        while (last >= 0 && e0470_phase_action(ripple, last, 15, from) == 0) --last;
+        assert(last >= 0);
+        for (int f = 0; f < img->phases; ++f) {
+            const int src = last + f - (img->phases - 4);
+            const int expected = src >= 0 && src <= last ? e0470_phase_action(ripple, src, 15, from) : 0;
+            assert(e0470_phase_action(img, f, 15, from) == expected);
+        }
+    }
     for (int g = 0; g < 15; ++g)
         for (int f = 0; f < img->phases; ++f)
             assert(e0470_phase_action(img, f, g, g) == 0);

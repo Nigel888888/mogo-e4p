@@ -47,19 +47,22 @@ static void failure(mm_failure_t reason) {
     portEXIT_CRITICAL(&s_lock);
 }
 
-bool mm_check_capacity(mm_pool_t pool, size_t minimum_free, size_t largest_block) {
-    if (pool < 0 || pool >= MM_POOL_COUNT) { failure(MM_FAIL_INVALID); return false; }
+mm_failure_t mm_check_capacity(mm_pool_t pool, size_t minimum_free, size_t largest_block) {
+    if (pool < 0 || pool >= MM_POOL_COUNT) {
+        failure(MM_FAIL_INVALID);
+        return MM_FAIL_INVALID;
+    }
     const uint32_t caps = pool_caps(pool);
     const size_t available = heap_caps_get_free_size(caps);
     const size_t largest = heap_caps_get_largest_free_block(caps);
     portENTER_CRITICAL(&s_lock);
     const size_t pending = s_pending[pool];
     portEXIT_CRITICAL(&s_lock);
-    if (available < minimum_free || available - minimum_free < pending) {
-        failure(MM_FAIL_CAPACITY); return false;
-    }
-    if (largest < largest_block) { failure(MM_FAIL_FRAGMENTED); return false; }
-    return true;
+    mm_failure_t result = MM_FAIL_NONE;
+    if (available < minimum_free || available - minimum_free < pending) result = MM_FAIL_CAPACITY;
+    else if (largest < largest_block) result = MM_FAIL_FRAGMENTED;
+    if (result != MM_FAIL_NONE) failure(result);
+    return result;
 }
 
 void *mm_alloc(mm_owner_t owner, mm_pool_t pool, size_t bytes, size_t alignment, size_t reserve_bytes) {

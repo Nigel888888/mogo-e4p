@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def unit(source):
     code = native.unit().split('typedef struct {char path[288];', 1)[0]
+    for header in ('image/image_decode.h', 'ui/ui_image_dither.h'):
+        code += f'#include "{ROOT / "main" / header}"\n'
     code += host.function('ui_text_fixed_ink_vc', ROOT / 'main/ui/ui_kit.c') + '\n'
     code += host.function('ui_image_dither_gray', ROOT / 'main/ui/ui_image_dither.c') + '\n'
     code += r'''
@@ -32,6 +34,7 @@ static EpdRect s_pressed;
 static bool s_press_pending;
 static EpdRect text_boxes[16];
 static unsigned box_count;
+static uint8_t app_settings_system_contrast(void){return 100;}
 static void checked_home_text(uint8_t *fb,int x,int y,int px,const char *text,const char *sample,
                              enum EpdFontFlags align,uint8_t ink,uint8_t bg){
     int above=0,below=0;ui_font_measure_line_px(px,text,&above,&below);

@@ -97,6 +97,7 @@ typedef enum {
 typedef struct {
     bool open, tracking, swallow, moved;
     app_quick_layout_t layout; ///< 装配层提供的显示与顺序。/ Visibility/order supplied by the layer owner.
+    const char *network_notice; ///< 静态网络错误提示。/ Static network error notice.
     bool rotation_notice; ///< 当前页面不能旋转的提示。/ Rotation-unavailable notice for the current page.
     bool rotation_available, rotation_enabled; ///< 只由当前页面提供，不落盘 / Supplied by the current page, never persisted
     bool haptics_available, haptics_enabled; ///< 马达能力与已保存的开关状态 / Motor capability and saved switch state

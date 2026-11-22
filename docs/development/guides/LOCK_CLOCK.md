@@ -1,9 +1,9 @@
 # 简约时钟锁屏 / Minimal clock lock
 
-在「设置 → 锁屏样式 → 简约时钟」选择。24小时制，小时与分钟上下对齐，不显示冒号；使用固定 Chakra Petch Bold 数字，字号不跟随系统字号，下方为月日、星期和固件电量图标，不显示年份与电量百分比。中文沿用系统字体。
+在「设置 → 个性化功能 → 壁纸 → 待机壁纸 → 简约时钟」选择。24小时制，小时与分钟上下对齐，不显示冒号；使用固定 Chakra Petch Bold 数字，字号不跟随系统字号，下方为月日、星期和固件电量图标，不显示年份与电量百分比。中文沿用系统字体。
 Select Settings → Lock style → Clock. Fixed Chakra Petch Bold numerals form aligned hour/minute rows without a colon. Month/day, weekday and the existing battery icon follow below, without a year or percentage; Chinese uses the system face.
 
-「仅浅睡」持续更新；「浅睡后关机」更新到所选10/30/60分钟截止点；「彻底关机」保留关机前最后画面。选择时钟不自动更改待机方式。电源键或已开启的拿起唤醒沿用现有行为，已设密码仍须验证。
+「仅浅睡」持续更新；「浅睡后关机」更新到所选10/30/60分钟截止点，再切换独立关机画面并断电；「彻底关机」直接显示关机画面，不保留冻结时钟。选择时钟不自动更改待机方式。电源键或已开启的拿起唤醒沿用现有行为，已设密码仍须验证。
 Light-only standby keeps updating. Timed standby updates until its 10/30/60-minute deadline; full off retains the last face. Selecting the clock preserves the standby choice and existing key/pickup/PIN behavior.
 
 ## 时间与刷新 / Time and refresh

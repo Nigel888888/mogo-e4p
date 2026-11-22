@@ -1,4 +1,5 @@
 #include "render.h"
+#include "epd_output_offset.h"
 
 #include "epd_board.h"
 #include "epd_power_guard.h"
@@ -45,6 +46,8 @@ const int clear_cycle_time = 15;
 static RenderContext_t render_context;
 static const uint8_t* const* s_phase_luts;
 static const int8_t* s_line_phase;
+static const uint8_t* s_line_outer_lut;
+static int s_line_inner_x0, s_line_inner_x1;
 static const int* s_col_band_x0;
 static const int* s_col_band_x1;
 static const int8_t* s_col_band_phase;
@@ -53,6 +56,7 @@ static int s_col_band_n;
 void epd_clear_phase_luts(void) {
     s_phase_luts = NULL;
     s_line_phase = NULL;
+    s_line_outer_lut = NULL;
     s_col_band_x0 = NULL;
     s_col_band_x1 = NULL;
     s_col_band_phase = NULL;
@@ -63,6 +67,13 @@ void epd_set_line_phase_luts(const uint8_t* const* phase_luts, const int8_t* lin
     epd_clear_phase_luts();
     s_phase_luts = phase_luts;
     s_line_phase = line_phase;
+}
+
+void epd_set_line_phase_outer_lut(const uint8_t* lut, int x0, int x1) {
+    if (!s_line_phase || !lut || x0 < 0 || x0 >= x1 || x1 > epd_width() || (epd_width() & 15)) return;
+    s_line_outer_lut = lut;
+    s_line_inner_x0 = x0;
+    s_line_inner_x1 = x1;
 }
 
 void epd_set_col_phase_luts(const uint8_t* const* phase_luts, const int* x0, const int* x1,
@@ -130,6 +141,10 @@ void epd_set_leading_skip(bool enable) {
 
 void epd_leading_skip_discard(void) {
     s_present_for = NULL;
+}
+
+void epd_leading_skip_forget_waveform(void) {
+    s_first_active_phases = NULL;
 }
 
 int epd_last_leading_skip(void) {
@@ -287,10 +302,15 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
     render_context.error = EPD_DRAW_SUCCESS;
     render_context.drawn_lines = drawn_lines;
     render_context.data_ptr = data;
+    epd_get_output_offset(&render_context.offset_x, &render_context.offset_y);
     render_context.lut_build_func = lut_functions.build_func;
     render_context.lut_lookup_func = lut_functions.lookup_func;
+    render_context.lut_msb_first = lut_functions.msb_first;
     render_context.phase_luts = s_phase_luts;
     render_context.line_phase = s_line_phase;
+    render_context.line_outer_lut = s_line_outer_lut;
+    render_context.line_inner_x0 = s_line_inner_x0;
+    render_context.line_inner_x1 = s_line_inner_x1;
     render_context.col_band_x0 = s_col_band_x0;
     render_context.col_band_x1 = s_col_band_x1;
     render_context.col_band_phase = s_col_band_phase;
@@ -325,7 +345,8 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
     }
 
     epd_populate_line_mask(
-        render_context.line_mask, drawn_columns, render_context.display_width / 4
+        render_context.line_mask, drawn_columns, render_context.display_width / 4,
+        render_context.lut_msb_first
     );
 
     epd_power_guard_scan_begin();
@@ -333,6 +354,7 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
     epd_power_guard_scan_end();
     render_context.phase_luts = NULL;
     render_context.line_phase = NULL;
+    render_context.line_outer_lut = NULL;
     render_context.col_band_x0 = NULL;
     render_context.col_band_x1 = NULL;
     render_context.col_band_phase = NULL;

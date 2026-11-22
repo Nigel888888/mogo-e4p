@@ -10,6 +10,8 @@
 #define WEATHER_CITY_LIMIT 8
 #define WEATHER_SEARCH_BATCH_SIZE 20
 #define WEATHER_SEARCH_TOTAL_LIMIT 4000
+#define WEATHER_MAX_AGE_HOURS 10
+#define WEATHER_MAX_AGE_SECONDS (WEATHER_MAX_AGE_HOURS * 3600LL)
 #define WEATHER_BODY_LIMIT 8192
 typedef struct {
     char id[17], admin2[97]; ///< 官方地点标识与地级行政区 / Official location ID and prefecture

@@ -14,16 +14,16 @@
 #include <strings.h>
 #include "settings_bluetooth.h"
 #include "ble_page_turner.h"
+#include "memory_peak.h"
 #include "settings.h"
 #include "ui_kit.h"
 #include "ui_nav.h"
-#include "wifi_transfer.h"
 
 #define BLE_ROWS 6
 #define BLE_ROW_H 88
 typedef enum { BLE_HOME, BLE_SCAN, BLE_DETAIL, BLE_SCAN_CONFIRM, BLE_FORGET_CONFIRM } ble_view_t;
 typedef struct {
-    bool enabled, running, connected, connecting, scanning, wifi_busy;
+    bool enabled, running, connected, connecting, scanning, network_busy, cellular_busy;
     bool bound[2];
     uint8_t bond_count, device_count;
     char addr[18], name[32];
@@ -54,7 +54,7 @@ static const ble_pt_device_t *ble_scan_visible_at(int row) {
     return NULL;
 }
 static bool live_peer(const char *addr) { return s_model.connected && !strcasecmp(addr, s_model.addr); }
-static bool available(void) { return s_model.enabled && s_model.running && !s_model.wifi_busy; }
+static bool available(void) { return s_model.enabled && s_model.running && !s_model.network_busy; }
 static bool can_learn(void) { return available() && s_model.connected; }
 
 // 报告只在 tick 和显式操作中消费；render 保持纯绘制。/ Consume reports in ticks/actions, never in render.
@@ -96,9 +96,8 @@ static bool capture(void) {
     next.connected = ble_pt_connected();
     next.connecting = ble_pt_connecting();
     next.scanning = ble_pt_scanning();
-    wifi_transfer_status_t network;
-    wifi_transfer_get_status(&network);
-    next.wifi_busy = network.state != WIFI_TRANSFER_STOPPED;
+    next.cellular_busy = ble_pt_cellular_paused();
+    next.network_busy = next.cellular_busy || ble_pt_network_paused();
     if (next.connected) {
         snprintf(next.addr, sizeof(next.addr), "%s", ble_pt_connected_addr());
         snprintf(next.name, sizeof(next.name), "%s", ble_pt_connected_name());
@@ -210,16 +209,16 @@ static void draw_home(uint8_t *fb) {
     epd_fill_circle(s_model.enabled ? 626 : 582, 182, 17, UI_GRAY_WHITE, fb);
     border(fb, (EpdRect){36, 222, 612, 142}, 22);
     ui_draw_icon(fb, 75, 260, 32, UI_ICON_BLUETOOTH, s_model.enabled ? UI_GRAY_BLACK : 0x80);
-    const char *name = !s_model.enabled ? "蓝牙已关闭" : s_model.wifi_busy ? "蓝牙暂时不可用" :
+    const char *name = !s_model.enabled ? "蓝牙已关闭" : s_model.network_busy ? "蓝牙暂时不可用" :
                        s_model.connected ? (s_model.name[0] ? s_model.name : s_model.addr) :
                        s_model.connecting ? "正在连接翻页器…" : !s_model.running ? "蓝牙启动中…" : "尚未连接翻页器";
     text(fb, (EpdRect){104, 236, s_model.connected ? 380 : 512, 44}, 27, name, false);
-    const char *status = !s_model.enabled ? "已配对的设备会保留" : s_model.wifi_busy ? "WiFi 使用中，蓝牙暂停" :
+    const char *status = !s_model.enabled ? "已配对的设备会保留" : s_model.network_busy ? (s_model.cellular_busy ? "4G 使用中，蓝牙暂停" : "WiFi 使用中，蓝牙暂停") :
                          s_model.connected ? "已连接 · 可以翻页" : s_model.connecting ? "请保持设备靠近墨水屏" :
                          !s_model.running ? "正在准备蓝牙，请稍候" : "添加设备，开始遥控翻页";
     text(fb, (EpdRect){64, 283, 534, 34}, 21, status, false);
     const char *hint = s_ble_notice[0] ? s_ble_notice : !s_model.enabled ? "打开上方开关即可使用" :
-                       s_model.wifi_busy ? "结束 WiFi 使用后再连接" : s_model.connected ? "按键只在阅读时翻页" : "请让翻页器进入配对模式";
+                       s_model.network_busy ? (s_model.cellular_busy ? "关闭移动网络后再连接" : "结束 WiFi 使用后再连接") : s_model.connected ? "按键只在阅读时翻页" : "请让翻页器进入配对模式";
     text(fb, (EpdRect){64, 323, 556, 30}, 19, hint, false);
     if (s_model.connected && available()) button(fb, CONTROL_DISCONNECT, "断开", false, true);
     char label[40]; snprintf(label, sizeof(label), "已配对 %u", s_model.bond_count);
@@ -237,7 +236,7 @@ static void draw_home(uint8_t *fb) {
         EpdRect r = peer_rect(i, false);
         bool live = live_peer(peer->addr);
         if (i) rule(fb, r.y);
-        const char *detail = !s_model.enabled ? "已配对 · 蓝牙已关闭" : s_model.wifi_busy ? "已配对 · 蓝牙暂停" :
+        const char *detail = !s_model.enabled ? "已配对 · 蓝牙已关闭" : s_model.network_busy ? "已配对 · 蓝牙暂停" :
                              live ? "已连接" : s_model.connecting && !strcasecmp(peer->addr, s_connect_addr) ? "正在连接…" : "已配对 · 未连接";
         draw_peer(fb, r, peer->name[0] ? peer->name : peer->addr, detail, live);
     }
@@ -379,7 +378,9 @@ static void connect_peer(const char *addr) {
     s_ble_learning = 0;
     s_ble_feedback[0] = 0;
     esp_err_t error = ble_pt_connect(s_connect_addr);
-    snprintf(s_ble_notice, sizeof(s_ble_notice), "%s", error == ESP_OK ? "正在连接…" : "连接失败，请重试");
+    const char *hint = memory_peak_hint(error);
+    snprintf(s_ble_notice, sizeof(s_ble_notice), "%s",
+             error == ESP_OK ? "正在连接…" : hint ? hint : "连接失败，请重试");
     capture();
 }
 bool settings_bluetooth_tick(int64_t now_ms) {
@@ -475,6 +476,12 @@ bool settings_bluetooth_gesture(const ui_gesture_event_t *ev) {
     }
     if (ui_rect_hit(control_rect(CONTROL_TOGGLE), x, y)) {
         bool wanted = !app_settings_ble_turner();
+        const char *blocked = wanted ? ble_pt_enable_block_reason() : NULL;
+        if (blocked) {
+            snprintf(s_ble_notice, sizeof(s_ble_notice), "%s", blocked);
+            capture();
+            return true;
+        }
         app_settings_set_ble_turner(wanted);
         if (app_settings_ble_turner() != wanted) snprintf(s_ble_notice, sizeof(s_ble_notice), "保存失败，请重试");
         else {

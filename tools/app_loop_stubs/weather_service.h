@@ -5,4 +5,7 @@
 #pragma once
 #include <stdbool.h>
 static inline bool app_weather_busy(void) {return false;}
+static inline void app_weather_reap_cancelled(void) {}
 static inline void app_weather_cancel_join(void) {}
+void app_weather_background_poll(void);
+void app_weather_background_pause(void);

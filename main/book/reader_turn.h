@@ -39,7 +39,7 @@ typedef struct {
 } reader_turn_frame_t;
 
 typedef struct {
-    bool text; ///< 普通文字翻页许可 / Ordinary text-turn eligibility
+    bool text; ///< 稳定正文翻页许可（可含背景） / Stable text-turn eligibility, including backgrounds
     bool water; ///< 水波纹翻页许可 / Water-turn eligibility
     bool footer_strong; ///< 换章页脚使用 GL16 / Chapter footer uses GL16
 } reader_turn_effects_t;

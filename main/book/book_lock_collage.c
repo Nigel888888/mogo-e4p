@@ -7,8 +7,10 @@
  * Frozen: No online sources, reader-font changes or whole-font loads; bounded workspaces and SD cache only.
  * 用户修订：复用单次扫描的文件信息，只读封面头取得尺寸；锁屏显示后再提交新整帧缓存。
  * User revision: reuse scan metadata, read cover headers for dimensions and commit fresh frame caches after presentation.
- * 冻结：不改拼贴像素、缓存键或校验；延后写入仅引用调用者仍持有的完整画布，不增加整帧副本。
- * Frozen: Keep artwork, cache keys and checksums. Deferred persistence borrows a caller-owned complete frame, never another full copy.
+ * 用户要求封面恢复暗部浓度；只调封面像素的明暗，并更新成品缓存版本。
+ * User requests deeper cover shadows; adjust only cover tones and bump the rendered cache revision.
+ * 冻结：拼贴布局、缓存结构和校验保持；延后写入只引用调用者画布，不增加整帧副本。
+ * Frozen: Preserve layout, cache structure and checksums. Deferred persistence borrows the caller's frame without a copy.
  */
 #include "book_lock_collage.h"
 #include <dirent.h>
@@ -49,8 +51,8 @@
 #define BOOK_LOCK_CACHE_PARENT "/sdcard/.readpico"
 #endif
 #define LOCK_CACHE_DIR BOOK_LOCK_CACHE_PARENT "/locks"
-#define LOCK_CACHE_VERSION 2u
-#define LOCK_RENDER_REVISION 4u
+#define LOCK_CACHE_VERSION 3u
+#define LOCK_RENDER_REVISION 5u
 #define LOCK_CACHE_MAGIC UINT32_C(0x4c434431)
 #define LOCK_COVER_HEIGHT 334.f
 #define LOCK_GAP 18.f
@@ -521,7 +523,7 @@ static void cover_draw(uint8_t *fb, const uint8_t *gray, const lock_book_t *book
                                         v * book->height / LOCK_COVER_HEIGHT - .5f);
             // 源缓存为未抖动灰阶，最终屏幕坐标只量化一次；不跟随主页黑白快刷。
             // Source cache is undithered gray; quantize once at screen coordinates, independent of main-page BW modes.
-            if (outline && cover_edge(u, v, p.w)) tone = 112;
+            tone = outline && cover_edge(u, v, p.w) ? 112 : ui_image_cover_tone(tone, 100);
             epd_draw_pixel(x, y, ui_image_dither_gray(tone, x, y), fb);
         }
         lock_yield((unsigned)y);

@@ -52,12 +52,30 @@ static void interaction(app_ctx_t *ctx) {
     gesture(ctx,UI_GESTURE_LONG_PRESS,120,574);
     assert(s_view==FILE_VIEW_ACTIONS && !strcmp(s_selected.name,s_files[7].name));
     fixture(true);
-    for(int i=0;i<3;++i) {
+    if (CLOUDZAO_FIXTURE_CONFIGURED) {
+        assert(home_transfer_count()==4);
+        render(ctx,ctx->fb);
+        const EpdRect cloud=home_transfer_rect(3);
+        const int left=cloud.x+cloud.width/2-CLOUDZAO_BADGE_SIZE/2;
+        const int top=cloud.y+28-CLOUDZAO_BADGE_SIZE/2;
+        unsigned shades=0;
+        for(int y=top;y<top+CLOUDZAO_BADGE_SIZE;++y)
+            for(int x=left;x<left+CLOUDZAO_BADGE_SIZE;++x)
+                shades|=1u<<ui_read_pixel(ctx->fb,x,y);
+        assert(shades==0xffffu);
+    } else {
+        assert(home_transfer_count()==3);
+    }
+    for(int i=0;i<home_transfer_count();++i) {
         route=-1;ctx->request_app=NULL;
         EpdRect r=home_transfer_rect(i);
         gesture(ctx,UI_GESTURE_TAP,r.x+r.width/2,302);assert(route==i && ctx->request_app==&app_transfer);
-        route=-1;gesture(ctx,UI_GESTURE_LONG_PRESS,r.x+20,347);assert(route==-1 && s_view==FILE_VIEW_LIST);
+        route=-1;ctx->request_app=NULL;
+        gesture(ctx,UI_GESTURE_LONG_PRESS,r.x+20,347);assert(route==-1 && s_view==FILE_VIEW_LIST);
+        ui_gesture_event_t outside={.type=UI_GESTURE_TAP,.x0=r.x+r.width-1,.y0=302,.x=r.x+r.width,.y=302};
+        on_gesture(ctx,&outside);assert(route==-1 && ctx->request_app==NULL);
     }
+    gesture(ctx,UI_GESTURE_TAP,590,249);assert(route==-1 && ctx->request_app==NULL);
     const int gaps[]={214,249,273,406,422,460,487,992,1005};
     for(unsigned i=0;i<sizeof(gaps)/sizeof(gaps[0]);++i) {
         int before=opened;route=-1;

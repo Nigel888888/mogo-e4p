@@ -65,6 +65,7 @@ unit+='\n'.join(function(n,home) for n in ['mini_cancel','home_region','continue
 settings=(root/'main/settings/settings.h').read_text();a=settings.index('typedef enum {\n    APP_READER_KEY_PREV');b=settings.index('} app_reader_key_action_t;',a)+len('} app_reader_key_action_t;');unit+=settings[a:b]
 unit+=r'''
 enum {READER_PANEL_NONE,READER_PANEL_TOOLS};
+static struct {struct {char path[32];} book;} s_reader_session;
 static bool s_reader_return_home;static int s_reader_panel,s_reader_slider,s_stats_activity_ms;
 static bool s_reader_tools_toggle;
 static struct {bool pending;} s_reader_tap;
@@ -142,6 +143,7 @@ int main(void){app_ctx_t ctx={0};consume_s_reader_tap();
  for(int via_key=0;via_key<2;++via_key)for(int from_home=0;from_home<2;++from_home){
   s_view=READING;s_reader_panel=READER_PANEL_TOOLS;s_reader_return_home=from_home;
   nav=-1;ctx.leaf=99;int before=freed;
+  strcpy(s_reader_session.book.path,"/a.txt");
   app_redraw_t result=via_key?reader_key_action(&ctx,APP_READER_KEY_HOME):reader_return(&ctx);
   if(from_home)assert(result==APP_REDRAW_NONE&&nav==0&&freed==before);
   else assert(result==APP_REDRAW_PAGE&&nav==-1&&s_view==SHELF&&ctx.leaf==4&&freed==before+1&&s_reader_panel==READER_PANEL_NONE);

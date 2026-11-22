@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "memory_peak.h"
 #include "wifi_transfer_network.h"
 
 #define WIFI_TRANSFER_PASSWORD "mogo1234"
@@ -37,6 +38,7 @@ typedef enum {
 typedef struct {
     wifi_transfer_mode_t mode; ///< 网络模式，默认热点 / Network mode, default AP
     bool network_only; ///< 仅连接已有 WiFi，不启动上传服务或访问存储 / Connect saved WiFi without upload server or storage
+    uint32_t session_id; ///< 本地页面会话标识，跨恢复保留；零表示无页面所有者。/ Local owner ID, preserved on restore; zero means no page owner.
     const char *root_dir; ///< 已挂载根目录，start 内复制 / Mounted root, copied by start
     bool is_flash; ///< 内置存储标志 / Internal storage flag
     size_t file_limit; ///< 单文件上限，零表示不限 / Per-file limit, zero means unlimited
@@ -55,7 +57,9 @@ typedef struct {
 } wifi_transfer_cfg_t;
 
 typedef struct {
+    uint32_t session_id; ///< 本地页面会话标识。/ Local owner ID.
     wifi_transfer_state_t state; ///< 当前状态 / Current state
+    bool owns_radio; ///< 启动、运行或未清完的 Wi-Fi 会话，不含已清理的错误。/ Starting, live or not fully stopped; excludes fully cleaned failures.
     wifi_transfer_mode_t mode; ///< 网络模式 / Network mode
     char url[64]; ///< 可访问地址，未联网为空 / Reachable address, empty when offline
     char wifi_ssid[33]; ///< 已保存网络名称，不含密码 / Saved network name, never a password
@@ -74,6 +78,10 @@ typedef struct {
 
 /// 同一控制任务串行启动/停止；重复启动返回状态错误。/ Serialize start/stop on one owner task; repeated start fails.
 esp_err_t wifi_transfer_start(const wifi_transfer_cfg_t *cfg);
+/// 由网络事务持有非零准入；此调用不交还外层代次。/ A network transaction holds admission; this call does not finish it.
+esp_err_t wifi_transfer_start_admitted(const wifi_transfer_cfg_t *cfg, memory_peak_token_t admitted);
+/// 恢复刚停止的服务及其模式，不用于新会话。/ Restore the just-stopped service and its mode, not a new session.
+esp_err_t wifi_transfer_restore_admitted(memory_peak_token_t admitted);
 /// 等待请求退出并释放本组件资源；可重复调用。/ Join requests and release owned resources; repeatable.
 void wifi_transfer_stop(void);
 /// 只读已发布的传输缓冲/HTTP栈字节数；驱动和临时分配不在此范围，查询不解引用活动指针。
@@ -81,16 +89,25 @@ void wifi_transfer_stop(void);
 void wifi_transfer_memory_usage(size_t *internal_bytes, size_t *psram_bytes);
 /// 原子拒绝文件操作期间的停止；成功则已停服，由同一控制任务调用。/ Atomically refuse stopping during file operations; true means stopped. Owner task only.
 bool wifi_transfer_try_stop_if_idle(void);
+/// 保留被业务借用的 STA，仅关闭文件服务器；拔卡时允许结束在途文件请求。
+/// Keep a borrowed STA, closing only HTTP; media loss may terminate file requests.
+bool wifi_transfer_detach_http(bool media_lost);
+/// 拔卡时按拥有者阻止新请求，无需等待控制门。/ Reject new file requests for the removed medium without waiting for the bearer gate.
+void wifi_transfer_block_local_files(uint32_t session_id);
 /// 锁屏浅睡前停用射频；唤醒后按原会话配置恢复。上传中返回 false。
 bool wifi_transfer_pause_for_sleep(void);
-void wifi_transfer_resume_after_sleep(void);
+/// 调度繁忙时保留原配置，交由承载控制门退避重试。/ Keep the saved configuration on peak contention for a gated retry.
+esp_err_t wifi_transfer_resume_after_sleep(void);
 /// 跨任务复制一致状态快照。/ Copy a consistent snapshot across tasks.
 void wifi_transfer_get_status(wifi_transfer_status_t *out);
 /// 返回当前 STA/AP netif；指针仅在会话运行期间有效，不转移所有权。
 /// Return the current STA/AP netif; valid only while the session runs, ownership stays here.
 void *wifi_transfer_netif(void);
-/// 控制任务每500ms驱动有界连接重试与15秒超时。/ Owner task polls every 500 ms for bounded retries and a 15 s timeout.
+/// 控制任务轮询有界连接重试；超时等待断开确认。/ Owner task polls bounded retries and waits for disconnect confirmation on timeout.
 void wifi_transfer_service_poll(void);
+/// 多次无断开确认时尝试停驱动；调用者必须持有承载控制门且无 Wi-Fi 租约。
+/// Try stopping the driver after missing disconnect acknowledgments; caller needs the bearer gate and no Wi-Fi leases.
+void wifi_transfer_recover_stuck_sta(void);
 /// 只读已保存SSID；未配置仍返回ESP_OK。/ Read only the saved SSID; unconfigured still returns ESP_OK.
 esp_err_t wifi_transfer_get_saved_wifi(char ssid[33], bool *configured);
 /// 按最近选择顺序列出所有已保存网络，不返回密码。/ List saved networks by latest selection without exposing passwords.
@@ -112,11 +129,23 @@ bool wifi_transfer_wifi_backup_valid(const wifi_transfer_wifi_backup_t *backup);
 /// 兼容旧备份的单网络恢复；保留其他网络，空记录清除全部；正在运行的会话不变。
 /// Restore a legacy single-network backup, retaining others; an empty record clears all; active sessions stay unchanged.
 esp_err_t wifi_transfer_import_wifi_backup(const wifi_transfer_wifi_backup_t *backup);
+typedef struct {
+    uint8_t count; ///< 已存网络数量，首项为默认 / Saved network count, preferred first
+    wifi_transfer_wifi_backup_t items[WIFI_TRANSFER_SAVED_MAX]; ///< 明文，使用后清零 / Clear plaintext after use
+} wifi_transfer_profiles_backup_t;
+/// 备份全部已存网络，保留顺序。/ Back up all saved networks in order.
+esp_err_t wifi_transfer_export_profiles_backup(wifi_transfer_profiles_backup_t *out);
+/// 校验整组和互异 SSID；不访问设备。/ Validate all entries and distinct SSIDs without accessing the device.
+bool wifi_transfer_profiles_backup_valid(const wifi_transfer_profiles_backup_t *backup);
+/// 备份网络优先，保留未覆盖的本机网络；容量不足不写入。/ Backup entries take precedence; keep unmatched local networks and reject over-capacity without writing.
+esp_err_t wifi_transfer_merge_profiles_backup(const wifi_transfer_profiles_backup_t *backup, bool apply);
 /// 遗忘默认网络并保留其他网络；仅热点或 STA 已释放时可用，上传中拒绝。
 /// Forget the preferred network only, while AP or after releasing STA resources; reject during upload.
 esp_err_t wifi_transfer_forget_wifi(void);
 /// 停服后同步扫描2.4GHz网络；最多16个去重SSID，按信号降序，临时射频和STA接口均释放。/ Scan synchronously while stopped; up to 16 unique SSIDs by descending RSSI; release temporary radio and STA resources.
 esp_err_t wifi_transfer_scan_wifi(wifi_transfer_network_t out[WIFI_TRANSFER_SCAN_MAX], size_t *count);
+esp_err_t wifi_transfer_scan_admitted(wifi_transfer_network_t out[WIFI_TRANSFER_SCAN_MAX], size_t *count,
+                                     memory_peak_token_t admitted);
 /// 停服后保存设备输入的凭据，不自动连接；密码校验与网页相同。/ Save device-entered credentials while stopped without connecting; validation matches the webpage.
 esp_err_t wifi_transfer_save_wifi(const char *ssid, const char *password);
 /// 已连接 STA 时复用网络；停服时临时联网。成功返回 UTC 秒，保留原本在线状态。
@@ -124,6 +153,8 @@ esp_err_t wifi_transfer_save_wifi(const char *ssid, const char *password);
 esp_err_t wifi_transfer_sync_time(uint32_t *utc_seconds);
 /// 已连接 STA 时对时，不断开 WiFi；供 HTTPS 页面校验证书。/ Sync time on connected STA without disconnecting WiFi for HTTPS certificate checks.
 esp_err_t wifi_transfer_sync_time_online(uint32_t *utc_seconds);
+/// 已联网的手动校时可取消，结果仅交给调用者。/ Cancellable online manual sync; return the result only to the caller.
+esp_err_t wifi_transfer_sync_time_online_manual(uint32_t *utc_seconds);
 
 /// 后台短时校准，可被手动联网或睡眠取消；不读取 TF 文件。
 /// Brief background calibration, cancellable by manual networking or sleep; no TF access.

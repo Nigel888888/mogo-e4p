@@ -12,8 +12,24 @@ python3 tools/run_reader_baseline.py perf prefetch background
 python3 tools/run_reader_baseline.py shelf management
 python3 tools/run_reader_baseline.py session chapter open images book
 python3 tools/run_reader_baseline.py controls
-python3 tools/run_reader_baseline.py present
+python3 tools/run_reader_baseline.py present reader_feedback display
 ```
+
+## 阅读背景加载 / Reading-background loading
+
+`ui_reader_background` 在TF `/sdcard/.readpico/reader-background/0.bin` 至 `3.bin` 按四个方向各保留一个成品；正常屏幕每份415872字节像素加文件头，四份约1.6 MiB。首次准备（包括设置页预览）完成后保存成品，退出仍释放内存；下次开书或重启后先读取成品，不再解码、缩放或抖动原图。内存始终只有当前方向的一张成品，不常驻其他方向。
+`ui_reader_background` keeps one prepared file per orientation at SD `/sdcard/.readpico/reader-background/0.bin` through `3.bin`: normally 415872 pixel bytes plus a header each, about 1.6 MiB for four files. Initial preparation, including Settings previews, saves the result; exit still releases RAM. Subsequent opens/reboots load it without source decoding, scaling or dithering, retaining only the current orientation in RAM.
+
+缓存核对格式版本、原路径、源文件大小与修改时间、逻辑/面板尺寸、方向、像素长度及CRC；读取和解码后再次核对源文件元数据。原图必须仍在卡上，缺图不使用旧成品；路径、大小或修改时间变化及损坏、截断、尾部多余数据均触发重新生成。保留大小和修改时间的原地改图不能可靠识别，此时可删除缓存目录以强制重建。四个槽只代表最近在各方向准备的图片，预览其他图片会覆盖对应方向的槽。
+Caches check format version, source path/size/mtime, logical/panel dimensions, orientation, length and CRC; source metadata is rechecked after reading or decoding. The source must still exist. Identity changes, corruption, truncation and trailing data rebuild the result. Edits preserving both size and mtime cannot be reliably detected; delete the cache directory to force rebuilding. Each slot retains the most recently prepared image in that orientation, so previewing another image replaces that slot.
+
+缓存为可删除的派生数据，不纳入配置备份。缺失或不可写时仍走原图解码；临时文件写入、同步、关闭成功后才替换成品，写卡失败不阻止本次阅读，半写结果不会作为成品读取。首次加载、缓存命中、换方向以及不可写卡应分别测量，宿主“零次解码”不等于真机耗时。原白点归一、抖动相位、混合公式及刷新策略不变；PNG同尺寸路径跳过缩放，非透明灰度路径跳过RGBA展开。
+Caches are removable derived data excluded from settings backups. Missing/unwritable caches retain source decoding. Temporary writes must sync and close before replacement; failures retain the current decoded frame and partial files are never loaded as results. Measure initial loads, cache hits, orientation changes and unwritable media separately; host zero-decode evidence is not a device timing measurement. White-point clamping, dither phase, blending and refresh rules remain unchanged; native PNG skips scaling and opaque grayscale skips RGBA expansion.
+
+`background` 覆盖四向逐像素等价、内存释放后零解码重载、成品单份415872字节、源变化、损坏及写卡故障；`image_stream` 核对灰度/彩色/透明/调色板/黑白/16位PNG的真实像素、原尺寸裁切、缩放等价、图层alpha及取消。
+`background` checks exact four-orientation pixels, zero-decode reloads after RAM release, one 415872-byte result, source changes, corruption and write failures. `image_stream` checks real grayscale/color/transparent/palette/mono/16-bit PNG pixels, native crops, scaling equivalence, layer alpha and cancellation.
+
+## 宿主回归与测量范围 / Host regression and measurement scope
 
 `display_contract` 在禁止硬件头的条件下单独编译 C/C++ 页面契约，检查不透明显示状态与真实后端类型及布局兼容，并覆盖区域回调在零尺寸、负坐标和整数边界上的无损转换。显示状态仍由装配和显示服务持有；页面只借用，区域裁剪继续由原显示出口处理。
 `display_contract` compiles C/C++ page contracts with hardware headers forbidden, checks opaque/native state identity and layout, and verifies lossless callback rectangles at zero sizes, negative coordinates and integer boundaries. Assembly and display services retain state ownership; pages borrow it, and existing display exits retain clipping.
@@ -78,6 +94,9 @@ Page observation allocates nothing, performs no storage IO and retains no text b
 `prefetch` 编译完整的预绘模块，使用真实线程和受控行边界验证推屏期间借用、停止交还、部分页续画、代次失效、内存/任务创建失败及重复释放。页面负责输入优先级和插图排除；预绘模块在 `end` 返回前借用稳定的字体、章节与布局，调用方随后才能替换资源。
 `prefetch` compiles the complete prefetch module with real threads and controlled row boundaries, checking presentation-time borrowing, stop/handoff, partial-page continuation, generation invalidation, allocation/task failures and repeated release. The page owns input priority and illustration exclusions; fonts, chapter and layout remain stable until `end` returns, before callers replace resources.
 
+横屏普通翻页仍与下一页预绘重叠；不会为水波纹额外生成扫描帧。`reader_feedback` 和 `present` 核对横屏正文/插图输出及回竖屏效果恢复，宿主不测实际连翻时延或光学效果。
+Ordinary landscape turns still overlap next-page prerendering and generate no additional ripple scan frames. `reader_feedback` and `present` check landscape text/image output and restored portrait effects, not hardware latency or optical quality.
+
 `storage` 编译真实的 `storage_jobs_quiesce`，覆盖封面先于头像、失败短路和每项独立超时；同时运行 S31 USB 四线总线/模拟开关、退出失败重试、文件页格式化/重挂门控、主机下电恢复，以及真实封面与头像工作队列测试。USB、文件页与睡眠共用这一交还入口；阅读预绘、传输、OTA 和介质状态仍由原调用边界负责。
 `storage` compiles the real `storage_jobs_quiesce`, checking cover-before-avatar ordering, failure short-circuiting and independent per-job timeouts. It also runs S31 USB four-bit bus/switch and teardown-retry checks, file-page format/remount guards, host power-down recovery, and real cover/avatar worker tests. USB, files and sleep share this handoff; reader prefetch, transfers, OTA and media state remain owned by their existing caller boundaries.
 
@@ -98,6 +117,12 @@ The cover slot array retains its existing resident policy. Cancellation frees un
 
 macOS 默认使用可用的 Command Line Tools 编译器及其 SDK；可以显式设置 `CC` 和 `SDKROOT`。入口先验证 sanitizer 编译与运行，失败即停止；不会静默取消 sanitizer。各组日志与 `results.json` 保留实际退出码。
 On macOS the runner defaults to an available Command Line Tools compiler and SDK; explicit `CC` and `SDKROOT` overrides are supported. A sanitizer compile/run probe must succeed; sanitizers are never silently removed. Suite logs and `results.json` retain actual exit codes.
+
+书内 JPEG/PNG 大幅缩小时，在同样的输出像素数下拓宽取样间距，减轻细线漏采和条纹混叠。PNG 仍逐行解压，但只把会取样的行转为灰度；不透明 RGB 行不扩为 RGBA。基线 JPEG 的软件回退优先从仍有足够缩图取样的 IDCT 档开始，原有硬件路径、解码预算和低内存回退保留。渐进式 JPEG 仍为低内存的 1/8 DC 解码，无法还原高频细节。
+For strong reductions of in-book JPEG/PNG, spread the taps without adding output pixels. PNG still inflates by row, converts only sampled rows to gray, and keeps opaque RGB at three channels. Baseline JPEG software fallback starts at a reduced IDCT size when it still has enough samples. Hardware decoding, memory caps and low-memory fallbacks remain in place. Progressive JPEG still uses low-memory 1/8 DC decoding and cannot recover high-frequency detail.
+
+封面缩略图保持原有尺寸上限；书架、首页灰阶封面与锁屏票根用双线性采样直接写入现有帧缓冲，封面在采样后加深中间调，保留纯黑与纯白，再按显示模式量化；快刷从 8 位亮度直接生成 1 位点阵。后台按需更新旧封面缓存，只读票根仍可用上一版灰阶小图，不在锁屏时打开 EPUB 解码。票根铺屏仍基于缩略图，不是从原书解码一幅满屏封面。
+Cover thumbnails keep their existing dimension caps. Shelf, grayscale Home covers and lock tickets sample into the existing framebuffer. Cover midtones are deepened after sampling without shifting pure black or white. Fast refresh dithers directly from 8-bit tone to 1-bit pixels. Workers regenerate old thumbnail caches on demand; the read-only lock ticket can use the previous grayscale cache without decoding the EPUB while locking. The full-screen ticket art is still based on a thumbnail, not a panel-resolution decode of the original cover.
 
 `python3 tools/gen_book_fixtures.py` 在 `build/book-fixtures/books/` 生成原创测试书。`河边记事_图文.epub` 每章交替包含 60 段短文和 60 张灰阶 PNG（384×128，十六阶灰阶带及黑白棋盘格），用于补充正文图片混排场景。生成器固定 ZIP 元数据并在 manifest 记录校验值；书源宿主回归验证实际解析后的图片数量、尺寸和资源读取。传入设备后，仍须独立采集并确认显示效果。
 `python3 tools/gen_book_fixtures.py` generates original books in `build/book-fixtures/books/`. `河边记事_图文.epub` alternates 60 short paragraphs with 60 grayscale PNGs per chapter (384×128, sixteen gray bands and a black/white checkerboard). Fixed ZIP metadata and manifest checksums support repeatable mixed-page measurements. Source host tests verify parsed image counts, dimensions and resource reads. Device capture and visual acceptance remain separate checks.

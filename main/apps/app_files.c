@@ -4,8 +4,8 @@
  *
  * 中文：TF 卡文件入口、目录浏览及 USB/Wi-Fi 传输入口。
  * English: SD file entry, directory browser and USB/Wi-Fi transfer routes.
- * 用户修订：文件管理直接显示 WiFi、热点、USB 三个入口，不再包含在线书籍下载。
- * User revision: show direct WiFi, hotspot and USB routes, with no online book downloads.
+ * 用户修订：文件管理直接显示 WiFi、热点、USB；有接入 ID 时并排显示 CloudZao。
+ * User revision: show direct WiFi, hotspot and USB routes, alongside CloudZao when an integration ID is configured.
  * 用户授权新输入法：文件改名使用共用九宫格/全键盘及常亮光标；离页释放候选。
  * Authorized keyboard revision: rename uses shared T9/QWERTY and a steady caret; exit frees candidates.
  * 用户修订：输入只刷新变化区域，布局切换局部灰阶，避免打字累计整屏清残影。
@@ -27,6 +27,11 @@
 #include <unistd.h>
 
 #include "app.h"
+#include "sdkconfig.h"
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+#include "assets/cloudzao_badge.h"
+#include "cloudzao_service.h"
+#endif
 #include "app_content_open.h"
 #include "app_transfer_mode.h"
 #include "book_store.h"
@@ -174,9 +179,32 @@ static bool file_pager_event(app_ctx_t *ctx,const ui_gesture_event_t *ev,app_red
     if(decorated)*redraw=file_pager_paint(ctx);
     return true;
 }
-static EpdRect home_transfer_rect(int index) {
-    return (EpdRect){36 + index * 204, 274, 204, 132};
+static int home_transfer_count(void) {
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+    return cloudzao_available() ? 4 : 3;
+#else
+    return 3;
+#endif
 }
+
+static EpdRect home_transfer_rect(int index) {
+    const int width = 612 / home_transfer_count();
+    return (EpdRect){36 + index * width, 274, width, 132};
+}
+
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+static void draw_cloudzao_logo(uint8_t *fb, int cx, int cy) {
+    const int left = cx - CLOUDZAO_BADGE_SIZE / 2;
+    const int top = cy - CLOUDZAO_BADGE_SIZE / 2;
+    for (int y = 0; y < CLOUDZAO_BADGE_SIZE; ++y) {
+        for (int x = 0; x < CLOUDZAO_BADGE_SIZE; ++x) {
+            const uint8_t pair = cloudzao_badge_gray4[(y * CLOUDZAO_BADGE_SIZE + x) / 2];
+            const uint8_t gray = (x & 1) ? pair & 0x0f : pair >> 4;
+            if (gray != 15) epd_draw_pixel(left + x, top + y, (uint8_t)(gray << 4), fb);
+        }
+    }
+}
+#endif
 
 // 无边框存储信息区，包含容量条；绘制与命中共用。
 // Unframed storage information including its capacity bar, shared by rendering and hits.
@@ -755,12 +783,25 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             if (capacity.width > 0) ui_fill_rect_fast(capacity, UI_GRAY_BLACK, fb);
         }
         ui_text_box(fb, (EpdRect){36, 229, 612, 40}, 18, "传输文件", EPD_DRAW_ALIGN_LEFT, false);
-        static const char *const methods[] = {"WiFi传输", "热点传输", "USB传输"};
-        static const char *const details[] = {"同一网络", "连接设备热点", "连接电脑"};
+        static const char *const methods[] = {"WiFi传输", "热点传输", "USB传输",
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+            "CloudZao",
+#endif
+        };
+        static const char *const details[] = {"同一网络", "连接设备热点", "连接电脑",
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+            "接收推送",
+#endif
+        };
         static const ui_icon_t icons[] = {UI_ICON_WIFI, UI_ICON_RADIO_TOWER, UI_ICON_USB};
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < home_transfer_count(); ++i) {
             EpdRect card = home_transfer_rect(i);
-            ui_draw_icon(fb, card.x + card.width / 2, card.y + 28, 40, icons[i], UI_GRAY_BLACK);
+            const int cx = card.x + card.width / 2;
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+            if (i == 3) draw_cloudzao_logo(fb, cx, card.y + 28);
+            else
+#endif
+                ui_draw_icon(fb, cx, card.y + 28, 40, icons[i], UI_GRAY_BLACK);
             ui_text_box(fb, (EpdRect){card.x + 6, card.y + 54, card.width - 12, 38},
                         21, methods[i], EPD_DRAW_ALIGN_CENTER, false);
             ui_text_box(fb, (EpdRect){card.x + 6, card.y + 95, card.width - 12, 32},
@@ -1111,11 +1152,16 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         s_sd_format_confirm = false;
         s_sd_notice[0] = 0;
     }
-    for (int i = 0; !long_press && i < 3; ++i) if (ui_rect_hit(home_transfer_rect(i), ev->x0, ev->y0)) {
+    for (int i = 0; !long_press && i < home_transfer_count(); ++i) {
+        EpdRect card = home_transfer_rect(i);
+        if (!ui_rect_hit(card, ev->x0, ev->y0) || !ui_rect_hit(card, ev->x, ev->y)) continue;
         extern const app_desc_t app_transfer;
         if (i == 0) app_transfer_request_wifi_upload();
         else if (i == 1) app_transfer_request_hotspot_start();
-        else app_transfer_request_usb_start();
+        else if (i == 2) app_transfer_request_usb_start();
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+        else app_transfer_request_cloudzao();
+#endif
         ctx->request_app = &app_transfer;
         return APP_REDRAW_NONE;
     }

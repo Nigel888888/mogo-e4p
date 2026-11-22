@@ -191,7 +191,7 @@ assert save.index("return;") < save.index("book_excerpt_flush") < save.index("pe
 release = function("free_book", BOOK)
 assert release.index("book_excerpt_flush") < release.index("book_excerpt_reset") < release.index("reader_session_close")
 lost = function("book_on_media_lost", BOOK)
-assert lost.index("book_excerpt_reset") < lost.index("save_progress") < lost.index("free_book")
+assert lost.index("cancel_auto_resume") < lost.index("book_excerpt_reset") < lost.index("save_progress") < lost.index("free_book")
 GATE = r'''
 #include <assert.h>
 #include <stdio.h>

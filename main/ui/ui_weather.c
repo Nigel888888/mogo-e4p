@@ -193,11 +193,14 @@ void ui_weather_draw(uint8_t *f, EpdRect region, bool tomorrow, const app_weathe
     weather_time_text(day?day->sunrise:0,value,sizeof(value));tc(f,left+342,top+369,34,value);
     weather_time_text(day?day->sunset:0,value,sizeof(value));tc(f,left+558,top+369,34,value);
     if(view->state==APP_WEATHER_LOADING)snprintf(value,sizeof(value),"正在更新…");
+    else if (view->notice[0]) {
+        const bool cached = day && (view->forecast.stale || now >= view->forecast.fresh);
+        snprintf(value, sizeof(value), "%s%s", cached ? "缓存 · " : "", view->notice);
+    }
     else if(day) {
         char updated[16];weather_time_text(view->forecast.fetched,updated,sizeof(updated));
-        snprintf(value,sizeof(value),"%s 更新%s%s",updated,
-            view->forecast.stale||now>=view->forecast.fresh?" · 缓存":"",
-            view->notice[0]?" · 更新失败":"");
+        snprintf(value,sizeof(value),"%s 更新%s",updated,
+            view->forecast.stale||now>=view->forecast.fresh?" · 缓存":"");
     } else snprintf(value,sizeof(value),"点城市名称设置，或重试刷新");
     const EpdRect refresh=refresh_button(region);
     const int footer=refresh.y+refresh.height/2;

@@ -7,7 +7,7 @@ import re, subprocess, sys, tempfile
 ROOT=Path(__file__).resolve().parents[1]
 power=(ROOT/'main/ui/ui_power_dialog.c').read_text()
 if len(sys.argv)>2 and sys.argv[1]=='--input-c':
-    Path(sys.argv[2]).write_text(power[:power.index('EpdRect ui_power_dialog_rect(void)')])
+    Path(sys.argv[2]).write_text(re.sub(r'^#include "(?:shutdown_wallpaper|memory_manager|settings|book_ticket|book_lock_collage|lock_calendar)\.h"\n','',power[:power.index('EpdRect ui_power_dialog_rect(void)')],flags=re.M))
     raise SystemExit(0)
 def function(path,name):
     text=(ROOT/path).read_text()
@@ -46,6 +46,32 @@ for name in ('epd_draw_circle','epd_fill_circle_helper','epd_fill_circle'):
     code+=function('components/epdiy/src/epdiy.c',name)
 for name in ('ui_read_pixel','icon_row_decode', 'icon_nibble','ui_draw_icon','clamp_radius','draw_arc','ui_draw_round_rect_raw','ui_draw_round_rect','ui_inset_rect','ui_draw_control_frame','ui_fill_round_rect_raw','ui_fill_round_rect'):
     code+=function('main/ui/ui_kit.c',name)
+settings=(ROOT/'main/settings/settings.h').read_text()
+code+=settings[settings.index('typedef enum {\n    APP_OFF_SYSTEM'):settings.index('/// 与浅睡锁屏独立')]
+code+=r'''
+#define SHUTDOWN_ART_WIDTH 684u
+#define SHUTDOWN_ART_HEIGHT 1216u
+#define SHUTDOWN_ART_BYTES (684u*1216u/2u)
+#define MM_OWNER_FILE_JOB 0
+#define MM_POOL_PSRAM 1
+static app_shutdown_wallpaper_t off_config;
+static bool off_cache_ok=true,off_oom;
+static const app_shutdown_wallpaper_t *app_settings_shutdown_wallpaper(void){return &off_config;}
+static void *mm_alloc(int owner,int pool,size_t n,size_t align,size_t reserve){(void)owner;(void)pool;(void)align;(void)reserve;return off_oom?NULL:malloc(n);}
+static bool mm_free(void *p){free(p);return true;}
+static bool shutdown_wallpaper_read(const app_shutdown_wallpaper_t *v,uint8_t *p){(void)v;memset(p,0x33,SHUTDOWN_ART_BYTES);return off_cache_ok;}
+'''
+code+=r'''
+static bool generated_ok=true,last_variant;
+static unsigned generated_kind;
+static bool generated(uint8_t *p,unsigned kind,bool variant){
+ for(unsigned i=0;i<sizeof(fb);++i)assert(p[i]==255);
+ generated_kind=kind;last_variant=variant;memset(p,(int)(kind*17),sizeof(fb));return generated_ok;
+}
+static bool book_ticket_preview(uint8_t *p,bool cover){return generated(p,4,cover);}
+static bool book_lock_collage_prepare(uint8_t *p){return generated(p,5,false);}
+static bool lock_calendar_draw_variant(uint8_t *p,bool month){return generated(p,6,month);}
+'''
 code+=re.sub(r'^#include[^\n]*\n','',power,flags=re.M)
 code+=r'''
 static ui_power_dialog_t dialog;
@@ -63,6 +89,19 @@ static void raster_check(void){
  assert(changed);
 }
 int main(int argc,char **argv){
+ off_config.style=APP_OFF_SYSTEM;ui_power_shutdown_prepare(fb);assert(fb[0]==255);
+ const unsigned styles[]={APP_OFF_TICKET,APP_OFF_COLLAGE,APP_OFF_CALENDAR};
+ for(unsigned i=0;i<3;++i)for(unsigned variant=0;variant<2;++variant){
+  off_config.style=styles[i];off_config.ticket_background=off_config.calendar_style=variant;
+  app_shutdown_wallpaper_t saved=off_config;memset(fb,0x11,sizeof(fb));ui_power_shutdown_prepare(fb);
+  assert(generated_kind==i+4&&fb[0]==(i+4)*17&&last_variant==(i==1?false:(bool)variant));
+  assert(!memcmp(&saved,&off_config,sizeof(saved)));
+  generated_ok=false;ui_power_shutdown_prepare(fb);assert(fb[0]==255);generated_ok=true;
+ }
+ off_config.style=APP_OFF_CUSTOM;off_config.show_hint=false;ui_power_shutdown_prepare(fb);for(unsigned i=0;i<sizeof(fb);++i)assert(fb[i]==0x33);
+ off_cache_ok=false;ui_power_shutdown_prepare(fb);assert(fb[0]==255);off_cache_ok=true;
+ off_oom=true;ui_power_shutdown_prepare(fb);assert(fb[0]==255);off_oom=false;
+ off_config.show_hint=true;ui_power_shutdown_prepare(fb);assert(fb[0]==0x33&&epd_get_pixel(342,1120,W,H,fb)==240);
  ui_power_dialog_draw(fb,&dialog);press();
  assert(feed(UI_POWER_THUMB_X+1,UI_POWER_THUMB_Y,1,false,false)==UI_POWER_ACTION_NONE&&dialog.position==1);raster_check();
  assert(feed(UI_POWER_THUMB_X+1,UI_POWER_THUMB_Y,1,false,false)==UI_POWER_ACTION_NONE&&!dirty.height);

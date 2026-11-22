@@ -27,6 +27,7 @@ set(main_requires
     bt
     # 蓝牙翻页器本体。/ The page-turner itself.
     ble_page_turner
+    memory_peak
     e0470_epaper_waveform
     e0470_page_turn
     device_power
@@ -56,6 +57,15 @@ set(main_requires
 set(cellular_sources
     "services/cellular/cellular_service.cc"
     "services/cellular/uart_eth_modem.cc")
+if(CONFIG_MOGO_CLOUDZAO_TRANSFER)
+    set(cloudzao_sources "services/cloudzao_receive.c" "services/cloudzao_wire.c" "services/cloudzao_service.c"
+        "services/cloudzao_history.c" "services/cloudzao_partner.c")
+endif()
+
+if(MOGO_PUBLIC_RELEASE AND NOT CONFIG_MOGO_CLOUDZAO_TRANSFER)
+    message(FATAL_ERROR "Public releases require CloudZao file reception")
+endif()
+
 # 原始位图保留在源码中，只把可复现的压缩资源嵌入 app。/ Retain source bitmaps and embed only reproducible compressed resources in the app.
 idf_build_get_property(image_python PYTHON)
 set(builtin_image_dir "${CMAKE_CURRENT_BINARY_DIR}/builtin_images")
@@ -76,6 +86,7 @@ endif()
 idf_component_register(
     SRCS
         "app_main.c"
+        ${cloudzao_sources}
         "factory/epd_test.c"
         "boot/boot_state.c"
         "apps/app_boot_recovery.c"
@@ -96,6 +107,7 @@ idf_component_register(
         "display/display_main_waveform.c"
         "display/display_reader_waveform.c"
         "display/display_normalize.c"
+        "display/display_static_black.c"
         "power/cache_wake_restore.c"
         "power/s31_sleep_compat.c"
         "services/storage_jobs.c"
@@ -106,6 +118,7 @@ idf_component_register(
         "services/network_http.c"
         ${cellular_sources}
         "services/lock_style_images.c"
+        "services/shutdown_wallpaper.c"
         "services/weather_model.c"
         "services/weather_service.c"
         "services/reading_journal_model.c"
@@ -168,8 +181,9 @@ idf_component_register(
         "apps/book_toc.c"
         "apps/app_dashboard.c"
         "apps/app_components.c"
-        "apps/app_reading_journal.c"
+        "apps/app_reading_journal.c",
         "apps/app_vocabulary.c"
+        "book/book_vocabulary.c"
         "apps/app_files.c"
         "apps/file_tree.c"
         "apps/app_device_settings.c"
@@ -201,7 +215,6 @@ idf_component_register(
         "book/book_title.c"
         "book/book_ticket.c"
         "book/book_excerpt.c"
-        "book/book_vocabulary.c"
         "book/book_lock_collage.c"
         "book/book_lock_bookmark.c"
         "book/book_source.c"
@@ -226,6 +239,7 @@ idf_component_register(
         "book/reader_dictionary.c"
         "ui/ui_reader_dictionary.c"
         "book/book_layout.c"
+        "book/book_hyphen_en.c"
         "book/gbk.c"
         "font/ttf_font.c"
         "font/ttf_font_source.c"
@@ -249,6 +263,27 @@ idf_component_register(
         "assets/ui-hanzi.bin"
         "assets/display-test.png"
 )
+
+if(CONFIG_MOGO_CLOUDZAO_TRANSFER)
+    target_add_binary_data(${COMPONENT_LIB} "services/cloudzao_oss_root_r3.pem" TEXT)
+
+    # 不写入 Kconfig、CMake 缓存或编译命令；此生成目录也不在发布产物白名单内。
+    # Keep the ID out of Kconfig, CMake cache and command lines; this directory is not a release artifact.
+    set(cloudzao_integration_id "")
+    if(MOGO_PUBLIC_RELEASE)
+        set(cloudzao_integration_id "$ENV{MOGO_CLOUDZAO_INTEGRATION_ID}")
+        string(LENGTH "${cloudzao_integration_id}" cloudzao_id_length)
+        if(cloudzao_id_length GREATER 256 OR NOT cloudzao_integration_id MATCHES "^[A-Za-z0-9._~+/=-]+$")
+            message(FATAL_ERROR "Public releases require a valid MOGO_CLOUDZAO_INTEGRATION_ID")
+        endif()
+    endif()
+    set(cloudzao_private_dir "${CMAKE_CURRENT_BINARY_DIR}/cloudzao_private")
+    file(CONFIGURE OUTPUT "${cloudzao_private_dir}/cloudzao_integration.h"
+        CONTENT "#define MOGO_CLOUDZAO_BUILD_ID \"@cloudzao_integration_id@\"\n" @ONLY)
+    file(CHMOD "${cloudzao_private_dir}/cloudzao_integration.h" PERMISSIONS OWNER_READ OWNER_WRITE)
+    target_include_directories(${COMPONENT_LIB} PRIVATE "${cloudzao_private_dir}")
+    unset(cloudzao_integration_id)
+endif()
 
 # 连接失败后 IDF 会关闭 socket；按需保留解析地址和连接阶段，正式默认关闭。
 # Failed sockets are closed inside IDF; opt in to address/progress logs locally.

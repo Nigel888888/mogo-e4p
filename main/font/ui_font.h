@@ -20,6 +20,7 @@ size_t ui_font_cache_clear(void);
 /// Visit live glyph allocations on the UI task without initializing/rasterizing; callbacks must not mutate or allocate.
 void ui_font_visit_allocations(void (*visit)(void *context, const void *allocation), void *context);
 int ui_font_ascender_px(int px);
+/// 测宽不生成字形位图或创建字形缓存。/ Measure advances without rasterizing or creating the glyph cache.
 int ui_font_text_width_px(int px, const char *text);
 /// 标题里是否有字只存在于补充位图：有则整行走补充基准字号，没有则按轮廓字号生成。
 /// Whether any title glyph lives only in the bitmap supplement: such a line takes the supplement's

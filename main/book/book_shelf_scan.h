@@ -15,9 +15,9 @@ typedef struct {
 typedef struct {
     book_shelf_catalog_t catalog; ///< 同步借用；页面负责最终释放 / Synchronous borrow; the page performs final release
     const char *query; ///< 本次搜索文本 / Search text for this call
-    bool (*cancel)(void *ctx); ///< 页面轮询导航并报告是否停止；NULL表示不轮询 / Page polls navigation and reports stop; NULL disables polling
+    bool (*cancel)(void *ctx); ///< 检查是否取消；NULL表示不检查 / Cooperative cancellation; NULL disables checks
     void *cancel_ctx; ///< 取消回调上下文 / Cancellation context
-    int (*category_add)(const char *path); ///< 登记卡上书根的一级目录 / Register first-level card book-root folders
+    int (*category_add)(const char *path); ///< 可选：登记书根一级目录 / Optional: register first-level book-root folders
     bool (*favorite_read)(nvs_handle_t handle, const char *path); ///< 借用已打开的收藏句柄 / Borrow an open favorites handle
     bool (*hidden_read)(nvs_handle_t handle, const char *path); ///< 借用已打开的隐藏记录句柄 / Borrow an open hidden-record handle
     nvs_handle_t progress; ///< 已尝试打开的只读进度句柄，扫描借用 / Borrowed read-only progress handle for this scan

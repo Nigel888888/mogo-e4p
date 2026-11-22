@@ -6,6 +6,8 @@
 #include <stdint.h>
 /// 使用当前北京时间绘制所选日历；时间无效时绘制校准提示。/ Draw the chosen face for Beijing time, or a clock-calibration prompt.
 bool lock_calendar_draw(uint8_t *framebuffer);
+/// 绘制独立日历版式，不修改待机选择或待机帧身份。/ Draw an independent calendar face without changing standby settings or frame identity.
+bool lock_calendar_draw_variant(uint8_t *framebuffer, bool month);
 /// 缓存身份包含日期和子样式，跨日/换样式后拒绝旧图。/ Include date and variant in cache identity, rejecting stale art after either changes.
 uint64_t lock_calendar_key(void);
 

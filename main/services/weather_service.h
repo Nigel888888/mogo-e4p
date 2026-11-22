@@ -1,6 +1,6 @@
 /*
- * 中文：当前页面持有的天气服务；UI任务交接结果，后台只做有界HTTP。
- * English: Page-owned weather service; UI hands off results and the worker only performs bounded HTTP.
+ * 中文：当前页面持有的天气服务；UI任务交接结果，后台处理有界HTTP与已选城市的自动缓存。
+ * English: Page-owned weather service; UI hands off results; the worker handles bounded HTTP and automatic cache writes for a selected city.
  */
 #pragma once
 #include "weather_model.h"
@@ -29,11 +29,21 @@ bool app_weather_set_enabled(bool enabled);
 /// 仅控制自动请求；手动更新和选城不受影响。/ Gate automatic requests only, preserving manual updates and city selection.
 bool app_weather_set_auto_refresh(bool enabled);
 bool app_weather_select(const weather_location_t *city);
+/// 恢复城市和自动刷新，不导入缓存或旧组件开关。/ Restore city and automatic refresh without importing cache or the legacy widget switch.
+bool app_weather_restore_preferences(bool auto_refresh, bool has_city, const weather_location_t *city);
 bool app_weather_request(app_weather_request_t request, const char *query);
 /// 页码从零开始；优先本地缓存，仅补取缺失批次。/ Zero-based pages use local results first, fetching only missing batches.
 bool app_weather_search(const char *query, unsigned page);
 /// automatic由前台页面按首页槽位决定，旧enabled字段不再决定新布局。/ The foreground page gates automatic work by Home slots, not the legacy enabled field.
 bool app_weather_poll(bool automatic);
+/// 空闲非天气页静默更新已选城市；调用者确认组件仍在首页。/ Quiet refresh for an idle non-weather page; caller checks widget presence.
+void app_weather_background_poll(void);
+/// 仅回收或取消静默任务，不等待、不影响页面发起的请求。/ Collect or cancel only quiet work, without waiting or affecting page requests.
+void app_weather_background_pause(void);
+/// 通知取消，不等待；旧结果不会写回设置或缓存。/ Signal cancellation without waiting or publishing stale results.
+void app_weather_cancel(void);
+/// 非天气页也回收已取消结果；不消费有效回复。/ Reap cancelled results off-page without consuming valid replies.
+void app_weather_reap_cancelled(void);
 /// 取消后等待真正交还无线与HTTP，不删除仍运行的任务。/ Cancel and await actual radio/HTTP handoff; never delete a running worker.
 void app_weather_cancel_join(void);
 bool app_weather_busy(void);

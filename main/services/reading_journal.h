@@ -7,6 +7,8 @@
  */
 #pragma once
 #include "reading_journal_model.h"
+#include "esp_err.h"
+#include <stdio.h>
 
 /// 事件或轮询调用；日期/状态变化返回true，不从render调用。/ Events/polls only; return date/state changes, never call from render.
 bool app_reading_journal_poll(void);
@@ -15,6 +17,9 @@ void app_reading_journal_record(const char *path, const char *title, uint32_t fi
                                 unsigned chapter, uint32_t milliseconds, uint32_t turns);
 /// 锁屏/离页立即尝试保存；失败保留内存，下次重试。/ Flush on lock/exit; retain memory on failure for retry.
 bool app_reading_journal_flush(void);
+/// 流式读写当前手账；apply 为假时只校验。/ Stream the current journal; read only validates when apply is false.
+esp_err_t app_reading_journal_backup_write(FILE *file);
+esp_err_t app_reading_journal_backup_read(FILE *file, bool apply);
 /// 分类改名/移书时保持当月书籍身份；失败由卡上路径日志重试。/ Retain monthly book identity during category moves; retry failures through the card's path journal.
 bool app_reading_journal_relocate(const char *old_path, const char *new_path, uint32_t file_size);
 bool app_reading_journal_next_scene(void);

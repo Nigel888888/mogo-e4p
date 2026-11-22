@@ -70,7 +70,7 @@ void ttf_font_close_embedded(void);
 /// 字形失败原因。/ Why a glyph could not be rasterized.
 typedef enum {
     TTF_FONT_FAIL_READ = 0, ///< 轮廓读取或打包失败 / outline read or pack failed
-    TTF_FONT_FAIL_EMPTY,    ///< 重试后仍无轮廓且无字宽 / still empty and zero-width after a retry
+    TTF_FONT_FAIL_EMPTY,    ///< 缺少预期轮廓或度量 / Expected outline or metrics missing
     TTF_FONT_FAIL_ALLOC,    ///< 位图或缓存条目分配失败 / bitmap or cache-entry allocation failed
     TTF_FONT_FAIL_RETRY_OK, ///< 第一次读取异常，清缓存重试后成功 / first read was bad, retry recovered
 } ttf_font_failure_t;

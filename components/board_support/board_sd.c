@@ -502,6 +502,14 @@ esp_err_t board_sd_get_info(board_sd_info_t* info) {
     return err;
 }
 
+bool board_sd_is_mounted(void) {
+    board_sd_info_t info = {0};
+    const esp_err_t err = board_sd_get_info(&info);
+    // 忙不是掉卡：已挂载的巡检仍带有效快照，首次挂载则没有。
+    // Busy is not removal: health checks retain a mounted snapshot, whereas initial mounting has none.
+    return info.mounted && (err == ESP_OK || err == ESP_ERR_NOT_FINISHED);
+}
+
 // 驱动操作期间占用忙状态，不在临界区执行 I/O。/ Reserve busy state across driver I/O outside the critical section.
 static bool begin_operation(void) {
     portENTER_CRITICAL(&state_lock);

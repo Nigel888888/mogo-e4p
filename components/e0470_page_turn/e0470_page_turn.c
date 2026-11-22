@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "e0470_epaper_waveform.h"
+#include "e0470_white_field.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -260,8 +261,56 @@ static void copy_front_to_back(EpdiyHighlevelState* hl, EpdRect phys) {
     }
 }
 
+// 仅打包明确请求的栏位差分；00/FF 表示静态纯黑/纯白，EE 表示保持。
+// Pack differences only in requested bars; 00/FF denote static black/white and EE means hold.
+static unsigned pack_reader_chrome(EpdiyHighlevelState* hl, EpdRect body, int w, int h,
+                                   const EpdRect* chrome, bool reinforce_black, bool reinforce_white) {
+    unsigned found = 0;
+    const int starts[] = {0, body.x + body.width}, ends[] = {body.x, w}, stride = w / 2;
+    for (int y = 0; y < h; ++y) {
+        const size_t row = (size_t)y * w;
+        E0470WhiteField paper = e0470_white_field_row(hl->back_fb, hl->front_fb, stride, h, y);
+        int left[2] = {0}, right[2] = {0};
+        if (chrome) for (int i = 0; i < 2; ++i) {
+            if (y >= chrome[i].y && y < chrome[i].y + chrome[i].height) {
+                left[i] = chrome[i].x;
+                right[i] = chrome[i].x + chrome[i].width;
+            }
+        }
+        for (int side = 0; side < 2; ++side) {
+            for (int x = starts[side]; x < ends[side]; ++x) {
+                const size_t p = (row + x) / 2;
+                const int shift = (x & 1) * 4;
+                const unsigned old = (hl->back_fb[p] >> shift) & 15;
+                const unsigned target = (hl->front_fb[p] >> shift) & 15;
+                const bool black = reinforce_black && (old | target) == 0;
+                const bool white = reinforce_white && (old & target) == 15 &&
+                    e0470_white_field_contains(&paper, x);
+                const bool changed = old != target &&
+                    ((x >= left[0] && x < right[0]) || (x >= left[1] && x < right[1]));
+                hl->difference_fb[row + x] = changed ? (target << 4) | old : black ? 0 : white ? 0xff : 0xee;
+                found |= (unsigned)black | ((unsigned)changed << 1) | ((unsigned)white << 2);
+            }
+        }
+    }
+    return found;
+}
+
+static uint64_t reader_chrome_ticks(const EpdWaveformPhases* gl, int all_active, unsigned pushes) {
+    uint64_t mask = 0;
+    // 只用全部条带都活跃的拍，并沿用当前表的末段推黑；不补相，不改变正文节拍。
+    // Use only all-bands-active ticks and the effective table's final black pushes; never add ticks or change the body cadence.
+    for (int f = gl->phases - 1; f >= all_active && pushes; --f) {
+        if ((gl->luts[f * 64 + 3] & 3) == 1) {
+            mask |= UINT64_C(1) << f;
+            --pushes;
+        }
+    }
+    return pushes ? 0 : mask;
+}
+
 static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
-    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned band_count, bool compact) {
+    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned band_count, bool compact, unsigned chrome_pushes, const EpdRect* chrome, bool* scanned) {
     if (hl == NULL) return EPD_DRAW_NO_PHASES_AVAILABLE;
     if (band_count < 2 || band_count > TURN_BANDS_MAX) return EPD_DRAW_INVALID_CROP;
     if (dir > E0470_TURN_BTT) dir = E0470_TURN_RTL;
@@ -308,6 +357,18 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
     for (int band = 0; band < bands; ++band) assigned += s_band0[band] < s_band1[band];
     if (assigned != bands) return EPD_DRAW_INVALID_CROP;
 
+    // 合并仅面向竖屏整宽正文，外侧栏位使用同一张波形的独立时序，不占用正文相位。
+    // Join only full-width portrait text; outside bars use an independent timeline of the same waveform.
+    const bool chrome_crop = (chrome || chrome_pushes) && line_ph && lr && compact && y0 == 0 && y1 == fb_h &&
+        (fb_w & 15) == 0 && (phys.x > 0 || phys.width < fb_w) && nphase < TURN_PHASE_CAP;
+    if (chrome && !chrome_crop) return EPD_DRAW_INVALID_CROP;
+    if (chrome) for (int i = 0; i < 2; ++i) {
+        EpdRect r = chrome[i];
+        if (!r.width && !r.height) continue;
+        if (r.x < 0 || r.y < 0 || r.width <= 0 || r.height <= 0 || r.width > fb_w - r.x ||
+            r.height > fb_h - r.y || (r.x + r.width > phys.x && r.x < phys.x + phys.width))
+            return EPD_DRAW_INVALID_CROP;
+    }
     if (!build_luts(gl)) return EPD_DRAW_NO_PHASES_AVAILABLE;
     epd_poweron();
 
@@ -316,6 +377,26 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
     epd_difference_image_cropped(
         hl->front_fb, hl->back_fb, phys, hl->difference_fb, hl->dirty_lines, hl->dirty_columns
     );
+    uint64_t chrome_ticks = chrome_crop ? reader_chrome_ticks(gl, bands - 1, chrome_pushes) : 0;
+    int white_tick = -1;
+    if (chrome_crop && chrome_pushes) {
+        // 仅借用一拍已有的擦白，不移动正文条带或追加扫描。
+        // Borrow one existing whitening tick without moving the body bands or adding a scan.
+        for (int f = nphase - 1; f >= bands - 1; --f) {
+            if ((gl->luts[f * 64 + 60] >> 6) == 2) {
+                white_tick = f;
+                break;
+            }
+        }
+    }
+    uint8_t* chrome_lut = s_lut[TURN_PHASE_CAP - 1];
+    bool chrome_changes = false;
+    if (chrome_ticks || white_tick >= 0 || chrome) {
+        const unsigned packed = pack_reader_chrome(hl, phys, fb_w, fb_h, chrome, chrome_ticks != 0, white_tick >= 0);
+        if (!(packed & 1)) chrome_ticks = 0;
+        if (!(packed & 4)) white_tick = -1;
+        chrome_changes = (packed & 2) != 0;
+    }
     const int64_t gen_us = esp_timer_get_time() - t_gen;
 
     int64_t draw_us = 0;
@@ -352,12 +433,33 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
                 memset(hl->dirty_columns + xs / 2, 0xFF, (size_t)((xe - xs) / 2));
             }
             epd_set_line_phase_luts(s_lut_ptr, s_line_phase);
+            if (chrome_crop && (phys.x & 1)) hl->dirty_columns[phys.x / 2] = 0xf0;
+            if (chrome_crop && ((phys.x + phys.width) & 1)) hl->dirty_columns[(phys.x + phys.width) / 2] = 0x0f;
+            const bool bar_phase = chrome_changes && tick < nphase;
+            const bool black_phase = tick < nphase && (chrome_ticks & (UINT64_C(1) << tick)) != 0;
+            const bool white_phase = tick == white_tick;
+            if (bar_phase || black_phase || white_phase) {
+                if (bar_phase) {
+                    memcpy(chrome_lut, s_lut_ptr[tick], 1024);
+                    // 栏位从第一拍起覆盖所有原生行；正文未启动的行仍保持。
+                    // Start bars on all native rows with tick zero; body lines not yet started hold.
+                    memset(hl->dirty_lines, 1, (size_t)fb_h);
+                } else memset(chrome_lut, 0, 1024);
+                memset(chrome_lut, 0, 4);
+                memset(chrome_lut + 0xee * 4, 0, 4);
+                memset(chrome_lut + 0xff * 4, 0, 4);
+                chrome_lut[0] = black_phase;
+                chrome_lut[0xff * 4] = white_phase ? 2 : 0;
+                memset(hl->dirty_columns, 0xff, (size_t)fb_w / 2);
+                epd_set_line_phase_outer_lut(chrome_lut, phys.x, phys.x + phys.width);
+            }
         } else {
             memset(hl->dirty_lines + y0, 1, (size_t)(y1 - y0));
             epd_set_col_phase_luts(s_lut_ptr, s_band0, s_band1, s_band_phase, bands);
         }
 
         const int64_t t_draw = esp_timer_get_time();
+        if (scanned) *scanned = true;
         err = epd_draw_base(
             epd_full_screen(),
             hl->difference_fb,
@@ -379,7 +481,11 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
 
     // 扫描失败时屏幕可能停在中间相位，保留旧帧基准给调用方恢复。
     // A failed scan may leave intermediate pixels; keep the old baseline for caller recovery.
-    if (err == EPD_DRAW_SUCCESS) copy_front_to_back(hl, phys);
+    if (err == EPD_DRAW_SUCCESS) {
+        copy_front_to_back(hl, phys);
+        if (chrome_changes) for (int i = 0; i < 2; ++i)
+            if (chrome[i].width && chrome[i].height) copy_front_to_back(hl, chrome[i]);
+    }
     ESP_LOGI(
         TAG,
         "dir=%s ticks=%d gen=%d ms draw=%d ms scan_avg=%d us wall=%d ms err=%d",
@@ -395,17 +501,28 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
 }
 
 enum EpdDrawError e0470_page_turn(EpdiyHighlevelState* hl, EpdRect area, e0470_turn_dir_t dir) {
-    return page_turn_run(hl, area, dir, &E0470_WAVEFORM, TURN_DEFAULT_BANDS, true);
+    return page_turn_run(hl, area, dir, &E0470_WAVEFORM, TURN_DEFAULT_BANDS, true, 0, NULL, NULL);
 }
 
 enum EpdDrawError e0470_page_turn_with_waveform(EpdiyHighlevelState* hl, EpdRect area,
     e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned band_count) {
-    return page_turn_run(hl, area, dir, waveform, band_count, false);
+    return page_turn_run(hl, area, dir, waveform, band_count, false, 0, NULL, NULL);
 }
 
 enum EpdDrawError e0470_page_turn_with_waveform_compact(EpdiyHighlevelState* hl, EpdRect area,
     e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned band_count) {
-    return page_turn_run(hl, area, dir, waveform, band_count, true);
+    return page_turn_run(hl, area, dir, waveform, band_count, true, 0, NULL, NULL);
+}
+
+enum EpdDrawError e0470_page_turn_reader(EpdiyHighlevelState* hl, EpdRect body,
+    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned chrome_pushes) {
+    return page_turn_run(hl, body, dir, waveform, TURN_DEFAULT_BANDS, true, chrome_pushes, NULL, NULL);
+}
+
+enum EpdDrawError e0470_page_turn_reader_joined(EpdiyHighlevelState* hl, EpdRect body,
+    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned chrome_pushes, const EpdRect chrome[2], bool* scanned) {
+    *scanned = false;
+    return page_turn_run(hl, body, dir, waveform, TURN_DEFAULT_BANDS, true, chrome_pushes, chrome, scanned);
 }
 
 enum EpdDrawError e0470_update_regions(EpdiyHighlevelState* hl, EpdRect area,

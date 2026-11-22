@@ -45,6 +45,8 @@ static int test_error(FILE *f) { return f == read_error_stream || ferror(f); }
 #define fread test_read
 #define fgetc test_getc
 #define ferror test_error
+static const char *backup_root;
+#define BOOK_COLLECTION_BACKUP_ROOT backup_root
 #include "../main/book/book_collection.c"
 #undef fwrite
 #undef fsync
@@ -60,8 +62,48 @@ static void corrupt(const char *prefix, int slot) {
 static void book(book_shelf_entry_t *b, const char *root, const char *leaf) {
     memset(b, 0, sizeof(*b)); snprintf(b->path, sizeof(b->path), "%s/%s", root, leaf); b->search_match = true;
 }
+static void test_collection_backup(const char *directory) {
+    backup_root = directory;
+    const char *card = "01-1234-12345678-90ab", *other = "02-1234-12345678-90ab";
+    book_collection_t built = {0}, current = {0}, different = {0};
+    uint32_t id; unsigned changed;
+    book_shelf_entry_t entry;
+    book(&entry, "/sdcard/books", "a.epub"); entry.selected = true;
+    assert(collection_backup_open(&built, "builtin") == ESP_OK);
+    assert(collection_backup_open(&current, card) == ESP_OK);
+    assert(collection_backup_open(&different, other) == ESP_OK);
+    assert(book_collection_create(&built, "Internal", NULL, 0, false, &id, &changed) == ESP_OK);
+    assert(book_collection_create(&current, "Card", &entry, 1, true, &id, &changed) == ESP_OK);
+    assert(book_collection_create(&different, "Other card", NULL, 0, false, &id, &changed) == ESP_OK);
+    FILE *file = tmpfile(); assert(file && book_collection_backup_write(file, card) == ESP_OK);
+    assert(book_collection_rename(&current, id, "Changed") == ESP_OK);
+    uint32_t rev = book_collection_backup_revision();
+    rewind(file);
+    assert(book_collection_backup_read(file, card, false) == ESP_OK && book_collection_backup_revision() == rev);
+    rewind(file);
+    assert(book_collection_backup_read(file, other, true) == ESP_OK && book_collection_backup_revision() == rev + 1);
+    assert(collection_backup_open(&different, other) == ESP_OK);
+    assert(!strcmp(book_collection_at(&different, 0)->name, "Other card"));
+    rewind(file);
+    assert(book_collection_backup_read(file, card, true) == ESP_OK && book_collection_backup_revision() == rev + 3);
+    assert(collection_backup_open(&current, card) == ESP_OK);
+    assert(!strcmp(book_collection_at(&current, 0)->name, "Card"));
+    assert(book_collection_assignment(&current, entry.path) == id);
+    rewind(file); assert(fputc('x', file) == 'x'); rewind(file);
+    assert(book_collection_backup_read(file, card, true) == ESP_ERR_INVALID_RESPONSE &&
+           book_collection_backup_revision() == rev + 3);
+    assert(fclose(file) == 0);
+    const char *libraries[] = {"builtin", card, other};
+    for (size_t i = 0; i < 3; ++i) for (int j = 0; j < 2; ++j) {
+        char path[320]; snprintf(path, sizeof(path), "%s/.mogo-shelf-%s.%d", directory, libraries[i], j);
+        if (unlink(path)) assert(errno == ENOENT);
+    }
+    book_collection_close(&built); book_collection_close(&current); book_collection_close(&different);
+    puts("PASS: collection backup round trip, library identity isolation and corrupt header rejection");
+}
 int main(void) {
     char directory[] = "/tmp/mogo-collections-XXXXXX"; assert(mkdtemp(directory));
+    test_collection_backup(directory);
     char root[288], prefix[288], second[288], folder[288];
     snprintf(root, sizeof(root), "%s/books", directory); assert(!mkdir(root, 0700));
     snprintf(prefix, sizeof(prefix), "%s/library-card-a", directory);

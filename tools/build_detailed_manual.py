@@ -26,7 +26,7 @@ DIAGRAMS = {
     'wifi': ('无线网络：连接、断开与遗忘', 0, 1216, [(1, 622, 341, '连接 / 断开按钮'), (2, 629, 404, '遗忘网络：删除保存的连接配置'), (3, 626, 886, '重新扫描附近网络')]),
     'ime-nine': ('九宫格：中文拼音与候选', 548, 534, [(1, 305, 582, '顶部切换九宫格 / 全键盘'), (2, 640, 692, '候选词翻页'), (3, 103, 775, '左侧选择读音'), (4, 653, 852, '重输只清待选拼音；清空会清文本')]),
     'ime-pinyin': ('全键盘：连续拼音选词', 548, 534, [(1, 640, 692, '候选词右翻页'), (2, 513, 1026, '中 / En：切换输入语言'), (3, 402, 1026, '有待选拼音时，空格位置变为选择')]),
-    'ime-upper': ('英文：大小写切换', 548, 534, [(1, 99, 930, 'a / A：切换大小写'), (2, 513, 1026, 'En / 中：回到中文拼音'), (3, 99, 1026, '123：进入数字页')]),
+    'ime-upper': ('英文：大小写切换', 548, 534, [(1, 99, 930, '大写 / 小写：切换大小写'), (2, 513, 1026, 'En / 中：回到中文拼音'), (3, 99, 1026, '123：进入数字页')]),
     'ime-numbers': ('数字与符号', 548, 534, [(1, 99, 1026, 'ABC：回到字母键盘'), (2, 187, 1026, '符号：进入符号页')]),
     'ime-password': ('WiFi 密码：常亮光标与英文键盘', 145, 937, [(1, 613, 285, '输入框右侧箭头移动光标'), (2, 648, 930, '删除；长按连续删除')]),
     'reading-settings': ('阅读设置：刷新、翻页与按键', 168, 1040, [(1, 626, 293, '手动全刷'), (2, 639, 684, '翻页模式'), (3, 648, 1070, '按键控制')]),
@@ -131,7 +131,7 @@ def write_html(content, assets, output, website=False):
             rows = ''.join('<tr>' + ''.join(f'<td>{escape(x)}</td>' for x in row) + '</tr>' for row in tab['rows'])
             tables.append(f'<p class="table-title">{escape(tab["title"])}</p><div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>')
         sections.append(f'<section class="chapter" id="{c["id"]}"><div class="chapter-num">第 {i:02d} 章 / {len(c["tasks"])} 项操作</div><h2>{escape(c["title"])}</h2><p class="intro">{escape(c["intro"])}</p>{gallery}{"".join(task_blocks + tables)}</section>')
-    quick = [('recent-sort','按最近排列书架','管理 → 按最近'),('ime-case','切换英文大小写','全键盘 → En → a / A'),('custom-hold','自定义中键长按','阅读设置 → 按键控制'),('restore-config','恢复配置与阅读进度','设置 → 保存与恢复')]
+    quick = [('recent-sort','按最近排列书架','管理 → 按最近'),('ime-case','切换英文大小写','全键盘 → En → 点左下大小写键'),('custom-hold','自定义中键长按','阅读设置 → 按键控制'),('restore-config','恢复配置与阅读进度','设置 → 保存与恢复')]
     # Resolve labels to stable manuscript IDs so editorial ID changes fail safely.
     task_by_title = {t['title']: t['id'] for c in chapters for t in c['tasks']}
     fallback = {'recent-sort':'按照最近阅读排列书架','ime-case':'切换英文大小写','restore-config':'刷机后恢复设置与阅读进度'}

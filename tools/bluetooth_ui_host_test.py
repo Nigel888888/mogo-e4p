@@ -29,6 +29,7 @@ def unit():
     code += '\n#include "' + str(ROOT / 'components/ble_page_turner/include/ble_page_turner.h') + '"\n'
     fixture = (ROOT / "tools/bluetooth_ui_host_test.c").read_text()
     mocks, tests = fixture.split("// PRODUCTION_CONTROLLER\n")
+    code += '\n#include "memory_peak.h"\n'
     code += mocks
     code += re.sub(r'^#include[^\n]*\n', '', (ROOT / 'main/apps/settings_bluetooth.c').read_text(), flags=re.M)
     settings = ROOT / 'main/apps/app_device_settings.c'

@@ -30,10 +30,12 @@ This file holds **only the protocol and the template** and is safe to merge upst
   - …
 - **未完成 / 进行中**：
   - …
-- **验证等级**：未编译 | 已编译 ci | 已编译 defaults（本机 IDF / docker run / devcontainer）| 已烧写未验证启动 | 真机已验证（板 RDP-G01-W，IDF v6.1，COMx，USB 供电；验证了 …；未覆盖 …）
-- **烧写记录**（本次没烧写就写"无"）：
-  - 命令原文：`cd build; python -m esptool … write-flash '@flash_args'`（必须包含地址或 `@flash_args`）
-  - 串口里看到的开机日志片段（至少 `Loaded app from partition at offset 0x10000` 与 `UI ready on …`）/ "没看串口"
+- **验证等级**：未编译 | 静态文档核对 | 宿主回归（编译器/sanitizer/范围）| 已编译 ci | 已编译 defaults（本机 IDF / docker run / devcontainer）| 已烧写未验证启动 | 真机已验证（实际型号 Metalio E-INK4 Plus / ESP32-S31、IDF 版本、串口、供电；验证了 …；未覆盖 …）
+- **构建身份**：源码提交/工作区指纹、产品版本、IDF/Python、目标、构建目录、应用大小及 SHA-256；没有构建写“未验证”。
+- **烧写记录**（本次没烧写就写“无”）：
+  - 授权、prepare/flash 命令及回执路径；遵循项目级 flash skill 和 `tools/flash_fast.py`，不以模板代替授权。
+  - 从当次分区表、工具读回与启动日志记录实际槽名/地址，不固定活动槽。当前表的 ota_0/ota_1 只是两个合法候选。
+  - 分别记录写入、完整摘要读回、启动（实际 `Loaded app from partition at offset …` 与 `UI ready on …`）、功能/实屏结果；未执行分别写“未验证”。
 - **涉及文件**（新建标 N，修改标 M）：
   - M `main/apps/app_xxx.c`
 - **Frozen 触碰**：无 | `app_xxx.c` 文件头第 N 行，原因：…

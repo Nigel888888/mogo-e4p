@@ -35,7 +35,7 @@ main=s[s.index('    if (y<160 || y>=UI_NAV_TOP || ev->x0<36',start):s.index('\ns
 assert main.endswith('}')
 main=main[:-1]
 enum=s[s.index('typedef enum { SETTINGS_MAIN'):s.index('} settings_page_t;')+len('} settings_page_t;')]
-macros='\n'.join(re.findall(r'^#define SETTINGS_(?:ROW_H|WIRELESS_ROWS|DISPLAY_ROWS|PERSONAL_ROWS|MAINTENANCE_ROWS|POWER_ROWS|WIRELESS_Y|DISPLAY_Y|PERSONAL_Y|MAINTENANCE_Y|POWER_Y)[^\n]*',s,re.M))
+macros='\n'.join(re.findall(r'^#define SETTINGS_(?:ROW_H|DISPLAY_ROWS|PERSONAL_ROWS|MAINTENANCE_ROWS|POWER_ROWS|WIRELESS_Y|DISPLAY_Y|PERSONAL_Y|MAINTENANCE_Y|POWER_Y|VERSION_GAP|SCROLL_MAX)[^\n]*',s,re.M))
 layout=s[s.index('typedef struct {\n    EpdRect size, preview;'):s.index('static system_font_layout_t system_font_layout(')]
 unit=r'''
 #include <assert.h>
@@ -43,12 +43,13 @@ unit=r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "ui_nav_layout.h"
 typedef struct{int x,y,width,height;}EpdRect;
 typedef enum{APP_REDRAW_NONE,APP_REDRAW_PAGE}app_redraw_t;
 typedef struct{int type,x0,y0;}ui_gesture_event_t;
 enum{UI_GESTURE_TAP,UI_GESTURE_SWIPE_U};
 typedef struct{int unused;}app_desc_t;
-typedef struct{const app_desc_t*request_app;uint8_t *fb;}app_ctx_t;
+typedef struct{const app_desc_t*request_app;uint8_t *fb;int64_t now_ms;}app_ctx_t;
 const app_desc_t app_transfer={0};
 const app_desc_t app_components={0};
 static void app_components_open(app_ctx_t *ctx,bool city){assert(!city);ctx->request_app=&app_components;}
@@ -61,6 +62,7 @@ static bool ui_rect_hit(EpdRect r,int x,int y){return x>=r.x&&x<r.x+r.width&&y>=
 static uint8_t scale=100;
 static bool write_fail;
 static uint8_t app_settings_system_font_size(void){return scale;}
+static int ui_text_effective_px(int px){return ((px+2)*(int)scale+50)/100;}
 static void app_settings_set_system_font_size(uint8_t n){if(!write_fail)scale=n;}
 static char system_path[192]="/sdcard/fonts/Old.ttf",reader_path[192]="/sdcard/fonts/Reader.ttf";
 static unsigned reader_writes,system_activations;
@@ -70,8 +72,13 @@ static void app_settings_set_system_font_path(const char*p){if(!write_fail)snpri
 static void app_settings_set_font_path(const char*p){++reader_writes;if(!write_fail)snprintf(reader_path,sizeof(reader_path),"%s",p);}
 static void app_font_activate_system(void){++system_activations;}
 static void ui_text_set_system_scale(bool b){assert(b);}
-static int s_font_page,s_main_scroll,s_style_scroll;
+static int s_font_page,s_main_scroll;
 static bool s_font_sync_confirm,s_config_confirm,s_panel_repair_pending;
+static bool s_batt_calibration_confirm;
+static int64_t s_batt_calibration_next_ms;
+typedef struct{bool enabled,applied,save_error;uint8_t sampled_bins,trusted_bins,total_bins;}device_power_batt_calibration_status_t;
+static device_power_batt_calibration_status_t s_batt_calibration_status;
+static void device_power_get_batt_calibration(device_power_batt_calibration_status_t *out){memset(out,0,sizeof(*out));out->total_bins=21;}
 static bool s_reading_bg_confirm,s_reading_bg_ready,s_reading_bg_pending;
 static char s_reading_bg_notice[96];
 static char s_quick_notice[96];
@@ -93,14 +100,13 @@ typedef struct {
  bool wifi_enabled,wifi_ready; int route,auto_priority,active_bearer;
 } network_status_t;
 static void network_service_get_status(network_status_t *status){memset(status,0,sizeof(*status));}
-#define UI_NAV_TOP 1096
-'''+enum+'\nstatic settings_page_t s_page;\n'+macros+'''
+'''+enum+'\nstatic settings_page_t s_page;\nstatic const char *s_network_notice;\n'+macros+'''
 '''
 unit += 'static int settings_wireless_rows(void);\n'
 unit += fn('settings_wireless_rows') + '\n'
-unit += r'''
-#define SETTINGS_SCROLL_MAX (SETTINGS_POWER_Y+SETTINGS_POWER_ROWS*SETTINGS_ROW_H-UI_NAV_TOP+12)
-'''+fn('settings_stacked')+'\n'+fn('settings_profile_height')+'\n'+fn('settings_main_row_height')+'\n'+layout+fn('system_font_layout')+'\n'+fn('system_font_item_rect')+'\n'+fn('system_font_sync_button')+'\n'
+unit += fn('settings_stacked')+'\n'+fn('settings_profile_height')+'\n'+fn('settings_main_row_height')+'\n'
+unit += fn('settings_version_center_y')+'\n'+fn('settings_scroll_max')+'\n'
+unit += layout+fn('system_font_layout')+'\n'+fn('system_font_item_rect')+'\n'+fn('system_font_sync_button')+'\n'
 unit+='static app_redraw_t font_tap(int x,int y){ui_gesture_event_t e={UI_GESTURE_TAP,x,y};const ui_gesture_event_t*ev=&e;'+modal+choose+'return APP_REDRAW_NONE;}\n'
 unit+='static app_redraw_t modal_swipe(void){ui_gesture_event_t e={UI_GESTURE_SWIPE_U,400,700};const ui_gesture_event_t*ev=&e;'+modal+'return APP_REDRAW_NONE;}\n'
 unit+='static void upgrade_open(void){s_page=SETTINGS_UPGRADE;}\n'
@@ -116,13 +122,14 @@ int main(void){
    for(int i=0;i<l.slots;++i){EpdRect r=system_font_item_rect(i);assert(r.y+r.height<UI_NAV_TOP);if(i)assert(system_font_item_rect(i-1).y+system_font_item_rect(i-1).height<r.y);}
    assert(SETTINGS_WIRELESS_Y>=180+settings_profile_height()+70);
    assert(SETTINGS_DISPLAY_Y>SETTINGS_WIRELESS_Y+3*SETTINGS_ROW_H);
-   assert(SETTINGS_PERSONAL_Y>SETTINGS_DISPLAY_Y+6*SETTINGS_ROW_H);
+   assert(SETTINGS_PERSONAL_Y>SETTINGS_DISPLAY_Y+7*SETTINGS_ROW_H);
    const int tops[]={SETTINGS_WIRELESS_Y,SETTINGS_DISPLAY_Y,SETTINGS_PERSONAL_Y,SETTINGS_MAINTENANCE_Y,SETTINGS_POWER_Y};
-   const int counts[]={3,6,8,3,1};
+   const int counts[]={3,7,8,3,3};
+   assert(SETTINGS_DISPLAY_ROWS==7&&SETTINGS_POWER_ROWS==3);
    const int destinations[][8]={{-1,SETTINGS_BLUETOOTH,SETTINGS_TIME},
-     {SETTINGS_SYSTEM_FONT,SETTINGS_SYSTEM_CONTRAST,SETTINGS_MAIN_REFRESH,-2,SETTINGS_AUTO_LOCK,SETTINGS_POWER_SLEEP},
+     {SETTINGS_SYSTEM_FONT,SETTINGS_SYSTEM_CONTRAST,SETTINGS_MAIN_REFRESH,-2,SETTINGS_AUTO_LOCK,SETTINGS_POWER_SLEEP,SETTINGS_SCREEN_OFFSET},
      {SETTINGS_SHELF_STYLE,SETTINGS_LOCK_STYLE,SETTINGS_LOCK_PIN,-3,SETTINGS_HAPTIC,SETTINGS_READING_BG,-5,SETTINGS_QUICK_BAR},
-     {SETTINGS_CONFIG,-4,SETTINGS_UPGRADE},{SETTINGS_POWER_LOG}};
+     {SETTINGS_CONFIG,-4,SETTINGS_UPGRADE},{SETTINGS_BATT_CALIBRATION,SETTINGS_POWER_LOG,SETTINGS_CHARGE_CURRENT}};
    for(int group=0;group<5;++group)for(int i=0;i<counts[group];++i){
      s_page=SETTINGS_MAIN;s_panel_repair_pending=false;s_quick_notice[0]='x';int center=tops[group]+i*SETTINGS_ROW_H+SETTINGS_ROW_H/2;s_main_scroll=center-500;ctx.request_app=NULL;
      main_tap(&ctx,300,500);
@@ -133,11 +140,15 @@ int main(void){
      else if(destinations[group][i]==-5)assert(ctx.request_app==&app_components);
      else assert(profile_edits>0);
      if(destinations[group][i]==SETTINGS_QUICK_BAR)assert(!s_quick_notice[0]);
+     if(destinations[group][i]==SETTINGS_BATT_CALIBRATION)assert(!s_batt_calibration_confirm&&s_batt_calibration_status.total_bins==21&&s_batt_calibration_next_ms==ctx.now_ms+1000);
      s_page=SETTINGS_MAIN;assert(main_tap(&ctx,10,500)==APP_REDRAW_NONE&&s_page==SETTINGS_MAIN);
    }
    s_main_scroll=SETTINGS_SCROLL_MAX;s_page=SETTINGS_MAIN;s_panel_repair_pending=false;
    int last=SETTINGS_POWER_Y+SETTINGS_POWER_ROWS*SETTINGS_ROW_H-1-s_main_scroll;
-   assert(last<UI_NAV_TOP&&main_tap(&ctx,300,last)==APP_REDRAW_PAGE&&s_page==SETTINGS_POWER_LOG);
+   assert(last<UI_NAV_TOP&&main_tap(&ctx,300,last)==APP_REDRAW_PAGE&&s_page==SETTINGS_CHARGE_CURRENT);
+   int footer_half=(ui_text_effective_px(20)+1)/2;
+   int footer_y=settings_version_center_y()-s_main_scroll;
+   assert(footer_y-footer_half>last&&footer_y+footer_half<UI_NAV_TOP);
  }
  scale=100;s_page=SETTINGS_SYSTEM_FONT;s_font_page=0;s_main_scroll=0;s_font_sync_confirm=false;
  for(int i=0;i<11;++i){EpdRect r=system_font_layout().size;assert(font_tap(300,r.y+r.height/2)==APP_REDRAW_PAGE);assert(scale==((i+1)%11)*10+100);}
@@ -166,11 +177,11 @@ int main(void){
    assert(!strcmp(system_path,fonts[index-1].path));s_font_sync_confirm=false;
   }
  }
- puts("PASS: 11 scales, all 21 destinations including components and quick-bar management, reachable final row, 513-font pagination/selection, modal isolation, opt-in sync and failed-save retry");
+ puts("PASS: 11 scales, all 24 destinations including screen offset and charge profiles, reachable final row and footer, 513-font pagination/selection, modal isolation, opt-in sync and failed-save retry");
 }
 '''
 with tempfile.TemporaryDirectory() as folder:
     c,b=Path(folder)/'test.c',Path(folder)/'test'
     c.write_text(unit)
-    subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(c),'-o',str(b)],check=True)
+    subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(root/'main/ui'),str(c),'-o',str(b)],check=True)
     subprocess.run([str(b)],check=True)

@@ -63,3 +63,10 @@ void book_collection_apply(const book_collection_t *state, book_shelf_entry_t *b
 /// 独立的有校验流，用于版本化备份。/ Independent checked stream for versioned backups.
 esp_err_t book_collection_export(const book_collection_t *state, FILE *file);
 esp_err_t book_collection_import(book_collection_t *state, FILE *file);
+
+/// 备份内置及指定TF书库；校验时不写入，恢复时不覆盖其他卡的分类。
+/// Back up internal and specified card libraries; validate without writing and never replace another card's collection.
+esp_err_t book_collection_backup_write(FILE *file, const char *card_id);
+esp_err_t book_collection_backup_read(FILE *file, const char *card_id, bool apply);
+/// 分类恢复后令活动书架重取双副本。/ Reload active collections after restoring snapshots.
+uint32_t book_collection_backup_revision(void);

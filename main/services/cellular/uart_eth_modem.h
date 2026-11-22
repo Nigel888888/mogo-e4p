@@ -13,6 +13,7 @@
 #include "driver/uart.h"
 #include "uart_uhci.h"
 #include "esp_err.h"
+#include "memory_peak.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
@@ -131,7 +132,7 @@ public:
     *
     * @return ESP_OK on success
     */
-    esp_err_t Start();
+    esp_err_t Start(memory_peak_token_t *peak = nullptr);
 
     /**
     * @brief Stop the modem
@@ -188,7 +189,7 @@ public:
     std::string GetIccid();
     std::string GetCarrierName();
     std::string GetModuleRevision();
-    int GetSignalStrength();  // CSQ value (0-31, 99=unknown)
+    int GetSignalStrength() const;  // 缓存 CSQ / Cached CSQ (0-31, 99=unknown)
     CellInfo GetCellInfo();
     /**
      * @brief Get network event name for logging
@@ -279,6 +280,7 @@ private:
     // Task implementation (single task with UHCI DMA)
     void MainTaskRun();
     void InitTaskRun();
+    void PollSignalUntilStop();
     void TxTaskRun();  // Dedicated TX task for non-blocking transmit
 
     // Event handling
@@ -301,7 +303,7 @@ private:
     // Frame processing
     esp_err_t SendFrame(const uint8_t* data, size_t length, FrameType type);
     esp_err_t EnqueueTxFrame(const uint8_t* buf, size_t len);
-    void ProcessReceivedFrame(uint8_t* data, size_t size);
+    void ProcessReceivedFrame(const uint8_t* data, size_t size);
     void HandleEthFrame(uint8_t* data, size_t length);
     void HandleAtResponse(const char* data, size_t length);
 
@@ -382,6 +384,8 @@ private:
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> handshake_done_{false};
     std::atomic<bool> initializing_{false};
+    std::atomic<memory_peak_token_t> init_peak_{0};
+    std::atomic<bool> init_can_commit_{false};
     std::atomic<uint8_t> seq_no_{0};
 
     // Working state machine
@@ -397,7 +401,7 @@ private:
     std::string imsi_;
     std::string carrier_name_;
     std::string module_revision_;
-    int signal_strength_ = 99;
+    std::atomic<int> signal_strength_{99};
     CellInfo cell_info_;
     uint8_t mac_addr_[6] = {0};
 

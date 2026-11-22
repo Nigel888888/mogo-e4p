@@ -52,13 +52,12 @@ static unsigned focus(const book_mini_item_t *items, unsigned count, const char 
 }
 void book_mini_library_update(book_mini_library_t *model, const book_shelf_entry_t *entries, size_t count,
                               bool reshuffle, book_mini_random_fn random, void *ctx) {
-    char random_focus[BOOK_STORE_PATH_MAX] = "", recent_focus[BOOK_STORE_PATH_MAX] = "";
+    char random_focus[BOOK_STORE_PATH_MAX] = "";
     if (model->random_selected < model->random_count) strcpy(random_focus, model->random[model->random_selected].path);
-    if (model->recent_selected < model->recent_count) strcpy(recent_focus, model->recent[model->recent_selected].path);
     book_mini_item_t old[BOOK_MINI_LIBRARY_MAX];
     unsigned old_count = model->random_count;
     memcpy(old, model->random, sizeof(old));
-    model->random_count = model->recent_count = 0;
+    model->random_count = 0;
     if (!reshuffle) {
         for (unsigned i = 0; i < old_count; ++i) for (size_t j = 0; j < count; ++j)
             if (usable(&entries[j]) && !strcmp(old[i].path, entries[j].path)) {
@@ -71,6 +70,13 @@ void book_mini_library_update(book_mini_library_t *model, const book_shelf_entry
         unsigned j = below(i, random, ctx);
         book_mini_item_t item = model->random[i - 1]; model->random[i - 1] = model->random[j]; model->random[j] = item;
     }
+    model->random_selected = reshuffle ? 0 : focus(model->random, model->random_count, random_focus);
+    book_mini_library_update_recent(model, entries, count);
+}
+void book_mini_library_update_recent(book_mini_library_t *model, const book_shelf_entry_t *entries, size_t count) {
+    char recent_focus[BOOK_STORE_PATH_MAX] = "";
+    if (model->recent_selected < model->recent_count) strcpy(recent_focus, model->recent[model->recent_selected].path);
+    model->recent_count = 0;
     for (size_t i = 0; i < count; ++i) {
         const book_shelf_entry_t *entry = &entries[i];
         if (!usable(entry) || !entry->has_progress) continue;
@@ -82,9 +88,9 @@ void book_mini_library_update(book_mini_library_t *model, const book_shelf_entry
         for (unsigned j = model->recent_count - 1; j > at; --j) model->recent[j] = model->recent[j - 1];
         copy_item(&model->recent[at], entry);
     }
-    model->random_selected = reshuffle ? 0 : focus(model->random, model->random_count, random_focus);
     model->recent_selected = focus(model->recent, model->recent_count, recent_focus);
 }
+
 static void drop_card(book_mini_item_t *items, unsigned *count, unsigned *selected) {
     char path[BOOK_STORE_PATH_MAX] = "";
     if (*selected < *count) strcpy(path, items[*selected].path);

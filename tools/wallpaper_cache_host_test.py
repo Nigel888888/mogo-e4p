@@ -30,7 +30,8 @@ typedef enum { UI_WALLPAPER_MODE_CROP=0, UI_WALLPAPER_MODE_FIT=1 } ui_wallpaper_
 bool ui_wallpaper_draw_mode(uint8_t *fb,const char *path,EpdRect area,ui_wallpaper_mode_t mode);
 bool ui_wallpaper_prepare_lock_mode(uint8_t *fb,const char *path,ui_wallpaper_mode_t mode);
 static unsigned source_w=684,source_h=1216,loads,rotation,variant;
-static bool alloc_fail,decode_fail,source_mutates;
+static bool alloc_fail,decode_fail,source_mutates,bright_ramp;
+static const uint8_t ramp[] = {0,32,128,160,208,224,240,248,255};
 static char source_file[128]="source.jpg";
 static int test_stat(const char *path,struct stat *out){
  assert(!strncmp(path,"/sdcard/",8));
@@ -42,7 +43,7 @@ static bool book_image_file_dimensions(const char *path,bool png,unsigned *w,uns
 static bool book_image_file_grayscale(const char *path,bool png,unsigned w,unsigned h,uint8_t *out){
  (void)path;(void)png;++loads;if(decode_fail)return false;
  for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){
-  uint8_t value=(uint8_t)(x*19+y*31+variant);
+  uint8_t value=bright_ramp?ramp[(x/32)%sizeof(ramp)]:(uint8_t)(x*19+y*31+variant);
   if(w<200&&(x<w/4||x>3*w/4||y<h/4||y>3*h/4))value=255;
   out[(size_t)y*w+x]=value;
  }
@@ -70,8 +71,33 @@ static void clean_expected(void){memset(expected,255,sizeof(expected));assert(ui
 static void cache_miss(void){unsigned before=loads;memset(frame,255,sizeof(frame));assert(ui_wallpaper_prepare_lock(frame,"/sdcard/wallpaper.jpg"));assert(loads==before+1&&!memcmp(frame,expected,sizeof(frame)));}
 static void cache_hit(void){unsigned before=loads;memset(frame,0,sizeof(frame));assert(ui_wallpaper_prepare_lock(frame,"/sdcard/wallpaper.jpg"));assert(loads==before&&!memcmp(frame,expected,sizeof(frame)));}
 static void damage(size_t offset){FILE *f=fopen(WALL_LOCK_CACHE,"r+b");assert(f&&!fseek(f,(long)offset,SEEK_SET));int c=fgetc(f);assert(c!=EOF&&!fseek(f,-1,SEEK_CUR));assert(fputc(c^0x55,f)!=EOF&&!fclose(f));}
+static unsigned read_gray(const uint8_t *fb,unsigned x,unsigned y){
+ unsigned i=y*684+x;return ((fb[i/2]>>((i&1)*4))&15)*17u;
+}
 int main(void){
- set_source("source.jpg",5000);clean_expected();
+ set_source("source.jpg",5000);
+ for(unsigned i=1;i<=255;++i){
+  assert(ui_image_wallpaper_tone(i)>=ui_image_wallpaper_tone(i-1));
+  assert(ui_image_wallpaper_tone(i)<=ui_image_wallpaper_base_tone(i));
+  if(i<=160)assert(ui_image_wallpaper_tone(i)==ui_image_wallpaper_base_tone(i));
+ }
+ bright_ramp=true;clean_expected();bright_ramp=false;
+ unsigned prev=0;
+ for(unsigned band=0;band<sizeof(ramp);++band){
+  unsigned sum=0,baseline=0;
+  for(unsigned y=0;y<4;++y)for(unsigned x=band*32;x<band*32+4;++x){
+   sum+=read_gray(expected,x,y);
+   baseline+=ui_image_dither_gray(ui_image_wallpaper_base_tone(ramp[band]),x,y);
+  }
+  if(band)assert(sum>prev);
+  if(ramp[band]<=160)assert(sum==baseline);
+  if(ramp[band]>=208&&ramp[band]<=240)assert(sum+4u*16u<baseline);
+  if(ramp[band]==248)assert(sum<baseline);
+  if(ramp[band]==0||ramp[band]==255)assert(sum==ramp[band]*16u);
+  if(ramp[band]==32)assert(sum>=28u*16u);
+  prev=sum;
+ }
+ clean_expected();
  cache_miss();ui_wallpaper_cache_commit(frame);
  // 完整显示必须留下上下白边，且切换模式不能命中裁剪缓存。
  source_w=1600;source_h=900;variant=0;set_source("source.jpg",5001);
@@ -86,6 +112,10 @@ int main(void){
  #undef stat
  assert(!stat(WALL_LOCK_CACHE,&cached)&&cached.st_size==sizeof(wallpaper_cache_t)+WALL_LOCK_BYTES);
  #define stat(path,out) test_stat(path,out)
+ // 匹配源文件但使用旧色调缓存时仍要重绘。 / Rebuild a pre-tone image even with a matching source.
+ FILE *old=fopen(WALL_LOCK_CACHE,"r+b");uint32_t version=3;
+ assert(old&&!fseek(old,sizeof(uint32_t),SEEK_SET)&&fwrite(&version,sizeof(version),1,old)==1&&!fclose(old));
+ cache_miss();ui_wallpaper_cache_commit(frame);
  for(int i=0;i<20;++i)cache_hit();
  alloc_fail=decode_fail=true;cache_hit();alloc_fail=decode_fail=false;
  damage(sizeof(wallpaper_cache_t)+8913);cache_miss();ui_wallpaper_cache_commit(frame);cache_hit();
@@ -123,7 +153,7 @@ int main(void){
  assert(!remove(source_file)&&!ui_wallpaper_avatar_cached("/sdcard/avatar.png",avatar,82));
 
  assert(!ui_wallpaper_prepare_avatar("/sdcard/avatar.png",avatar,129));
- puts("PASS: pixel-identical 16-gray/dithered wallpaper disk hits without decode/allocation; checksum/truncation/trailing bytes/source/rotation invalidation; bounded failed writes and decode fallback; avatar cached vs original rounded paint");
+ puts("PASS: near-white ramp/black-white endpoints; pixel-identical 16-gray/dithered wallpaper disk hits without decode/allocation; checksum/truncation/trailing bytes/source/rotation invalidation; bounded failed writes and decode fallback; avatar cached vs original rounded paint");
 }
 '''
 # Cache paths are confined to a temporary directory; source stat redirects only SD test paths.

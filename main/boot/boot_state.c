@@ -22,7 +22,7 @@ typedef struct {
 } boot_record_t;
 static boot_record_t s_record;
 static pico_resume_t s_resume;
-static bool s_recovery, s_resume_pending, s_writable, s_interrupted, s_resume_frame;
+static bool s_recovery, s_resume_pending, s_writable, s_interrupted;
 typedef struct {
     uint32_t magic;
     uint16_t lengths[3];
@@ -66,7 +66,7 @@ static uint32_t packed_checksum(const uint8_t *data,size_t size) {
 }
 static size_t pack_record(uint8_t data[BOOT_PACKED_MAX]) {
     boot_packed_header_t header={.magic=BOOT_PACKED_MAGIC,.starting=s_record.starting,
-        .resume_valid=s_record.resume_valid,.frame=s_record.reserved[0],.tab=s_record.resume.tab,
+        .resume_valid=s_record.resume_valid,.tab=s_record.resume.tab,
         .reader=s_record.resume.reader,.fullscreen=s_record.resume.fullscreen};
     const char *paths[]={s_record.resume.path,s_record.opening,s_record.blocked};
     size_t size=sizeof(header);
@@ -85,7 +85,9 @@ static bool unpack_record(const uint8_t *data,size_t size,boot_record_t *record)
     if(header.magic!=BOOT_PACKED_MAGIC||header.checksum!=packed_checksum(data,size)||
         header.starting>1||header.resume_valid>1||header.frame>1||header.reader>1||header.fullscreen>1)return false;
     memset(record,0,sizeof(*record));record->magic=BOOT_MAGIC;
-    record->starting=header.starting;record->resume_valid=header.resume_valid;record->reserved[0]=header.frame;
+    // 旧帧标志仍占原字节，但不能证明物理面板保留了锁屏图。
+    // Retain the legacy byte on disk, but it cannot attest that the panel retained lock art.
+    record->starting=header.starting;record->resume_valid=header.resume_valid;
     record->resume.tab=header.tab;record->resume.reader=header.reader;record->resume.fullscreen=header.fullscreen;
     char *paths[]={record->resume.path,record->opening,record->blocked};size_t at=sizeof(header);
     for(unsigned i=0;i<3;++i){
@@ -123,7 +125,6 @@ static esp_err_t store(void) {
 void pico_boot_init(bool abnormal_reset) {
     memset(&s_record, 0, sizeof(s_record));
     s_resume_pending = false;
-    s_resume_frame = false;
     s_interrupted = false;
     s_recovery = abnormal_reset;
     nvs_handle_t h;
@@ -149,7 +150,7 @@ void pico_boot_init(bool abnormal_reset) {
     // 其他版本的缓存清单仍留在卡上，只移除不被本地阅读器支持的恢复/隔离入口。
     // Retain other editions' cache files; remove only resume/quarantine entries unsupported by the local reader.
     if(s_record.resume.reader&&!book_file_path_supported(s_record.resume.path)){
-        memset(&s_record.resume,0,sizeof(s_record.resume));s_record.resume_valid=0;s_record.reserved[0]=0;
+        memset(&s_record.resume,0,sizeof(s_record.resume));s_record.resume_valid=0;
     }
     if(s_record.opening[0]&&!book_file_path_supported(s_record.opening))s_record.opening[0]=0;
     if(s_record.blocked[0]&&!book_file_path_supported(s_record.blocked))s_record.blocked[0]=0;
@@ -162,12 +163,10 @@ void pico_boot_init(bool abnormal_reset) {
     if (s_record.resume_valid && !s_recovery) {
         s_resume = s_record.resume;
         s_resume_pending = true;
-        s_resume_frame = s_record.reserved[0] == 1;
     }
     s_record.magic = BOOT_MAGIC;
     s_record.starting = 1;
     s_record.resume_valid = 0;
-    s_record.reserved[0] = 0;
     if (store() != ESP_OK) { s_resume_pending = false; s_recovery = true; }
     ESP_LOGI("boot_state", "startup recovery=%d resume=%d", s_recovery, s_resume_pending);
 }
@@ -199,20 +198,11 @@ esp_err_t pico_boot_save_resume(const pico_resume_t *resume) {
     s_record.resume.fullscreen = resume->fullscreen;
     memcpy(s_record.resume.path, resume->path, strlen(resume->path));
     s_record.resume_valid = 1;
-    s_record.reserved[0] = 0;
     return store();
 }
 void pico_boot_hold_resume(void) {
     if (s_resume_pending) (void)pico_boot_save_resume(&s_resume);
 }
-esp_err_t pico_boot_mark_frame_cached(void) {
-    if(!s_record.resume_valid || s_recovery)return ESP_ERR_INVALID_STATE;
-    s_record.reserved[0]=1;
-    esp_err_t err=store();
-    if(err!=ESP_OK)s_record.reserved[0]=0;
-    return err;
-}
-bool pico_boot_resume_frame_cached(void) { return s_resume_frame && s_resume_pending && !s_recovery; }
 bool pico_boot_has_resume(void) { return s_resume_pending && !s_recovery; }
 bool pico_boot_take_resume(pico_resume_t *resume) {
     if (!resume || !s_resume_pending) return false;

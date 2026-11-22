@@ -48,7 +48,7 @@ static void app_navigation_switch_to(
     app_ctx_t* ctx, const app_desc_t** current, const app_desc_t* next
 ) {
     if (next == NULL || next == *current) return;
-    pico_ota_auto_cancel();
+    pico_ota_auto_request_cancel();
     bool main_source = app_navigation_main_page_ready(ctx, *current);
     bool reader_source = *current == &app_book && !main_source;
     bool shelf_source = main_source && app_index_of(*current) == 1;

@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
 static uint64_t trace = UINT64_C(1469598103934665603);
 static void record(unsigned tag, unsigned value) {
@@ -20,6 +21,10 @@ static bool available = true, saved_on = true, hw_on, ble, online, usb, hold_gra
 static bool motor_available, saved_haptics = true;
 static unsigned haptics_writes, haptics_pulses, setup_haptics;
 static bool shown_haptics, shown_rotation_notice;
+static const char *shown_network_notice, *ble_block;
+static bool wifi_owns_ble;
+static esp_err_t wifi_start_error;
+static unsigned ble_writes, ble_reconnects, ble_cancels;
 static ui_quick_menu_t shown_menu;
 static bool memory_busy;
 static unsigned memory_requests, memory_accepted, setup_memory;
@@ -61,7 +66,7 @@ static const app_desc_t *current = &page;
 static app_quick_layout_t saved_quick_layout = APP_QUICK_LAYOUT_DEFAULT;
 const app_quick_layout_t *app_settings_quick_layout(void) { return &saved_quick_layout; }
 bool ui_quick_menu_draw_notice(uint8_t *buffer, const ui_quick_menu_t *menu, EpdRect *dirty) {
-    (void)buffer; shown_rotation_notice = menu->rotation_notice; *dirty = (EpdRect){40, ui_quick_menu_height(menu) - 50, 604, 32}; return true;
+    (void)buffer; shown_rotation_notice = menu->rotation_notice; shown_network_notice = menu->network_notice; *dirty = (EpdRect){40, ui_quick_menu_height(menu) - 50, 604, 32}; return true;
 }
 bool app_settings_frontlight_on(void) {return saved_on;}
 uint8_t app_settings_frontlight_brightness(void) {return saved_bri;}
@@ -75,24 +80,30 @@ esp_err_t frontlight_apply(bool on, uint8_t bri, uint8_t cct) {
     record(7, on); record(8, bri); record(9, cct); return ESP_OK;
 }
 bool app_settings_ble_turner(void) {return ble;}
-void app_settings_set_ble_turner(bool on) {ble = on; record(10, on);}
+void app_settings_set_ble_turner(bool on) {ble = on; ++ble_writes; record(10, on);}
+static bool cellular_owns_ble;
+const char *ble_pt_enable_block_reason(void) {
+    return cellular_owns_ble ? "4G 使用中，请先关闭移动网络" :
+        wifi_owns_ble ? "Wi-Fi 使用中，请先结束 Wi-Fi" : ble_block;
+}
 bool haptics_available(void) {return motor_available;}
 bool app_settings_touch_haptics(void) {return saved_haptics;}
 void app_settings_set_touch_haptics(bool on) {saved_haptics = on; ++haptics_writes;}
 void haptics_pulse(void) {assert(saved_haptics); ++haptics_pulses;}
 void ble_pt_sync(bool on) {record(11, on);}
-void ble_pt_reconnect_recent(void) {assert(ble); record(12, 1);}
-void ble_pt_cancel_recent(void) {assert(!ble); record(13, 0);}
+void ble_pt_reconnect_recent(void) {assert(ble); ++ble_reconnects; record(12, 1);}
+void ble_pt_cancel_recent(void) {assert(!ble); ++ble_cancels; record(13, 0);}
 bool pico_online_busy(void) {return online;}
 bool usb_storage_active(void) {return usb;}
 void wifi_transfer_get_status(wifi_transfer_status_t *s) {*s = network;}
 int wifi_transfer_get_saved_wifi(char *ssid, bool *ok) {ssid[0] = 0; *ok = configured; return ESP_OK;}
 int wifi_transfer_start(const wifi_transfer_cfg_t *cfg) {
     assert(cfg->mode == WIFI_TRANSFER_MODE_STA && cfg->network_only);
-    ++wifi_starts; network.mode = cfg->mode; network.state = 1; record(14, wifi_starts); return ESP_OK;
+    if (wifi_start_error != ESP_OK) return wifi_start_error;
+    ++wifi_starts; wifi_owns_ble = true; network.mode = cfg->mode; network.state = 1; record(14, wifi_starts); return ESP_OK;
 }
 bool wifi_transfer_try_stop_if_idle(void) {
-    ++wifi_stops; if (can_stop) network.state = WIFI_TRANSFER_STOPPED;
+    ++wifi_stops; if (can_stop) { network.state = WIFI_TRANSFER_STOPPED; wifi_owns_ble = false; }
     record(15, can_stop); return can_stop;
 }
 void app_navigation_capture_reader_return(const app_desc_t *p) {assert(p == current); ++captures; record(16, captures);}
@@ -157,6 +168,13 @@ enum EpdDrawError update_display_area_full_with(EpdiyHighlevelState *h, const vo
 enum EpdDrawError update_display_area_diff_with(EpdiyHighlevelState *h, const void *wave, int mode, EpdRect area) {
     assert(h == &hl); return push(37, wave, mode, area);
 }
+enum EpdDrawError update_display_area_stable_diff(EpdiyHighlevelState *h, const void *wave, int mode, EpdRect area) {
+    return update_display_area_diff_with(h, wave, mode, area);
+}
+enum EpdDrawError update_display_area_reader_turn(EpdiyHighlevelState *h, const void *wave, int mode, EpdRect area, bool full_body) {
+    (void)full_body;
+    return update_display_area_diff_with(h, wave, mode, area);
+}
 enum EpdDrawError update_display_area_diff_padded(EpdiyHighlevelState *h, const void *wave, int mode, EpdRect area, int x, int y) {
     assert(h == &hl && x == 1 && y == 1); return push(38, wave, mode, area);
 }
@@ -204,6 +222,9 @@ static void hold(int button, const app_desc_t *p) {
     (void)frame(true, false, false, x, 156, 500, false);
     assert(!app_quick_layer_is_open()); release();
 }
+static bool page_modal_visible(app_ctx_t *c) { assert(c == &ctx); return true; }
+static const app_desc_t modal_page = {.render = render, .modal_input_owned = page_modal_visible};
+
 int main(void) {
     ctx = (app_ctx_t){.hl = &hl, .fb = fb, .touch = &touch};
     // 锁屏、切页与读点错误会重置快捷层；实体键已改过设置时，旧预览不能写回。
@@ -304,10 +325,25 @@ int main(void) {
     }
 
     open_layer(); configured = false; p = wifi_starts; tap(0); assert(wifi_starts == p);
-    configured = true; tap(0); assert(wifi_starts == p + 1);
+    configured = true; wifi_start_error = ESP_ERR_NO_MEM; tap(0);
+    assert(wifi_starts == p && network.state == WIFI_TRANSFER_STOPPED && strstr(shown_network_notice, "内存不足"));
+    wifi_start_error = ESP_OK; tap(0); assert(wifi_starts == p + 1);
+    // 独占已取得、尚未就绪也要拦；仅提示，不写开关或申请重连。/ Block a pending Wi-Fi lease too, without writes or reconnect.
+    const unsigned bw = ble_writes, br = ble_reconnects, bc = ble_cancels;
+    tap(1); assert(!ble && ble_writes == bw && ble_reconnects == br && ble_cancels == bc);
+    assert(app_quick_layer_is_open() && strstr(shown_network_notice, "Wi-Fi 使用中"));
     can_stop = false; p = wifi_stops; tap(0); assert(wifi_stops == p + 1 && network.state != 0);
-    can_stop = true; tap(0); assert(network.state == 0);
-    tap(1); assert(ble); tap(1); assert(!ble);
+    can_stop = true; tap(0); assert(network.state == WIFI_TRANSFER_STOPPED);
+    cellular_owns_ble = true; tap(1);
+    assert(!ble && ble_writes == bw && ble_reconnects == br && strstr(shown_network_notice, "4G 使用中"));
+    cellular_owns_ble = false;
+    ble_block = "可用内存不足，请稍后重试"; tap(1);
+    assert(!ble && ble_writes == bw && ble_reconnects == br && strstr(shown_network_notice, "内存不足"));
+    ble_block = NULL; tap(1); assert(ble && ble_writes == bw + 1 && ble_reconnects == br + 1);
+    // 已开启的空闲蓝牙即便被暂停，关闭入口必须保留。/ An enabled but paused turner can still be disabled.
+    wifi_owns_ble = true; tap(1);
+    assert(!ble && ble_writes == bw + 2 && ble_cancels == bc + 1);
+    wifi_owns_ble = false;
     p = captures; hold(0, &page); assert(ctx.request_app == &app_transfer && captures == p + 1);
     p = enters; hold(0, &app_transfer); assert(enters == p + 1 && exits == enters);
     p = captures; hold(1, &page); assert(ctx.request_app == &app_device_settings && captures == p + 1 && expect_origin);
@@ -421,6 +457,15 @@ int main(void) {
     assert(setup_wifi==old_setup+1&&!app_quick_layer_is_open());release();
     saved_quick_layout=(app_quick_layout_t)APP_QUICK_LAYOUT_DEFAULT;
     puts("PASS: resident rotation notice expires without toggling, custom ordering drives actual light/WiFi-hold actions");
+    for (unsigned replay = 0; replay < 2; ++replay) {
+        app_quick_layer_reset(); online = usb = false; current = &modal_page;
+        (void)frame(true, true, false, 200, 10, 10, replay);
+        (void)frame(true, false, false, 200, 130, 10, replay);
+        release();
+        assert(!app_quick_layer_is_open());
+    }
+    open_layer();
+    app_quick_layer_reset();
     printf("QUICK_TRACE %016" PRIx64 " applies=%u rows=%u pushes=%u failures=%u\n", trace, applies, rows, pushes, failures);
     return 0;
 }

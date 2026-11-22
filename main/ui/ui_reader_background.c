@@ -8,17 +8,23 @@
  * clamped (>=240 becomes pure white) before the cache is packed in panel scan order;
  * blending uses a 256-entry nibble LUT, so the turn hot path makes no per-pixel calls.
  *
- * 冻结：仅一个选中背景，不保留两份图片；混合公式 (bg*ink+7)/15 不变。
- * Frozen: one selected wallpaper, never two image caches; the blend formula
- * (bg*ink+7)/15 never changes.
+ * 用户2026-11-18要求缩短背景开书等待：TF按四个方向复用成品，避免离页后重新解码。
+ * User request 2026-11-18: reuse prepared art in four SD orientation slots to avoid decoding after exit.
+ * 冻结：内存仅一个选中背景，TF每个方向一个可重建成品；混合公式 (bg*ink+7)/15 不变。
+ * Frozen: one selected RAM background, one rebuildable SD result per orientation;
+ * the blend formula (bg*ink+7)/15 never changes.
  */
 #include "../diagnostics/reader_memory.h"
 #include "ui_reader_background.h"
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "image_decode.h"
+#include "esp_crc.h"
 #include "esp_heap_caps.h"
 #include "ui_kit.h"
 #include "ui_image_dither.h"
@@ -52,6 +58,89 @@ static void blend_lut_init(void) {
             s_blend_lut[(bg << 4) | ink] = (uint8_t)((bg * ink + 7) / 15);
     s_blend_lut_ready = true;
 }
+
+#ifndef READER_BG_CACHE_ROOT
+#define READER_BG_CACHE_ROOT "/sdcard/.readpico"
+#endif
+#define READER_BG_CACHE_DIR READER_BG_CACHE_ROOT "/reader-background"
+// 白点、抖动或面板打包规则改变时递增，拒绝旧成品。
+// Bump when white-point, dithering or panel-packing rules change to reject old results.
+#define READER_BG_CACHE_VERSION 1u
+typedef struct {
+    uint32_t magic, version, width, height, panel_width, panel_height, rotation, bytes;
+    uint64_t source_size;
+    int64_t source_mtime;
+    char path[288];
+    uint32_t checksum, reserved;
+} background_cache_header_t;
+
+static bool background_source_same(const char *path, const struct stat *before) {
+    struct stat after;
+    return !stat(path, &after) && S_ISREG(after.st_mode) &&
+        after.st_size == before->st_size && after.st_mtime == before->st_mtime;
+}
+
+static bool background_cache_read(const char *file, const background_cache_header_t *wanted, uint8_t *out) {
+    FILE *f = fopen(file, "rb");
+    if (!f) return false;
+    background_cache_header_t found;
+    bool ok = fread(&found, 1, sizeof(found), f) == sizeof(found) &&
+        found.magic == wanted->magic && found.version == wanted->version && !found.reserved &&
+        found.width == wanted->width && found.height == wanted->height &&
+        found.panel_width == wanted->panel_width && found.panel_height == wanted->panel_height &&
+        found.rotation == wanted->rotation && found.bytes == wanted->bytes &&
+        found.source_size == wanted->source_size && found.source_mtime == wanted->source_mtime &&
+        !memcmp(found.path, wanted->path, sizeof(found.path)) &&
+        fread(out, 1, wanted->bytes, f) == wanted->bytes && fgetc(f) == EOF && !ferror(f) &&
+        found.checksum == esp_crc32_le(0, out, wanted->bytes);
+    if (fclose(f)) ok = false;
+    return ok;
+}
+
+static void background_cache_write(const char *file, background_cache_header_t *header, const uint8_t *out) {
+    if ((mkdir(READER_BG_CACHE_ROOT, 0775) && errno != EEXIST) ||
+        (mkdir(READER_BG_CACHE_DIR, 0775) && errno != EEXIST)) return;
+    char temp[sizeof(READER_BG_CACHE_DIR) + 16];
+    snprintf(temp, sizeof(temp), "%s.tmp", file);
+    FILE *f = fopen(temp, "wb");
+    if (!f) return;
+    header->checksum = esp_crc32_le(0, out, header->bytes);
+    bool ok = fwrite(header, 1, sizeof(*header), f) == sizeof(*header) &&
+        fwrite(out, 1, header->bytes, f) == header->bytes && !fflush(f) && !fsync(fileno(f));
+    if (fclose(f)) ok = false;
+    // FatFs不覆盖同名目标；半写、关闭或改名失败只损失可重建缓存，不阻止本次阅读。
+    // FatFs cannot replace an existing target; partial/close/rename failures only lose a rebuildable cache.
+    if (ok) {
+        (void)remove(file);
+        if (!rename(temp, file)) return;
+    }
+    (void)remove(temp);
+}
+
+static void background_pack(const uint8_t *plane, uint8_t *out, unsigned w, unsigned h, int rotation) {
+    const int pw = epd_width(), ph = epd_height();
+    size_t at = 0;
+    if (!s_white_lut_ready) white_lut_init();
+    // 按面板顺序连续写入：旋转只在行首求逆映射，白点与抖动仍使用原逻辑坐标。
+    // Write sequential panel bytes; invert rotation once per row, keeping the original logical dither phase.
+    for (int py = 0; py < ph; ++py) {
+        int x = 0, y = py, dx = 1, dy = 0;
+        switch (rotation) {
+            case EPD_ROT_PORTRAIT: x = py; y = pw - 1; dx = 0; dy = -1; break;
+            case EPD_ROT_INVERTED_LANDSCAPE: x = pw - 1; y = ph - py - 1; dx = -1; break;
+            case EPD_ROT_INVERTED_PORTRAIT: x = ph - py - 1; y = 0; dx = 0; dy = 1; break;
+            default: break;
+        }
+        ptrdiff_t source = (ptrdiff_t)y * w + x, step = (ptrdiff_t)dy * w + dx;
+        for (int px = 0; px < pw; ++px, ++at, source += step, x += dx, y += dy) {
+            const unsigned nib = ui_image_dither_gray(s_white_lut[plane[source]], x, y) >> 4;
+            if (at & 1) out[at >> 1] |= (uint8_t)(nib << 4);
+            else out[at >> 1] = (uint8_t)nib;
+        }
+    }
+    if (((size_t)w * h) & 1) out[at >> 1] |= 0xf0;
+}
+
 void ui_reader_background_release(void) {
     free(s_gray); s_gray = NULL; s_path[0] = 0; s_width = s_height = 0; s_rotation = -1;
 }
@@ -79,41 +168,52 @@ bool ui_reader_background_prepare(const char *path) {
         ui_reader_background_release(); return false;
     }
     const unsigned w = epd_rotated_display_width(), h = epd_rotated_display_height();
-    if (!w || !h || w > 1216 || h > 1216 || (uint64_t)w * h > 684u * 1216u) {
+    if (!w || !h || w > 1216 || h > 1216 || (uint64_t)w * h > 684u * 1216u ||
+        (uint64_t)epd_width() * epd_height() != (uint64_t)w * h) {
         ui_reader_background_release(); return false;
     }
     const int rotation = (int)epd_get_rotation();
     if (!strcmp(path, s_path) && s_gray && st.st_size == s_size && st.st_mtime == s_mtime &&
         s_width == w && s_height == h && s_rotation == rotation) return true;
-    ui_reader_background_release(); // 仅一个选中背景，不保留两份图片。/ One selected wallpaper, never two image caches.
+    ui_reader_background_release(); // 先释放上一张内存成品。/ Release the previous RAM result first.
     const char *ext = strrchr(path, '.');
     bool png = ext && !strcasecmp(ext, ".png");
-    unsigned source_w = 0, source_h = 0;
     if (!ext || (!png && strcasecmp(ext, ".jpg") && strcasecmp(ext, ".jpeg")) ||
-        !book_image_file_dimensions(path, png, &source_w, &source_h) || !source_w || !source_h) return false;
+        rotation < EPD_ROT_LANDSCAPE || rotation > EPD_ROT_INVERTED_PORTRAIT) return false;
     const size_t pixels = (size_t)w * h, packed = (pixels + 1) / 2;
     const unsigned caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    if (heap_caps_get_free_size(caps) < packed + 1024u * 1024u ||
+        heap_caps_get_largest_free_block(caps) < packed) return false;
+    uint8_t *out = heap_caps_malloc(packed, caps);
+    if (!out) return false;
+    background_cache_header_t header = {0};
+    header.magic = UINT32_C(0x52424731); header.version = READER_BG_CACHE_VERSION;
+    header.width = w; header.height = h; header.panel_width = epd_width(); header.panel_height = epd_height();
+    header.rotation = rotation; header.bytes = packed; header.source_size = st.st_size; header.source_mtime = st.st_mtime;
+    strcpy(header.path, path);
+    char file[sizeof(READER_BG_CACHE_DIR) + 12];
+    snprintf(file, sizeof(file), READER_BG_CACHE_DIR "/%d.bin", rotation);
+    bool cached = background_cache_read(file, &header, out);
     // 8 位临时面与面板序 4 位成品并存解码；常驻仍只有 packed 一份。
     // The 8-bit temp plane and the panel-order 4-bit result coexist during packing;
     // only the packed half stays resident afterwards.
-    if (heap_caps_get_free_size(caps) < pixels + packed + 1024u * 1024u ||
-        heap_caps_get_largest_free_block(caps) < pixels) return false;
-    uint8_t *plane = heap_caps_malloc(pixels, caps);
-    uint8_t *out = plane ? heap_caps_calloc(packed, 1, caps) : NULL;
-    if (!plane || !out || !book_image_file_grayscale(path, png, w, h, plane)) {
-        free(plane); free(out); ui_reader_background_release(); return false;
+    if (!cached) {
+        unsigned source_w = 0, source_h = 0;
+        if (heap_caps_get_free_size(caps) < pixels + 1024u * 1024u ||
+            heap_caps_get_largest_free_block(caps) < pixels ||
+            !book_image_file_dimensions(path, png, &source_w, &source_h) || !source_w || !source_h) {
+            free(out); return false;
+        }
+        uint8_t *plane = heap_caps_malloc(pixels, caps);
+        if (!plane || !book_image_file_grayscale(path, png, w, h, plane)) {
+            free(plane); free(out); return false;
+        }
+        background_pack(plane, out, w, h, rotation);
+        free(plane);
+        if (!background_source_same(path, &st)) { free(out); return false; }
+        background_cache_write(file, &header, out);
     }
-    // 白点归一后再抖动：纸面落在纯白，装饰灰阶原样通过；抖动仍在逻辑坐标定形，半字节按面板序落位。
-    // White-point clamp feeds the dither: paper lands on pure white while decorative grays
-    // pass through; dithering keeps logical coordinates and nibbles land in panel order.
-    if (!s_white_lut_ready) white_lut_init();
-    for (size_t i = 0; i < pixels; ++i) {
-        const int x = (int)(i % w), y = (int)(i / w);
-        const unsigned nib = ui_image_dither_gray(s_white_lut[plane[i]], x, y) >> 4;
-        const size_t at = panel_nibble(x, y);
-        out[at >> 1] |= at & 1 ? (uint8_t)(nib << 4) : (uint8_t)nib;
-    }
-    free(plane);
+    if (!background_source_same(path, &st)) { free(out); return false; }
     s_gray = out;
     s_width = w; s_height = h; s_rotation = rotation; s_size = st.st_size; s_mtime = st.st_mtime;
     strcpy(s_path, path); return true;

@@ -80,6 +80,8 @@ last = source.index("static void draw_font_picker(", first)
 # diagrams. Dynamic book text and user font names intentionally use other paths.
 section = source[first:last] + (root / "main/ui/ui_reader_settings.c").read_text(encoding="utf-8") + (root / "main/ui/ui_reader_tap_grid.c").read_text(encoding="utf-8")
 labels = re.findall(r'"([^"\n]*)"', section)
+labels.append(ast.literal_eval(re.search(r'^static const char s_landscape_turn_notice\[\] = (".+");$',
+                                         source, re.M).group(1)))
 # 本地快刷细点阵说明也必须使用完整系统字形。/ The local fine-dot mode explanation also needs complete system glyphs.
 settings = (root / "main/apps/app_device_settings.c").read_text()
 first = settings.index("if (s_page == SETTINGS_MAIN_REFRESH) {")
@@ -105,3 +107,10 @@ assert all(has_glyph(ord(ch)) for ch in "抗锯齿"), "antialias label lacks nat
 print("PASS: antialias label uses native outline glyphs")
 assert all(has_glyph(ord(ch)) for ch in "眉锋"), "reader labels must not enlarge 24px bitmap supplements"
 print("PASS: header and title-style labels use native outline glyphs")
+
+# 固定界面曾仅有位图的字必须有原生轮廓，缩放时不混用点阵。
+# Require native outlines for formerly bitmap-only UI glyphs so scaling does not mix in bitmaps.
+interface_outlines = "万估八具净剪囊尾异归徽搭旋景材析框箭素繁纯胶裁观追遥震顾驻"
+missing_outlines = "".join(ch for ch in interface_outlines if not has_glyph(ord(ch)))
+assert not missing_outlines, f"Fixed UI labels lack native outline glyphs: {missing_outlines}"
+print(f"PASS: {len(interface_outlines)} formerly bitmap-only UI glyphs have native outlines")

@@ -19,18 +19,21 @@ typedef void (*app_input_present_t)(app_ctx_t *ctx, const app_desc_t *app,
 typedef struct {
     bool contact; ///< 原始接触尚未抬起 / Raw contact has not lifted
     bool blocked; ///< 本次接触隔离至抬起 / Quarantine this contact until lift
+    int64_t last_contact_ms; ///< 最近一次按下采样的时间 / Latest down sample time
+    bool panel_key; ///< 最近接触帧是物理三键 / Last contact frame was a physical panel key
     bool disabled; ///< 上帧屏幕禁触状态 / Previous screen-touch policy
 } app_input_touch_filter_t;
-/// 每个原始帧摄取前调用，屏幕起手、越出三键及策略切换均隔离至抬起；返回 true 时取消按住与手势。
-/// Filter every raw frame before ingestion; quarantine screen starts, key-strip exits and policy changes until lift.
-/// A true return requires cancelling key holds and gestures.
+/// 先按物理三键筛选，再变换屏内坐标；留白或策略禁触均隔离至物理抬起。
+/// Check raw cover keys before mapping screen coordinates; quarantine exposed strips and disabled contacts until physical lift.
+/// 旧坐标帧也会隔离，但保留物理三键和抬手跟踪。/ Stale coordinates quarantine screen input but preserve raw keys and lift tracking.
+/// 返回 true 时取消所有输入跟踪，不合成释放事件。/ On true, cancel input tracking without synthesizing a release.
 bool app_input_filter_screen_touch(app_input_touch_filter_t *filter, app_touch_t *touch,
-                                    esp_err_t err, bool disabled);
+                                    esp_err_t err, bool disabled, app_ctx_t *ctx, int64_t sample_ms);
+/// 丢弃已摄取接触，不向控件发送释放沿。/ Drop an ingested contact without delivering a release edge.
+void app_input_drop_contact(app_touch_t *latest, bool *was_touched);
 /// 重建采样帧的坐标、触点数和按下状态；不回放多点载荷或原始寄存器。
 /// Rebuild frame coordinates, contact count and contact state without replaying multipoint payloads or raw registers.
 void app_input_frame_to_touch(const touch_frame_t *frame, app_touch_t *touch);
-/// 摄取前转换所有屏内触点，保留屏外实体键及诊断原始字节。/ Rotate all on-panel contacts before ingestion, preserving cover keys and raw diagnostics.
-void app_input_rotate_touch(app_touch_t *touch);
 /// 先判边沿、记诊断，再去抖并更新 ctx；was_touched 仍由调用方在原分发位置提交。
 /// Detect edges and record diagnostics before debounce/context updates; caller still commits was_touched at its existing dispatch point.
 /// frame_ms 使用原采样或直读时间，last_input_ms 只在成功读取的接触或释放帧更新。

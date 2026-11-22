@@ -27,5 +27,3 @@ typedef struct {
 esp_err_t book_txt_open(book_txt_t *book, const char *path);
 /// 加载一章并转为 UTF-8。/ Load a chapter as UTF-8.
 esp_err_t book_txt_load(book_txt_t *book, size_t i, char **utf8, size_t *len);
-/// 加载一章并生成 TXT 非空行块表。/ Load a chapter and build blocks for nonempty TXT lines.
-esp_err_t book_txt_load_blocks(book_txt_t *book, size_t i, html_text_t *out);

@@ -3,6 +3,68 @@
 按版本简述对用户可见的变化；使用方法见 [README](../README.zh-CN.md)。
 User-visible changes by release; see [README](../README.md) for usage.
 
+## 未发布 / Unreleased
+
+## v1.1.8 · 2026-11-22
+
+- CloudZao 暂未获取到绑定码时提示：若设备已绑定，先在 CloudZao App 或小程序解绑再试。/ If CloudZao cannot issue a pairing code, the device suggests unlinking it in the CloudZao app or mini-program if already linked.
+
+## v1.1.7 · 2026-11-21
+
+- 稳定 GL16 局刷可在同一次扫描中补强区域外已显示的纯黑，不增加额外刷新轮次。/ Stable GL16 partial updates can reinforce already-visible black outside the update area without a separate scan.
+- 普通与水波纹文字页翻页可在正文原有扫描内更新页眉、状态栏和页脚，同时补强不变的纯黑和远离字形的纯白，减少连翻时栏位白底发灰，不再追加栏位刷新。/ Ordinary and ripple text turns can update the header, status strip and footer in the existing body scan, reinforcing unchanged black and paper whites clear of glyphs to reduce gray drift without a trailing chrome refresh.
+- 天气可在空闲设置等主页面借用现有网络静默更新，正常周期延长到十小时（需平台配套）；阅读与待机继续避让。/ Refresh weather quietly on idle root pages over an existing connection, with a ten-hour normal interval when supported by the platform. Reading and standby still take priority.
+
+- 退出阅读回首页时，迷你书库改为后台整理，天气自动刷新让切页优先；阅读时间、手账和进度保存不变。/ Refresh the mini library in the background and give navigation priority over automatic weather updates when returning Home. Reading time, journal and progress saving are unchanged.
+- 横屏阅读固定使用普通翻页，切入横屏时短暂提示；转回竖屏自动恢复原选项，主页水波纹不变。/ Use ordinary turns in landscape reading and show a brief notice on entry. Portrait restores the selected effect; main-page ripple is unchanged.
+- 修复实时触摸切换到积压帧回放时，误取消有效点按的问题。/ Fix valid taps being canceled when live touch processing switches to buffered replay.
+- 移除旧的 WiFi／热点传书方式选择页。快捷栏返回恢复对应入口，不会重启传书；TF 卡失效不再打断 WiFi 配网。/ Remove the old WiFi/hotspot transfer chooser. Quick-settings returns restore the previous entry without starting transfers, and TF media loss no longer interrupts WiFi setup.
+- TF 配置备份扩展到 v48：补齐书封取景、书架书名、前光、自动对时和自动升级、天气、阅读手账和书库分类；保存全部已存 WiFi，恢复时合并，超过八组会在写入前提示。/ TF backup v48 adds cover framing, shelf captions, frontlight, automatic time/update checks, weather, journal and shelf categories. It saves all WiFi profiles and rejects over-capacity merges before writing.
+- 改善待机和关机壁纸偏白的问题，让浅灰细节更易分辨，保留纯黑、纯白和白边。/ Reduce washout in standby and shutdown wallpapers to make light-gray details easier to distinguish while preserving pure black, pure white and white margins.
+- 为内建界面字体补齐「工具栏」「边框索引」「中央章徽」等文案中的 29 个字的轮廓，改善不同字号下的清晰度。/ Add 29 outline glyphs to the built-in UI font, including those used in the reader toolbar and title-style labels, for sharper text across sizes.
+- 「按键控制」标明「上键（AI键）」；返回主页、手动全刷和前光开关的绑定可在普通页面使用，未绑定全局动作的手势保留原操作。/ Identify the AI key in key controls and allow mapped Home, full refresh and frontlight on ordinary pages without replacing other page gestures.
+- 「设置 → 电源管理 → 充电档位」新增「日常充电」（1 A，默认）与「快速充电」（1.5 A），显示当前档位，即时应用并由本机记住。/ Add Everyday (1 A, default) and Fast (1.5 A) charging, with the active profile shown. Changes apply immediately and persist locally.
+- 配置 CloudZao 接入 ID 后，在文件管理的「传输文件」区并排显示 CloudZao、WiFi、热点和 USB；CloudZao 支持通过已连接的 WiFi 获取推送列表，勾选或全选后下载书籍、PNG 和 TTF，未选的文件留在云端。页面显示本批文件、下载进度与速率及 TF 卡历史。未配置接入 ID 时不显示入口。 下载时只局刷进度条与数值，本批文件不随速率刷新。 设置按新版云造直连协议显示设备绑定码和授权状态，不需要开发者密钥或官网中转；Partner API 域名已与官方新文档同步；领取授权超时会保留有效绑定码并自动重试。 获取列表区分无待下载项目、连接失败和服务端 HTTP 错误。 三个页签可左右滑动切换，也可一键返回文件管理，标题旁显示无底色的黑色 CloudZao 标志。 历史记录改用更易扫读的列表，区分文件格式、接收时间和结果。 支持二次确认后清除当前 TF 卡的全部 CloudZao 接收记录，不删除已下载文件。 修复 TF 卡后台巡检偶发误判为拔卡，导致接收中断的问题。
+
+- 修复 CloudZao 把 OSS 下载路径含未编码中文的 EPUB 显示为不可下载的问题。/ Fix CloudZao marking EPUBs with unescaped Chinese in OSS download paths as unavailable.
+- CloudZao 首次进入时须确认注意事项，之后可在设置中重看书籍格式与壁纸推送限制。/ CloudZao requires acknowledging a first-use notice about book formats and wallpaper pushes, which can be reopened in Settings.
+- 去掉 CloudZao 传输和历史记录页中央图标的浅灰底，减少切页时的黑闪。/ Remove the pale gray backgrounds behind the central CloudZao transfer and history icons to reduce black flashing on tab switches.
+- CloudZao 设置新增官方下载二维码；更新 WiFi 和绑定提示。/ Add an official app download QR code to CloudZao Settings and update the WiFi and pairing hints.
+- 调整 CloudZao 注意事项和传输页提示；历史记录标题下方只显示数量，「清除」单独放在标题右侧。/ Update the CloudZao usage notice and transfer hint. Show only the count below the history title, with Clear on the right.
+- 修复 CloudZao 退出时可能误进入「功能」菜单的问题，返回固定回到文件管理。/ CloudZao Back returns to Files rather than falling back to the function menu.
+
+## v1.1.6 · 2026-11-19
+
+1. 提升 EPUB 插图缩小后的清晰度，优化 PNG 和 JPEG 插图加载。
+2. 优化书架、首页最近阅读和锁屏票根等处的封面采样，提升封面清晰度。
+3. 优化英文横排正文断词换行，在合适的位置添加行尾连字符。
+4. 优化中文双引号换行，`。”` 等连续右标点放不下时随末字一起换行。
+5. 深色书轨和亚克力书架分别新增「显示书名」开关，列表书架不变。
+6. 键盘大小写切换键直接显示当前状态，同时精简 WiFi 密码页提示。
+7. WiFi / 热点传书的 TF 书籍文件名上限提升至 232 个 UTF-8 字节（含扩展名）；超长项可在队列里修改保存名后重试，不影响同批其他文件。
+
+## v1.1.5 · 2026-11-19
+
+- 优化电量估算曲线。
+- 新增自动电量校准设置（Beta版，默认关闭）。
+- 统一调度阅读、Wi-Fi、4G 和蓝牙的内存。
+  - 区分联网更新的片内 RAM 和 PSRAM 不足，不再误提示退出传书。
+  - 减少锁屏书签和波形生成的片内 RAM 常驻占用，为联网和阅读留出更多空间。
+- 修复字形缓存失败导致缺字的问题。
+- 优化阅读背景的水波纹刷新，减轻残影。
+- 优化屏幕偏移；调整后若有溢墨，请恢复默认。
+- 优化关机壁纸刷新，减轻残影。
+
+## v1.1.4 · 2026-11-18
+
+- 优化开启阅读背景后的水波纹显示效果，减轻白闪。
+- 优化开启阅读背景时的开书速度。
+- 新增关机壁纸设置。
+- 新增屏幕偏移修正。
+- 移除锁屏图片显示数量限制。
+- 修复阅读票据封面不显示的问题。
+- 还原标题样式逻辑，TXT 不再支持标题样式。
+
 ## v1.1.3 · 2026-11-17
 
 - 新增内存管理。

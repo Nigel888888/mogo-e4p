@@ -8,26 +8,30 @@ from run_reader_baseline import toolchain
 ROOT=Path(__file__).resolve().parents[1]
 PRE=r'''
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include "home_library.h"
+#include "home_library_jobs.h"
+#include "book_progress.h"
 #include "book_shelf_scan.h"
 #include "book_cover_jobs.h"
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 typedef struct {bool present,mounted;char identity[40];} board_sd_info_t;
-static board_sd_info_t sd={.present=true,.mounted=true};
+static board_sd_info_t sd={.present=true,.mounted=true,.identity="card-A"};
 static unsigned store_revision=1,progress_revision=1,scans,submits,takes;
 static bool recent_mode,save_ok=true,flash_ready=true,fast_mode,asset_allowed=true;
-static bool fail_alloc,fail_catalog,fail_read,fail_open,probe_pending,cancelled,queue_pending;
+static bool worker;
+static bool fail_alloc,fail_catalog,fail_read,fail_open,probe_pending,queue_pending,fail_task;
 static unsigned contrast=100;
 static size_t largest=4*1024*1024;
 static const char *root="/sdcard/books";
 static int board_sd_get_info(board_sd_info_t *out){*out=sd;return probe_pending?ESP_ERR_NOT_FINISHED:ESP_OK;}
 static unsigned book_store_revision(void){return store_revision;}
-static unsigned book_progress_revision(void){return progress_revision;}
+unsigned book_progress_revision(void){return progress_revision;}
 static bool book_store_flash_ready(void){return flash_ready;}
 static const char *app_settings_books_dir(void){return root;}
 static bool app_settings_main_fast_refresh(void){return fast_mode;}
@@ -43,22 +47,45 @@ void nvs_close(nvs_handle_t h){assert(h==42);}
 bool book_shelf_hidden_read(nvs_handle_t h,const char *path){assert(h==42);(void)path;return false;}
 static book_shelf_entry_t catalog[12];
 static time_t file_modified[12];
-static unsigned missing_files;
+bool book_progress_load_handle(uintptr_t handle,const char *path,uint32_t size,book_progress_t *out){
+ assert(handle==42);
+ for(unsigned i=0;i<12;++i)if(catalog[i].size==size&&catalog[i].has_progress&&!strcmp(catalog[i].path,path)){
+  *out=(book_progress_t){.pct=catalog[i].pct,.last_open_s=catalog[i].recent};return true;
+ }
+ return false;
+}
+bool book_progress_load(const char *path,uint32_t size,book_progress_t *out){return book_progress_load_handle(42,path,size,out);}
+static int path_index(const char *path);
+static unsigned missing_files, metadata_reads;
+bool book_metadata_supported(const char *path){assert(worker);return strstr(path,".epub")!=NULL;}
+esp_err_t book_metadata_cached(const char *path,char *title,size_t tc,char *author,size_t ac){
+ assert(worker);++metadata_reads;
+ snprintf(title,tc,"%s",catalog[path_index(path)].name);
+ snprintf(author,ac,"%s",catalog[path_index(path)].author);
+ return ESP_OK;
+}
 static int path_index(const char *path){const char *leaf=strrchr(path,'/');return leaf?atoi(leaf+1):-1;}
 static int cover_stat(const char *path,struct stat *st){
+ assert(worker);
  if(!strstr(path,".epub")||(!sd.mounted&&!strncmp(path,"/sdcard/",8)))return -1;
  int i=path_index(path);assert(i>=0&&i<12);if(missing_files&(1u<<i))return -1;
  *st=(struct stat){.st_mode=S_IFREG,.st_size=catalog[i].size,.st_mtime=file_modified[i]};return 0;
 }
 #define stat(...) cover_stat(__VA_ARGS__)
 void book_shelf_scan_dir(const book_shelf_scan_t *q,const char *path,bool is_flash,nvs_handle_t fav,nvs_handle_t hidden,bool *truncated,bool *unreadable,bool *skipped){
- (void)is_flash;(void)fav;(void)skipped;assert(hidden==42);assert(q->category_add(path)==0&&!q->favorite_read(10,path));
+ (void)is_flash;(void)fav;(void)skipped;assert(worker&&hidden==42);assert(!q->category_add&&!q->favorite_read(10,path)&&!q->cache&&!q->metadata);
  ++scans;if(q->cancel&&q->cancel(q->cancel_ctx))return;
  if(fail_catalog){*truncated=true;return;}if(fail_read){*unreadable=true;return;}
  if(strcmp(path,"/flash/books"))return;
  *q->catalog.entries=malloc(sizeof(catalog));assert(*q->catalog.entries);memcpy(*q->catalog.entries,catalog,sizeof(catalog));*q->catalog.count=12;*q->catalog.capacity=12;
 }
-bool book_shelf_scan_backfill(const book_shelf_scan_t *q,bool *truncated){(void)truncated;assert(!q->favorite_read(9,"/flash/old.epub"));return false;}
+bool book_shelf_scan_backfill(const book_shelf_scan_t *q,bool *truncated){
+ (void)truncated;assert(worker&&!q->favorite_read(9,"/flash/old.epub"));
+ if(*q->catalog.entries)return false;
+ *q->catalog.entries=malloc(sizeof(catalog));assert(*q->catalog.entries);
+ for(unsigned i=0;i<12;++i)if(catalog[i].has_progress)(*q->catalog.entries)[(*q->catalog.count)++]=catalog[i];
+ return *q->catalog.count!=0;
+}
 static book_cover_job_t jobs[9];
 static unsigned current_generation;
 bool book_cover_jobs_submit(unsigned gen,unsigned slot,const book_cover_job_t *q){assert(gen==current_generation&&slot>=1&&slot<=5);jobs[slot]=*q;++submits;return true;}
@@ -68,70 +95,104 @@ int book_cover_jobs_take(unsigned gen,unsigned slot,book_cover_result_t *out){as
  int i=path_index(q->path);
  *out=(book_cover_result_t){.pixels=pixels,.width=176,.height=240,.fast=q->fast,.size=catalog[i].size,.modified=file_modified[i]};return 1;
 }
-static bool cancel(void *ctx){assert(ctx==&cancelled);return cancelled;}
+#define pdPASS 1
+#define tskIDLE_PRIORITY 0
+static void (*task)(void *);
+static void *task_arg;
+static int64_t mono;
+static int64_t esp_timer_get_time(void){return mono;}
+static void vTaskDelay(unsigned ticks){mono+=ticks*1000;}
+static void vTaskDelete(void *handle){assert(!handle&&worker);}
+static int xTaskCreate(void (*fn)(void *), const char *name,unsigned stack,void *arg,unsigned priority,void *handle){
+ assert(!task&&!strcmp(name,"home_books")&&stack==8192&&priority==tskIDLE_PRIORITY&&!handle);
+ if(fail_task)return 0;
+ task=fn;task_arg=arg;return pdPASS;
+}
+static void run_worker(void){assert(task&&!worker);worker=true;task(task_arg);task=NULL;worker=false;}
 '''
 BODY=r'''
 static void generation(void){home_library_cover_generation(++current_generation);}
 static void seed(void){for(unsigned i=0;i<12;++i){snprintf(catalog[i].path,sizeof(catalog[i].path),"/%s/books/%u.epub",i%2?"sdcard":"flash",i);snprintf(catalog[i].name,sizeof(catalog[i].name),"书%u",i);catalog[i].has_progress=i<4;catalog[i].recent=i;catalog[i].size=100;file_modified[i]=1000+i;}}
-static void refresh(void){home_library_enter();assert(home_library_view().loading);assert(home_library_poll(cancel,&cancelled));assert(!home_library_view().loading);}
-static void load_all(void){generation();for(unsigned i=0;i<5;++i)(void)home_library_poll(cancel,&cancelled);assert(!home_library_poll(cancel,&cancelled));}
+static bool complete_work(void){
+ unsigned scans_before=scans;assert(!home_library_poll()&&task&&scans==scans_before);
+ assert(!home_library_poll()&&scans==scans_before);run_worker();return home_library_poll();
+}
+static void refresh(void){
+ home_library_enter();assert(s_work>=LIBRARY_PROGRESS);
+ assert(home_library_view().loading==(s_work==LIBRARY_FULL));
+ assert(complete_work()&&!home_library_view().loading);
+}
+static void load_all(void){generation();for(unsigned i=0;i<5;++i)(void)home_library_poll();assert(!home_library_poll());}
 static void cached_files(void){
  unsigned old_scans=scans,old_submits=submits;const uint8_t *pixels[5];
  for(unsigned i=0;i<5;++i)pixels[i]=home_library_view().covers[i].pixels;
  // Navigation and reader round trips retain artwork, with zero re-submission.
- for(unsigned trip=0;trip<80;++trip){home_library_leave();home_library_enter();generation();assert(!home_library_poll(cancel,&cancelled));
+ for(unsigned trip=0;trip<80;++trip){home_library_leave();home_library_enter();generation();assert(!complete_work());
   for(unsigned i=0;i<5;++i)assert(home_library_view().covers[i].pixels==pixels[i]);}
  assert(scans==old_scans&&submits==old_submits);
  ++progress_revision;catalog[path_index(home_library_view().books[0].path)].pct=79;
- home_library_leave();refresh();generation();assert(!home_library_poll(cancel,&cancelled));
+ home_library_leave();refresh();generation();assert(!home_library_poll());
  for(unsigned i=0;i<5;++i)assert(home_library_view().covers[i].pixels==pixels[i]);assert(submits==old_submits);
  // Same-size replacement and changed metadata invalidate only that book.
  unsigned id=path_index(home_library_view().books[2].path);++file_modified[id];
- home_library_leave();home_library_enter();assert(!home_library_view().covers[2].pixels);
+ home_library_leave();home_library_enter();assert(home_library_view().covers[2].pixels&&complete_work());assert(!home_library_view().covers[2].pixels);
  for(unsigned i=0;i<5;++i)if(i!=2)assert(home_library_view().covers[i].pixels==pixels[i]);
  load_all();assert(submits==old_submits+1);pixels[2]=home_library_view().covers[2].pixels;
  strcpy(catalog[id].author,"新版作者");++store_revision;home_library_leave();refresh();assert(!home_library_view().covers[2].pixels);
  for(unsigned i=0;i<5;++i)if(i!=2)assert(home_library_view().covers[i].pixels==pixels[i]);load_all();
  // Size changes and missing files also discard stale art on entry.
  ++catalog[id].size;++store_revision;home_library_leave();refresh();assert(!home_library_view().covers[2].pixels);load_all();
- missing_files=1u<<id;home_library_leave();home_library_enter();assert(!home_library_view().covers[2].pixels);missing_files=0;load_all();
+ missing_files=1u<<id;home_library_leave();home_library_enter();assert(home_library_view().covers[2].pixels&&complete_work());assert(!home_library_view().covers[2].pixels);missing_files=0;load_all();
 }
 int main(void){
- seed();assert(!home_library_poll(cancel,&cancelled)&&!scans);
- home_library_enter();probe_pending=true;assert(!home_library_poll(cancel,&cancelled)&&!scans);probe_pending=false;
- cancelled=true;assert(!home_library_poll(cancel,&cancelled));assert(home_library_view().loading&&!home_library_view().count);cancelled=false;
- assert(home_library_poll(cancel,&cancelled));assert(home_library_view().count==5&&home_library_needs_generation());
+ seed();assert(!home_library_poll()&&!scans);
+ home_library_enter();probe_pending=true;assert(!home_library_poll()&&!scans&&!task);probe_pending=false;
+ assert(!home_library_poll()&&task&&home_library_view().loading&&!home_library_view().count);
+ home_library_leave();assert(!home_library_poll()&&!home_library_quiesce(0));
+ home_library_enter();assert(!home_library_poll()&&task&&!scans);
+ run_worker();assert(!home_library_poll()&&!scans&&!home_library_view().count);
+ assert(complete_work());assert(home_library_view().count==5&&home_library_needs_generation()&&metadata_reads==9);
  home_library_select(3);char focus[288];strcpy(focus,home_library_view().books[3].path);home_library_select(99);assert(home_library_view().selected==3);
- generation();queue_pending=true;assert(!home_library_poll(cancel,&cancelled));queue_pending=false;
- for(unsigned i=0;i<5;++i)assert(home_library_poll(cancel,&cancelled));assert(!home_library_poll(cancel,&cancelled));
+ generation();queue_pending=true;assert(!home_library_poll());queue_pending=false;
+ for(unsigned i=0;i<5;++i)assert(home_library_poll());assert(!home_library_poll());
  for(unsigned i=0;i<5;++i)assert(home_library_view().covers[i].pixels&&home_library_view().covers[i].width<=176&&home_library_view().covers[i].height<=240);
  cached_files();
- unsigned old_scans=scans;home_library_leave();assert(!home_library_poll(cancel,&cancelled));home_library_enter();assert(!home_library_view().loading&&scans==old_scans&&!strcmp(home_library_view().books[home_library_view().selected].path,focus));
+ unsigned old_scans=scans;home_library_leave();assert(!home_library_poll());home_library_enter();assert(!home_library_view().loading&&scans==old_scans&&!strcmp(home_library_view().books[home_library_view().selected].path,focus));
  save_ok=false;assert(!home_library_recent(true)&&!home_library_view().recent&&*home_library_view().notice);save_ok=true;
  assert(home_library_recent(true)&&home_library_view().count==4&&home_library_view().books[0].recent==3&&home_library_needs_generation());
- load_all();const uint8_t *recent_pixels[4];for(unsigned i=0;i<4;++i)recent_pixels[i]=home_library_view().covers[i].pixels;
- unsigned old_submits=submits;catalog[0].recent=99;++progress_revision;home_library_leave();refresh();
- assert(home_library_view().books[0].recent==99&&home_library_view().covers[0].pixels==recent_pixels[3]);
+ assert(!complete_work());load_all();const uint8_t *recent_pixels[4];for(unsigned i=0;i<4;++i)recent_pixels[i]=home_library_view().covers[i].pixels;
+ unsigned old_submits=submits;old_scans=scans;catalog[0].recent=99;++progress_revision;home_library_leave();refresh();
+ assert(scans==old_scans&&home_library_view().books[0].recent==99&&home_library_view().covers[0].pixels==recent_pixels[3]);
  for(unsigned i=1;i<4;++i)assert(home_library_view().covers[i].pixels==recent_pixels[i-1]);
- generation();assert(!home_library_poll(cancel,&cancelled)&&submits==old_submits);
+ generation();assert(!home_library_poll()&&submits==old_submits);
  assert(home_library_recent(false)&&!strcmp(home_library_view().books[home_library_view().selected].path,focus));
  // A failed/truncated scan retains the entire last-good batch, never commits a biased subset.
  book_mini_item_t old[5];memcpy(old,home_library_view().books,sizeof(old));
- fail_catalog=true;home_library_invalidate();assert(home_library_poll(cancel,&cancelled));assert(*home_library_view().notice&&!memcmp(old,home_library_view().books,sizeof(old)));fail_catalog=false;
+ fail_catalog=true;home_library_invalidate();assert(complete_work());assert(*home_library_view().notice&&!memcmp(old,home_library_view().books,sizeof(old)));fail_catalog=false;
  fail_read=true;refresh();assert(*home_library_view().notice&&!memcmp(old,home_library_view().books,sizeof(old)));fail_read=false;
  fail_open=true;refresh();assert(*home_library_view().notice&&!memcmp(old,home_library_view().books,sizeof(old)));fail_open=false;refresh();
- home_library_shuffle();assert(home_library_poll(cancel,&cancelled));for(unsigned i=0;i<5;++i)for(unsigned j=0;j<5;++j)assert(strcmp(old[i].path,home_library_view().books[j].path));
- generation();fail_alloc=true;assert(!home_library_poll(cancel,&cancelled));fail_alloc=false;
+ home_library_shuffle();assert(complete_work());for(unsigned i=0;i<5;++i)for(unsigned j=0;j<5;++j)assert(strcmp(old[i].path,home_library_view().books[j].path));
+ generation();fail_alloc=true;assert(!home_library_poll());fail_alloc=false;
  for(unsigned i=0;i<5;++i)assert(!home_library_view().covers[i].pixels);
- home_library_cover_mode_changed();generation();largest=1;assert(!home_library_poll(cancel,&cancelled));largest=4*1024*1024;
- fast_mode=true;assert(home_library_poll(cancel,&cancelled)&&home_library_needs_generation());generation();assert(home_library_poll(cancel,&cancelled));
+ home_library_cover_mode_changed();generation();largest=1;assert(!home_library_poll());largest=4*1024*1024;
+ fast_mode=true;assert(home_library_poll()&&home_library_needs_generation());generation();assert(home_library_poll());
  unsigned selected=home_library_view().selected;assert(home_library_view().covers[selected].fast);
+ // 更换卡身份后，扫描开始前不能继续展示上一张卡的书目。
+ // A different CID must never display the previous card's deck before scanning.
+ home_library_leave();strcpy(sd.identity,"card-B");home_library_enter();
+ for(unsigned i=0;i<home_library_view().count;++i)assert(strncmp(home_library_view().books[i].path,"/sdcard/",8));
+ assert(home_library_view().loading&&complete_work());
  // Unmounted media disappear immediately and cannot be backfilled from stale history.
  sd=(board_sd_info_t){0};home_library_media_lost();for(unsigned i=0;i<home_library_view().count;++i)assert(strncmp(home_library_view().books[i].path,"/sdcard/",8));
- assert(home_library_poll(cancel,&cancelled));for(unsigned i=0;i<home_library_view().count;++i)assert(strncmp(home_library_view().books[i].path,"/sdcard/",8));
- home_library_leave();assert(!home_library_poll(cancel,&cancelled));
+ assert(complete_work());for(unsigned i=0;i<home_library_view().count;++i)assert(strncmp(home_library_view().books[i].path,"/sdcard/",8));
+ // 任务完成后如书库版本已过期，不允许发布其结果。
+ // A completed job from an obsolete store revision must not publish a stale deck.
+ home_library_invalidate();assert(!home_library_poll()&&task);run_worker();++store_revision;
+ assert(!home_library_poll()&&home_library_view().loading);assert(complete_work());
+ home_library_shuffle();fail_task=true;assert(home_library_poll()&&!task&&!home_library_view().loading);fail_task=false;
+ home_library_leave();assert(!home_library_poll()&&home_library_quiesce(0));
  free_covers();
- puts("PASS: service cancellation, 80 cached page/reader returns without cover jobs, progress/recent reordering reuse, per-file invalidation, mode rollback, partial/OOM rollback, novel shuffle, cover ownership/bounds, fast format and media loss");
+ puts("PASS: nonblocking scans, cancellation and obsolete-result rejection, media identity, 80 cached page/reader returns without cover jobs, progress/recent reordering reuse, per-file invalidation, mode rollback, partial/OOM rollback, novel shuffle, cover ownership/bounds, fast format and media loss");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='home-library-service-') as d:

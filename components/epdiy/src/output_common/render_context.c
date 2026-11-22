@@ -93,7 +93,7 @@ void IRAM_ATTR prepare_context_for_next_frame(RenderContext_t* ctx) {
     }
 }
 
-void epd_populate_line_mask(uint8_t* line_mask, const uint8_t* dirty_columns, int mask_len) {
+void epd_populate_line_mask(uint8_t* line_mask, const uint8_t* dirty_columns, int mask_len, bool msb_first) {
     if (dirty_columns == NULL) {
         memset(line_mask, 0xFF, mask_len);
     } else {
@@ -104,6 +104,11 @@ void epd_populate_line_mask(uint8_t* line_mask, const uint8_t* dirty_columns, in
             mask |= (dirty_columns[c + 1] & 0x0F) != 0 ? 0x30 : 0x00;
             mask |= (dirty_columns[c] & 0xF0) != 0 ? 0x0C : 0x00;
             mask |= (dirty_columns[c] & 0x0F) != 0 ? 0x03 : 0x00;
+            // 遮罩与 LUT 输出共用四像素组的位序。/ The mask uses the LUT output order within each four-pixel group.
+            if (msb_first) {
+                mask = ((mask & 0x03) << 6) | ((mask & 0x0C) << 2) |
+                       ((mask & 0x30) >> 2) | ((mask & 0xC0) >> 6);
+            }
             line_mask[c / 2] = mask;
         }
     }

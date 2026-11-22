@@ -19,7 +19,7 @@
 #define READ_BLOCK (64 * 1024)
 #define PART_TARGET (48 * 1024)
 #define HEADING_LINE_BYTES 256
-#define TXT_CACHE_VERSION 3u
+#define TXT_CACHE_VERSION 2u
 typedef struct {
     uint32_t total;
     uint32_t bom;
@@ -53,68 +53,6 @@ static size_t encode(uint32_t cp, char out[4]) {
     if (cp < 0x800) { out[0] = 0xc0 | (cp >> 6); out[1] = 0x80 | (cp & 63); return 2; }
     if (cp < 0x10000) { out[0] = 0xe0 | (cp >> 12); out[1] = 0x80 | ((cp >> 6) & 63); out[2] = 0x80 | (cp & 63); return 3; }
     out[0] = 0xf0 | (cp >> 18); out[1] = 0x80 | ((cp >> 12) & 63); out[2] = 0x80 | ((cp >> 6) & 63); out[3] = 0x80 | (cp & 63); return 4;
-}
-static bool txt_space(uint32_t cp) {
-    return cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n' || cp == 0xa0 || cp == 0x3000;
-}
-static bool txt_line_has_text(const char *text, size_t start, size_t end) {
-    for (size_t at = start; at < end;) {
-        uint32_t cp; size_t n = utf8_one((const unsigned char *)text + at, end - at, &cp);
-        if (!n) break;
-        if (!txt_space(cp)) return true;
-        at += n;
-    }
-    return false;
-}
-static bool txt_line_is_decoration(const char *text, size_t start, size_t end) {
-    bool seen = false;
-    for (size_t at = start; at < end;) {
-        uint32_t cp; size_t n = utf8_one((const unsigned char *)text + at, end - at, &cp);
-        if (!n) return false;
-        if (txt_space(cp)) { at += n; continue; }
-        if (cp >= 128 || !strchr("-_=*~.+|/\\", (int)cp)) return false;
-        seen = true; at += n;
-    }
-    return seen;
-}
-static bool txt_line_matches_title(const char *text, size_t start, size_t end, const char *title) {
-    char normalized[sizeof(((book_entry_t *)0)->title)] = {0};
-    size_t used = 0; bool pending_space = false;
-    for (size_t at = start; at < end;) {
-        uint32_t cp; size_t n = utf8_one((const unsigned char *)text + at, end - at, &cp);
-        if (!n) return false;
-        if (txt_space(cp)) {
-            if (used) pending_space = true;
-            at += n;
-            continue;
-        }
-        if (pending_space) {
-            if (used + 1 >= sizeof(normalized)) return false;
-            normalized[used++] = ' '; pending_space = false;
-        }
-        if (used + n >= sizeof(normalized)) return false;
-        memcpy(normalized + used, text + at, n); used += n;
-        at += n;
-    }
-    normalized[used] = 0;
-    return !strcmp(normalized, title);
-}
-static bool txt_next_line(const char *text, size_t len, size_t start,
-                          size_t *content_end, size_t *next_start) {
-    if (start >= len) return false;
-    size_t end = start;
-    while (end < len && text[end] != '\r' && text[end] != '\n') ++end;
-    size_t next = end;
-    if (next < len) {
-        ++next;
-        if (text[end] == '\r' && next < len && text[next] == '\n') ++next;
-    }
-    *content_end = end; *next_start = next; return true;
-}
-static void txt_blocks_free(html_text_t *text) {
-    free(text->utf8);
-    free(text->blocks);
-    *text = (html_text_t){0};
 }
 static bool next(reader_t *r, uint32_t *cp) {
     if (r->used - r->pos < 4) {
@@ -174,30 +112,6 @@ static bool heading(const char *s, char key[HEADING_LINE_BYTES + 1]) {
         if (!digits || digits > 16 || (*end && *end != ' ' && *end != '.' && *end != ':')) return false;
         memcpy(key, number, digits); key[digits] = 0; return true;
     }
-    // 内容简介作为前置节标题，避免简介挤在序章前面时遮住序章题头。
-    // Keep a synopsis as a front-matter section so it cannot hide a following prologue heading.
-    static const char synopsis[] = "内容简介";
-    const size_t synopsis_bytes = sizeof(synopsis) - 1;
-    if (!strncmp(s, synopsis, synopsis_bytes) &&
-        (!s[synopsis_bytes] || s[synopsis_bytes] == ' ' || s[synopsis_bytes] == ':' ||
-         s[synopsis_bytes] == '-' || !strncmp(s + synopsis_bytes, "：", 3))) {
-        memcpy(key, synopsis, synopsis_bytes);
-        key[synopsis_bytes] = 0;
-        return true;
-    }
-    // 常见 TXT 序章没有数字，但仍是独立题头；要求后面是标题分隔符，避免把“序章说明”正文切成一章。
-    // Common TXT prologues have no number but are standalone headings; require a title separator
-    // so prose such as “序章说明” does not become a chapter.
-    static const char prologue[] = "序章";
-    const size_t prologue_bytes = sizeof(prologue) - 1;
-    if (!strncmp(s, prologue, prologue_bytes) &&
-        (!s[prologue_bytes] || s[prologue_bytes] == ' ' || s[prologue_bytes] == ':' ||
-         s[prologue_bytes] == '-' || !strncmp(s + prologue_bytes, "：", 3) ||
-         !strncmp(s + prologue_bytes, "、", 3))) {
-        memcpy(key, prologue, prologue_bytes);
-        key[prologue_bytes] = 0;
-        return true;
-    }
     uint32_t unit;
     size_t n = heading_marker(s, &unit);
     if (!n || strstr(s, "。")) return false;
@@ -237,18 +151,13 @@ static bool add(book_txt_t *b, uint32_t offset, const char *title) {
 typedef struct {
     char key[HEADING_LINE_BYTES + 1]; ///< 上个题头的编号序列 / Previous heading's numbered markers
     bool before_body; ///< 尚未遇到正文 / No body text encountered yet
-    bool saw_text; ///< 已经过了文件开头 / Past the file opening
 } heading_state_t;
 
 static bool index_line(book_txt_t *b, uint32_t start, char *line, bool overflow, heading_state_t *state) {
     char key[HEADING_LINE_BYTES + 1];
     size_t len = strlen(line);
     if (len && line[len - 1] == ' ') line[len - 1] = 0;
-    bool is_heading = !overflow && heading(line, key);
-    // “内容简介”只在文件最前面的非空行作为前置节，正文偶然出现同名句子不能切章。
-    // Only a leading “内容简介” is front matter; the same phrase in body text cannot split a chapter.
-    if (is_heading && !strcmp(key, "内容简介") && state->saw_text) is_heading = false;
-    if (is_heading) {
+    if (!overflow && heading(line, key)) {
         if (state->before_body) {
             if (!strcmp(key, state->key)) return true;
             // 重复题头可省略篇卷前缀；两边都带前缀时仍须区分篇卷。
@@ -264,7 +173,6 @@ static bool index_line(book_txt_t *b, uint32_t start, char *line, bool overflow,
         if (!add(b, start, line)) return false;
         strcpy(state->key, key); state->before_body = true;
     } else if (overflow || *line) state->before_body = false;
-    if (overflow || *line) state->saw_text = true;
     return true;
 }
 static esp_err_t index_book(reader_t *r, book_txt_t *b) {
@@ -393,49 +301,4 @@ esp_err_t book_txt_load(book_txt_t *b, size_t i, char **utf8, size_t *len) {
     free(r);
     if (err) { free(out); return err; }
     out[used] = 0; *utf8 = out; *len = used; return ESP_OK;
-}
-esp_err_t book_txt_load_blocks(book_txt_t *b, size_t i, html_text_t *out) {
-    if (!b || !out || i >= b->count) return ESP_ERR_INVALID_ARG;
-    memset(out, 0, sizeof(*out));
-    esp_err_t err = book_txt_load(b, i, &out->utf8, &out->len);
-    if (err != ESP_OK) return err;
-    size_t count = 0, start = 0, content_end, next;
-    bool too_many = false;
-    while (txt_next_line(out->utf8, out->len, start, &content_end, &next)) {
-        if (txt_line_has_text(out->utf8, start, content_end)) {
-            if (++count > HTML_TEXT_MAX_BLOCKS) too_many = true;
-        }
-        start = next;
-    }
-    if (!count || too_many) return ESP_OK;
-    out->blocks = heap_caps_calloc(count, sizeof(*out->blocks), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!out->blocks) { txt_blocks_free(out); return ESP_ERR_NO_MEM; }
-    out->count = count;
-    const char *title = b->entries[i].title;
-    size_t index = 0;
-    bool title_marked = false;
-    start = 0;
-    while (txt_next_line(out->utf8, out->len, start, &content_end, &next)) {
-        if (txt_line_has_text(out->utf8, start, content_end)) {
-            bool decoration = txt_line_is_decoration(out->utf8, start, content_end);
-            char title_key[HEADING_LINE_BYTES + 1];
-            bool indexed_heading = heading(title, title_key);
-            // 首章可能含简介或序言；只要行文本精确匹配已索引题头，就在原位标大，
-            // 不要求它必须是本章的第一行。这样前置内容仍保留，标题也不会丢失。
-            // A first chapter may contain a synopsis or preface. Mark an exact indexed heading
-            // wherever it occurs, preserving the front matter instead of requiring line one.
-            bool heading_block = !title_marked && !decoration && indexed_heading &&
-                                 txt_line_matches_title(out->utf8, start, content_end, title);
-            if (heading_block) title_marked = true;
-            out->blocks[index++] = (blk_t){
-                .offset = start, .len = content_end - start,
-                .heading = heading_block, .chapter_start = heading_block, .image = -1,
-                .auxiliary = decoration,
-                .heading_level = heading_block ? 1 : 0,
-            };
-        }
-        start = next;
-    }
-    if (index != count) { txt_blocks_free(out); return ESP_FAIL; }
-    return ESP_OK;
 }

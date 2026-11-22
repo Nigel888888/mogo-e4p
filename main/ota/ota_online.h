@@ -52,9 +52,13 @@ int pico_version_compare(const char *a, const char *b);
 bool pico_release_url_valid(const char *url);
 /// 检查或下载唯一后台任务；离页、锁屏先取消并等待。/ Start one worker; cancel and join on exit or lock.
 esp_err_t pico_online_check(void);
+/// 自动清单检查不等待其他任务；准入不足交给调度器退避。/ Automatic checks defer on admission failure and never join other jobs.
+esp_err_t pico_online_check_auto(void);
 esp_err_t pico_online_download(void);
 bool pico_online_busy(void);
 void pico_online_get_status(pico_update_status_t *status);
+/// 只通知取消；休眠与手动升级仍用 cancel_join 确认交还。/ Signal only; sleep and manual OTA still join before handoff.
+void pico_online_request_cancel(void);
 void pico_online_cancel_join(void);
 /// 刷屏与 OTA 擦写共用递归锁；未初始化 OTA 时不分配内存。/ Recursive display/OTA exclusion; no allocation before OTA initialization.
 bool pico_online_display_begin(void);

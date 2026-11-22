@@ -39,7 +39,10 @@ static bool usb_storage_active(void){return usb_active;}
 static bool book_category_pending(const char *root){(void)root;return pending;}
 static const char *app_settings_books_dir(void){return "/sdcard/books";}
 static int shelf_style;
+static unsigned shelf_titles;
 static int app_settings_shelf_style(void){return shelf_style;}
+static bool app_settings_shelf_show_titles(uint8_t style){return style==1?shelf_titles&1:style==2?shelf_titles&2:false;}
+static uint8_t app_settings_system_contrast(void){return 100;}
 static int shelf_rows(void){return shelf_style==5?4:9;}
 #include "book_shelf_covers.h"
 #include "book_cover_auto.h"
@@ -73,7 +76,8 @@ static void shelf_categories_recount(void){book_collection_apply(&s_collection,s
 static bool transfer_idle=true,cover_idle=true;
 static esp_err_t recovery_error=ESP_OK;
 static unsigned recovery_calls,recovery_invalidations;
-static bool wifi_transfer_try_stop_if_idle(void){return transfer_idle;}
+static bool network_service_stop_local_wifi(void){return transfer_idle;}
+static void cancel_auto_resume(void){}
 bool book_cover_jobs_quiesce(unsigned timeout){assert(timeout==2000);return cover_idle;}
 static esp_err_t category_extra_state(const char *old,const char *next,uint32_t size){(void)old;(void)next;(void)size;return ESP_OK;}
 static esp_err_t book_category_recover(const char *root,esp_err_t (*extra)(const char *,const char *,uint32_t)){
@@ -250,6 +254,7 @@ def shelf_fixture():
 #define BOOK_GRID_ROWS 9
 #define BOOK_BULK_ROWS 6
 #define SHELF_BOOK_LIFT_PX 16
+#define SHELF_FURNITURE_BOTTOM 226
 #define SHELF_LIST_BOUNCE_PX 8
 #define SHELF_FAST_COVER_WIDTH 164
 #define SHELF_FAST_COVER_STRIDE 21
@@ -281,9 +286,9 @@ static app_redraw_t shelf_turn_page(app_ctx_t *ctx,int delta){
         code += host.function(name, KIT) + "\n"
     code += host.function("book_cover_crop", ROOT / "main/image/image_decode.c") + "\n"
     code += host.function("icon", NAV) + host.function("ui_nav_draw", NAV) + host.function("ui_nav_hit", NAV)
-    for name in ("fit_text", "shelf_label", "row_rect", "shelf_cover_image", "shelf_cover_frame_ready", "draw_favorite_icon",
+    for name in ("fit_text", "fit_fixed_text", "shelf_label", "row_rect", "shelf_cover_image", "shelf_cover_frame_ready", "draw_favorite_icon",
                  "draw_shelf_favorite_icon", "cover_favorite_needs_white_edge", "draw_shelf_cover", "draw_list_title", "draw_list_row",
-                 "draw_shelf_furniture", "shelf_header_action_rect", "shelf_category_title_rect", "shelf_manage_rect", "shelf_import_rect", "draw_shelf_header_button", "draw_shelf_pager", "shelf_page_arrow_rect",
+                 "draw_shelf_furniture", "draw_shelf_titles", "shelf_header_action_rect", "shelf_category_title_rect", "shelf_manage_rect", "shelf_import_rect", "draw_shelf_header_button", "draw_shelf_pager", "shelf_page_arrow_rect",
                  "shelf_category_box", "draw_category_menu", "shelf_category_gesture", "toggle_selection", "main_page_visible"):
         code += host.function(name, BOOK) + "\n"
     tail = host.function("render", BOOK)
@@ -316,6 +321,34 @@ static void shelf_snapshot(app_ctx_t *ctx,const char *dir,const char *name){
     }
     char path[1024];snprintf(path,sizeof(path),"%s/%s-%u.raw",dir,name,font_scale);save(path,ctx->fb);
 }
+static void shelf_title_checks(app_ctx_t *ctx){
+    const size_t bytes=684*1216/2;
+    uint8_t *before=malloc(bytes);assert(before);
+    for (int style=1;style<=2;++style) for(int selection=0;selection<=1;++selection){
+        shelf_style=style;s_shelf_selecting=selection;
+        shelf_titles=3u ^ (1u<<(style-1));
+        render(ctx,ctx->fb);memcpy(before,ctx->fb,bytes);
+        shelf_titles=3;render(ctx,ctx->fb);
+        const int height=selection?18:24;
+        unsigned ink[3]={0};
+        for (int y=0;y<1216;++y) for(int x=0;x<684;++x){
+            if(ui_read_pixel(ctx->fb,x,y)==ui_read_pixel(before,x,y))continue;
+            int row=0;
+            for (;row<3;++row){
+                const int top=row_rect(row*3).y+SHELF_FURNITURE_BOTTOM;
+                if(y>=top&&y<top+height){++ink[row];break;}
+            }
+            assert(row<3);
+        }
+        assert(ink[0]&&ink[1]&&ink[2]);
+        shelf_titles=3u ^ (1u<<(style-1));render(ctx,ctx->fb);
+        assert(!memcmp(before,ctx->fb,bytes));
+    }
+    shelf_style=5;s_shelf_selecting=false;shelf_titles=0;
+    render(ctx,ctx->fb);memcpy(before,ctx->fb,bytes);
+    shelf_titles=3;render(ctx,ctx->fb);assert(!memcmp(before,ctx->fb,bytes));
+    shelf_titles=0;free(before);
+}
 static void shelf_checks(uint8_t *fb,const char *directory,const char *output){
     app_ctx_t ctx={.fb=fb,.now_ms=1000};font_scale=100;adapter_setup(directory);
     // 浏览过的分类保留初始排序，不受其他分类后来改动默认值影响。/ A visited category keeps its initial sort when another changes the default.
@@ -337,6 +370,8 @@ static void shelf_checks(uint8_t *fb,const char *directory,const char *output){
     for(int i=0;i<12;++i)s_shelf[i].selected=true;
     assert(book_collection_assign(&s_collection,s_shelf,s_count,true,target,&changed)==ESP_OK&&changed==12);
     assert(shelf_collection_sync(false));shelf_categories_recount();clear_selection();
+    shelf_style=2;s_view=SHELF;category_select(&ctx,target);ctx.leaf=0;
+    shelf_title_checks(&ctx);
     for(unsigned scale=100;scale<=200;scale+=25){
         font_scale=scale;shelf_style=2;s_view=SHELF;s_shelf_selecting=false;category_select(&ctx,target);ctx.leaf=0;clear_selection();
         shelf_snapshot(&ctx,output,"shelf-grid");

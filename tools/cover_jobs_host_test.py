@@ -76,7 +76,7 @@ int main(void){
   unsigned width=natural?176:164,height=natural?240:214,stride=natural?22:21;
   assert(result.width==width&&result.height==height);
   for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x){
-    bool expected=natural?ui_image_dither_bw(64,x,y):ui_image_dither_cover_bw(68,x,y);
+    bool expected=ui_image_dither_bw(ui_image_cover_tone('A',q.contrast),natural?x:q.x+x,natural?y:q.y+y);
     assert(!!(result.pixels[y*stride+x/8]&(1u<<(x&7)))==expected);
   }free(result.pixels);
  }

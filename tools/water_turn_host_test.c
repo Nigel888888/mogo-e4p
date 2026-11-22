@@ -7,8 +7,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "e0470_page_turn.h"
+#include "e0470_white_field.h"
 #include "e0470_epaper_waveform.h"
 
 #define WIDTH 1216
@@ -17,7 +19,8 @@
 static uint8_t front[FB_BYTES], back[FB_BYTES], diff[WIDTH * HEIGHT];
 static bool dirty_lines[HEIGHT];
 static uint8_t dirty_columns[WIDTH / 2];
-static const EpdWaveformPhases gl = {.phases = 37, .luts = (const uint8_t*)"x"};
+static uint8_t raw_gl[37 * 64];
+static const EpdWaveformPhases gl = {.phases = 37, .luts = raw_gl};
 static const EpdWaveformPhases soft_gl = {.phases = 37, .luts = (const uint8_t*)"s"};
 const EpdWaveform E0470_WAVEFORM = {.id = 1};
 const EpdWaveform E0470_APPLY_WAVEFORM = {.id = 2};
@@ -29,6 +32,9 @@ static const uint8_t* const* staged_luts;
 static const int8_t* staged_lines;
 static const int *staged_x0, *staged_x1;
 static const int8_t* staged_bands;
+static const uint8_t* staged_outer;
+static int staged_inner0, staged_inner1, chrome_scans;
+static bool check_chrome, check_joined, check_white;
 static int staged_count;
 static EpdRect difference_crop;
 static int scans, fail_at, differences, powerons;
@@ -71,6 +77,7 @@ EpdRect epd_difference_image_cropped(const uint8_t* to, const uint8_t* from, Epd
 }
 void epd_clear_phase_luts(void) {
     staged_luts = NULL;
+    staged_outer = NULL;
     staged_lines = NULL;
     staged_x0 = staged_x1 = NULL;
     staged_bands = NULL;
@@ -80,6 +87,10 @@ void epd_set_line_phase_luts(const uint8_t* const* luts, const int8_t* lines) {
     epd_clear_phase_luts();
     staged_luts = luts;
     staged_lines = lines;
+}
+void epd_set_line_phase_outer_lut(const uint8_t* lut, int x0, int x1) {
+    assert(staged_lines && lut && (check_chrome || check_joined || check_white));
+    staged_outer = lut; staged_inner0 = x0; staged_inner1 = x1;
 }
 void epd_set_col_phase_luts(const uint8_t* const* luts, const int* x0, const int* x1,
                             const int8_t* phases, int count) {
@@ -108,13 +119,40 @@ enum EpdDrawError epd_draw_base(EpdRect area, const uint8_t* data, EpdRect crop,
     for(int y=0;y<HEIGHT;++y){hash_byte(lines[y]);if(staged_lines)hash_byte((uint8_t)staged_lines[y]);}
     for(int x=0;x<WIDTH/2;++x)hash_byte(columns[x]);
     if(staged_bands)for(int b=0;b<staged_count;++b)hash_byte((uint8_t)staged_bands[b]);
+    const bool black_tick = (check_chrome || check_joined) && scans >= 30 && scans <= 33;
+    const bool white_tick = check_white && scans == 29;
+    const bool chrome_tick = black_tick || white_tick || (check_joined && scans < 37);
+    assert((staged_outer != NULL) == chrome_tick);
+    if (chrome_tick) {
+        ++chrome_scans;
+        assert(staged_inner0 == difference_crop.x && staged_inner1 == difference_crop.x + difference_crop.width);
+        for (int x = 0; x < WIDTH / 2; ++x) assert(columns[x] == 255);
+        for (int y = 0; y < HEIGHT; ++y) assert(lines[y] && (check_joined || staged_lines[y] >= 0));
+        for (int i = 0; i < 1024; ++i) {
+            const int expected = i == 0 ? black_tick : i == 1020 ? (white_tick ? 2 : 0) :
+                check_joined && i >= 4 && i < 1020 && i / 4 != 0xee ? scans : 0;
+            assert(staged_outer[i] == expected);
+        }
+        assert(data[0] == (check_chrome || check_joined ? 0 : 0xff));
+        assert(data[1] == (check_joined ? 0xf0 : check_chrome ? 0xee : 0xff));
+        assert(data[2] == (check_joined ? 0x06 : check_chrome ? 0xee : 0xff));
+        assert(data[3] == (check_joined ? 0x60 : check_chrome ? 0xee : 0xff));
+        assert(data[4] == 0xee && data[6] == 0xee && data[12] == 0xff);
+        assert(data[20] == 0xee && data[23] == 0xff && data[28] == 0xee);
+        const bool foreground = check_chrome || check_joined;
+        assert(data[WIDTH - 2] == (foreground ? 0 : 0xff) && data[WIDTH - 1] == (foreground ? 0xee : 0xff));
+        if (check_joined) {
+            assert(data[80] == 0xee && data[2 * WIDTH - 1] == 0x0f);
+            if (scans == 0) assert(staged_lines[0] < 0 || staged_lines[HEIGHT - 1] < 0);
+        }
+    }
     // 活跃行列不得跨过裁剪范围；列掩码允许边界字节内的邻接半字节。
     // Active masks stay within the crop, allowing the neighboring nibble in a boundary byte.
     for (int y = 0; y < HEIGHT; ++y)
         if (y < difference_crop.y || y >= difference_crop.y + difference_crop.height)
             assert(!lines[y]);
     for (int x = 0; x < WIDTH / 2; ++x)
-        if (x < difference_crop.x / 2 || x >= (difference_crop.x + difference_crop.width + 1) / 2)
+        if (!chrome_tick && (x < difference_crop.x / 2 || x >= (difference_crop.x + difference_crop.width + 1) / 2))
             assert(!columns[x]);
     int tick = scans++;
     int active = 0;
@@ -174,7 +212,24 @@ static void check_crop_baseline(EpdRect logical) {
     }
 }
 
+static void test_white_field(void) {
+    enum { W = 12, H = 6, STRIDE = W / 2 };
+    uint8_t a[STRIDE * H], b[STRIDE * H];
+    for (int f = 0; f < 2; ++f) for (int gy = 0; gy < H; ++gy) for (int gx = 0; gx < W; ++gx) {
+        memset(a, 0xff, sizeof(a)); memset(b, 0xff, sizeof(b));
+        (f ? a : b)[gy * STRIDE + gx / 2] ^= 1u << (4 * (gx & 1));
+        for (int y = 0; y < H; ++y) {
+            E0470WhiteField paper = e0470_white_field_row(a, b, STRIDE, H, y);
+            for (int x = 0; x < W; ++x)
+                assert(e0470_white_field_contains(&paper, x) == (abs(x - gx) > 2 || abs(y - gy) > 2));
+            for (int x = 0; x < W; x += 5)
+                assert(e0470_white_field_contains(&paper, x) == (abs(x - gx) > 2 || abs(y - gy) > 2));
+        }
+    }
+}
+
 int main(void) {
+    test_white_field();
     EpdiyHighlevelState hl = {front, back, diff, dirty_lines, dirty_columns};
     for (int rot = 0; rot < 4; ++rot) for (int dir = 0; dir < 4; ++dir) {
       uint64_t normal_trace=0;
@@ -352,5 +407,59 @@ int main(void) {
     for(unsigned i=0;i<sizeof(invalid_bands)/sizeof(invalid_bands[0]);++i)
         assert(e0470_page_turn_with_waveform_compact(&hl,main_body,direction,&soft_wave,invalid_bands[i])==EPD_DRAW_INVALID_CROP);
     assert(e0470_page_turn_with_waveform_compact(&hl,main_body,direction,NULL,16)==EPD_DRAW_NO_PHASES_AVAILABLE);
+    // 两个不对齐边界、待更改邻点以及每次失败都不得提前提交外侧。
+    // Neither unaligned edge nor queued outside changes may leak, including on failed scans.
+    water_test_alloc_fail = 0;
+    const EpdRect reader_body = {0, 81, HEIGHT, WIDTH - 156};
+    rotation = EPD_ROT_INVERTED_PORTRAIT;
+    direction = E0470_TURN_RTL;
+    test_bands = 8; test_launch_step = 1; check_direction = false;
+    for (int p = 20; p <= 33; ++p) raw_gl[p * 64 + 3] = 1;
+    raw_gl[25 * 64 + 60] = raw_gl[29 * 64 + 60] = 0x80;
+    check_white = true;
+    for (int trial = 0; trial < 3; ++trial) {
+        check_chrome = trial != 2; chrome_scans = 0; scans = 0; fail_at = trial == 1 ? 32 : 0;
+        memset(back, 0xff, sizeof(back)); memset(front, 0xff, sizeof(front));
+        if (check_chrome) {
+            back[0] = 0x00; front[0] = 0xf0;
+            back[1] = 0x06; front[1] = 0x60;
+            back[WIDTH / 2 - 1] = front[WIDTH / 2 - 1] = 0xf0;
+        }
+        back[3] = front[3] = 0xfd;
+        back[WIDTH + 10] = 0xfd; front[WIDTH + 14] = 0xfd;
+        const int x = 81;
+        front[x / 2] = 0x1f;
+        assert(e0470_page_turn_reader(&hl, reader_body, direction, &E0470_WAVEFORM, 4) ==
+                (fail_at ? EPD_DRAW_OTHER_ERROR : EPD_DRAW_SUCCESS));
+        assert(scans == (fail_at ? fail_at : 44) && chrome_scans == (trial == 0 ? 5 : trial == 1 ? 3 : 1));
+        assert(back[0] == (check_chrome ? 0x00 : 0xff) && back[1] == (check_chrome ? 0x06 : 0xff));
+        assert(back[x / 2] == (fail_at ? 0xff : 0x1f) && !staged_outer);
+    }
+    // 一轮并行更新顶底栏三种变化，包括揭页尚未启动的原生行；无新增拍，失败不提交任何区。
+    // Join three chrome transitions even on lines awaiting their body band; preserve tick count and commit no region on failure.
+    const EpdRect chrome[] = {{0, 0, 80, HEIGHT}, {1141, 1, 75, HEIGHT - 2}};
+    e0470_page_turn_set_tick_us(E0470_TURN_FAST_TICK_US);
+    check_joined = true;
+    for (int trial = 0; trial < 3; ++trial) {
+        fail_at = trial == 1 ? 32 : trial == 2 ? 2 : 0;
+        scans = chrome_scans = 0;
+        memset(back, 0xff, sizeof(back)); memset(front, 0xff, sizeof(front));
+        back[0] = 0; front[0] = 0xf0;
+        back[1] = 0x06; front[1] = 0x60;
+        back[3] = front[3] = 0xfd;
+        back[WIDTH + 10] = 0xfd; front[WIDTH + 14] = 0xfd;
+        back[WIDTH / 2 - 1] = front[WIDTH / 2 - 1] = 0xf0;
+        front[WIDTH - 1] = 0x0f;
+        front[40] = 0x10;
+        const int64_t start = now_us;
+        bool scanned = false;
+        assert(e0470_page_turn_reader_joined(&hl, reader_body, direction, &E0470_WAVEFORM, 4, chrome, &scanned) ==
+            (fail_at ? EPD_DRAW_OTHER_ERROR : EPD_DRAW_SUCCESS));
+        assert(scanned && scans == (fail_at ? fail_at : 44) && chrome_scans == (fail_at ? fail_at : 37));
+        if (!fail_at) assert(now_us - start == 44 * E0470_TURN_FAST_TICK_US);
+        assert(!staged_outer && back[0] == (fail_at ? 0 : 0xf0) && back[1] == (fail_at ? 0x06 : 0x60));
+        assert(back[WIDTH / 2 - 1] == 0xf0 && back[WIDTH - 1] == (fail_at ? 0xff : 0x0f));
+        assert(back[40] == (fail_at ? 0xff : 0x1f));
+    }
     puts("water turn: 4 rotations x 4 directions; reader 8 bands at 44 ticks, simulated 487.96ms; main original 24/compact 24/16/8 bands: 83/60/52/44 ticks, simulated 996/720/624/487.96ms; slow scans complete all 37 phases; every failure tick preserves history and clears LUTs; crop bounds, invalid inputs and OOM passed");
 }

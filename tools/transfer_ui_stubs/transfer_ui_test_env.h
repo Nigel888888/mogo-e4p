@@ -25,9 +25,13 @@ typedef enum { APP_REDRAW_NONE, APP_REDRAW_AREA, APP_REDRAW_PAGE, APP_REDRAW_FUL
 struct app_desc;
 typedef struct { bool touched; uint8_t count; uint16_t x,y; } cst836u_touch_t;
 typedef struct { uint8_t* fb; void* hl; bool consumed,released; int64_t now_ms; const cst836u_touch_t* touch; const struct app_desc* request_app; bool request_return; } app_ctx_t;
-typedef enum { UI_GESTURE_PRESS, UI_GESTURE_TAP, UI_GESTURE_CANCEL, UI_GESTURE_LONG_PRESS } ui_gesture_type_t;
+typedef enum {
+    UI_GESTURE_PRESS, UI_GESTURE_MOVE, UI_GESTURE_LONG_PRESS, UI_GESTURE_TAP,
+    UI_GESTURE_SWIPE_L, UI_GESTURE_SWIPE_R, UI_GESTURE_SWIPE_U, UI_GESTURE_SWIPE_D,
+    UI_GESTURE_CANCEL, UI_GESTURE_RELEASE,
+} ui_gesture_type_t;
 typedef struct { ui_gesture_type_t type; uint16_t x,y,x0,y0; } ui_gesture_event_t;
-typedef struct app_desc { const char *title,*detail; bool enter_full,owns_keys; bool(*menu_handle_enabled)(app_ctx_t*); void(*on_enter)(app_ctx_t*); void(*on_exit)(app_ctx_t*); void(*on_media_lost)(app_ctx_t*); void(*render)(app_ctx_t*,uint8_t*); bool(*present)(app_ctx_t*,app_redraw_t); app_redraw_t(*on_tick)(app_ctx_t*); app_redraw_t(*on_gesture)(app_ctx_t*,const ui_gesture_event_t*); app_redraw_t(*on_key)(app_ctx_t*,int); } app_desc_t;
+typedef struct app_desc { const char *title,*detail; bool enter_full,owns_keys; bool(*menu_handle_enabled)(app_ctx_t*); bool(*modal_input_owned)(app_ctx_t*); void(*on_enter)(app_ctx_t*); void(*on_exit)(app_ctx_t*); void(*on_media_lost)(app_ctx_t*); void(*on_before_lock)(app_ctx_t*); void(*render)(app_ctx_t*,uint8_t*); bool(*present)(app_ctx_t*,app_redraw_t); app_redraw_t(*on_tick)(app_ctx_t*); app_redraw_t(*on_gesture)(app_ctx_t*,const ui_gesture_event_t*); app_redraw_t(*on_key)(app_ctx_t*,int); } app_desc_t;
 enum EpdDrawMode { MODE_DU,MODE_GL16,MODE_GC16 };
 #define UI_MARGIN 40
 #define UI_CONTENT_TOP 176
@@ -75,18 +79,31 @@ static inline void ui_draw_icon(uint8_t* f,int x,int y,int size,ui_icon_t icon,u
 static inline void ui_draw_pressed_round_rect(uint8_t* f,...) {(void)f;}
 static inline void ui_draw_round_rect(uint8_t* f,...) {(void)f;}
 static inline void ui_fill_round_rect(uint8_t* f,...) {(void)f;}
+static inline void ui_fill_round_rect_raw(uint8_t* f,...) {(void)f;}
 static inline void ui_draw_menu_handle(uint8_t* f,...) {(void)f;}
 static inline void ui_hairline(uint8_t* f,...) {(void)f;}
-static inline void ui_text(uint8_t* f,...) {(void)f;}
+extern void (*test_observe_text)(const char *text);
+static inline void ui_text(uint8_t* f,int x,int y,int px,const char* text,int align,bool inverted) {
+    (void)f;(void)x;(void)y;(void)px;(void)align;(void)inverted;
+    if (test_observe_text) test_observe_text(text);
+}
 static inline int ui_text_effective_px(int px) {return px + 2;}
 static inline void ui_text_vc(uint8_t* f,...) {(void)f;}
 static inline void ui_text_box(uint8_t* f,EpdRect box,int px,const char* text,int align,bool inverted) {
-    (void)f;(void)box;(void)px;(void)text;(void)align;(void)inverted;
+    (void)f;(void)box;(void)px;(void)align;(void)inverted;
+    if (test_observe_text) test_observe_text(text);
 }
-static inline void ui_text_fixed_vc(uint8_t* f,...) {(void)f;}
+static inline void ui_text_fixed_vc(uint8_t* f,int x,int y,int px,const char* text,int align,bool inverted) {
+    ui_text(f,x,y,px,text,align,inverted);
+}
 static inline int ui_text_fixed_width_px(int px,const char* s) {return (int)strlen(s)*px/2;}
 static inline int ui_text_fixed_context_width_px(int px,const char* s,const char* sample) {(void)sample;return ui_text_fixed_width_px(px,s);}
 static inline void ui_text_fixed_context_vc(uint8_t* f,...) {(void)f;}
+extern void (*test_observe_pixel)(int x, int y, uint8_t gray);
+static inline void epd_draw_pixel(int x,int y,uint8_t gray,uint8_t* f) {
+    (void)f;
+    if (test_observe_pixel) test_observe_pixel(x,y,gray);
+}
 static inline void epd_fill_rect(EpdRect r,...) {(void)r;}
 static inline void epd_draw_rect(EpdRect r,...) {(void)r;}
 static inline void epd_draw_circle(int x,int y,int radius,...) {(void)x;(void)y;(void)radius;}
@@ -112,7 +129,7 @@ static inline const app_desc_t* app_at(int i) {(void)i;return NULL;}
 typedef enum {WIFI_TRANSFER_MODE_AP,WIFI_TRANSFER_MODE_STA} wifi_transfer_mode_t;
 typedef enum {WIFI_TRANSFER_STOPPED,WIFI_TRANSFER_STARTING,WIFI_TRANSFER_READY,WIFI_TRANSFER_UPLOADING,WIFI_TRANSFER_ERROR} wifi_transfer_state_t;
 typedef struct {wifi_transfer_mode_t mode;bool network_only;const char* root_dir;bool is_flash;size_t file_limit;uint64_t(*free_bytes_cb)(void*);void* free_bytes_ctx;bool(*title_get_cb)(const char*,char*,size_t);int(*title_set_cb)(const char*,const char*);int(*file_changed_cb)(const char*);void(*file_deleted_cb)(const char*);void(*file_moved_cb)(const char*,const char*,uint32_t);void(*directory_deleted_cb)(const char*);void(*directory_moved_cb)(const char*,const char*);bool(*wallpaper_set_cb)(const char*);bool(*signature_get_cb)(char*,size_t);int(*signature_set_cb)(const char*);} wifi_transfer_cfg_t;
-typedef struct {wifi_transfer_mode_t mode;wifi_transfer_state_t state;bool wifi_configured,network_ready;char ssid[33],wifi_ssid[33],url[64],cur_name[241];unsigned sta_count,done_count,changed_count;size_t cur_bytes,cur_total;int last_error;} wifi_transfer_status_t;
+typedef struct {wifi_transfer_mode_t mode;wifi_transfer_state_t state;uint32_t session_id;bool wifi_configured,network_ready,network_only;char ssid[33],wifi_ssid[33],url[64],cur_name[241];unsigned sta_count,done_count,changed_count;size_t cur_bytes,cur_total;int last_error;} wifi_transfer_status_t;
 #define WIFI_TRANSFER_PASSWORD "mogo1234"
 static wifi_transfer_status_t test_status;
 static bool test_busy;

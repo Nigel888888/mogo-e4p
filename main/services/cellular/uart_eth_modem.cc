@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "uart_eth_modem.h"
+#include "cellular_service.h"
+#include <utility>
 
 #include <cstdio>
 #include <cstring>
@@ -87,7 +89,7 @@ UartEthModem::~UartEthModem() {
     }
 }
 
-esp_err_t UartEthModem::Start() {
+esp_err_t UartEthModem::Start(memory_peak_token_t *peak) {
     ESP_LOGI(kTag, "Starting cellular modem");
 
     if (initialized_.load()) {
@@ -138,8 +140,11 @@ esp_err_t UartEthModem::Start() {
         return ret;
     }
 
-    // Allocate frame reassembly buffer
-    reassembly_buffer_ = static_cast<uint8_t*>(heap_caps_malloc(kMaxFrameSize, MALLOC_CAP_INTERNAL));
+    // 重组只在主任务复制和解析，不交给 UHCI；DMA 收发缓冲仍使用原分配。
+    // Reassembly is copied and parsed by the main task, never handed to UHCI; RX/TX DMA allocations stay unchanged.
+    static_assert(kMaxFrameSize == CELLULAR_UART_FRAME_MAX_BYTES);
+    reassembly_buffer_ = static_cast<uint8_t*>(heap_caps_malloc_prefer(kMaxFrameSize, 2,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (!reassembly_buffer_) {
         ESP_LOGE(kTag, "Failed to allocate reassembly buffer");
         CleanupResources(false);
@@ -155,6 +160,7 @@ esp_err_t UartEthModem::Start() {
         .rx_pool = {
             .buffer_count = config_.rx_buffer_count,
             .buffer_size = config_.rx_buffer_size,
+            .prefer_psram = true,
         },
     };
 
@@ -208,6 +214,10 @@ esp_err_t UartEthModem::Start() {
     // Signal start (initialization continues asynchronously in InitTaskRun)
     // Failure will be notified via event callback (ErrorInitFailed, ErrorNoSim, etc.)
     // Caller should call Stop() after receiving failure event to cleanup resources
+    // 在唤醒初始化任务前交接代次，部分创建失败仍由调用方收尾。
+    // Hand off before waking init; the caller still owns partial-creation failures.
+    init_can_commit_ = true;
+    if (peak) init_peak_.store(std::exchange(*peak, 0));
     xEventGroupSetBits(event_group_, kEventStart);
 
     ESP_LOGI(kTag, "UartEthModem starting asynchronously...");
@@ -223,6 +233,7 @@ esp_err_t UartEthModem::Stop() {
 
     ESP_LOGI(kTag, "Stopping UartEthModem...");
 
+    init_can_commit_.exchange(false);
     stop_flag_ = true;
     initializing_ = false;
     if (event_group_) {
@@ -264,6 +275,7 @@ esp_err_t UartEthModem::Stop() {
     CleanupResources(true);
 
     initialized_ = false;
+    memory_peak_finish(init_peak_.exchange(0));
 
     ESP_LOGI(kTag, "UartEthModem stopped");
     return ESP_OK;
@@ -499,25 +511,29 @@ std::string UartEthModem::GetModuleRevision() {
     return module_revision_;
 }
 
-int UartEthModem::GetSignalStrength() {
-    if (!initialized_.load()) {
-        return 99;
-    }
-    if (cell_info_.stat == 2) {
-        return 99;
-    }
+int UartEthModem::GetSignalStrength() const {
+    return initialized_.load() && network_event_.load() == UartEthModemEvent::Connected
+        ? signal_strength_.load() : 99;
+}
 
-    std::string resp;
-    if (SendAt("AT+CSQ", resp, 500) == ESP_OK) {
-        // Parse +CSQ: rssi,ber
-        auto pos = resp.find("+CSQ:");
-        if (pos != std::string::npos) {
-            int rssi = 99;
-            sscanf(resp.c_str() + pos, "+CSQ: %d", &rssi);
-            signal_strength_ = rssi;
+void UartEthModem::PollSignalUntilStop() {
+    // 复用初始化任务，避免每次采样创建栈，也不占用 RX/TX 任务或承载控制门。
+    // Reuse the init task: no per-sample stack and no blocking the RX/TX tasks or bearer gate.
+    while (!stop_flag_.load()) {
+        if (initialized_.load() && network_event_.load() == UartEthModemEvent::Connected) {
+            std::string response;
+            if (SendAt("AT+CSQ", response, 500) == ESP_OK) {
+                const auto offset = response.find("+CSQ:");
+                int rssi = 99;
+                if (offset != std::string::npos && sscanf(response.c_str() + offset, "+CSQ: %d", &rssi) == 1 &&
+                    ((rssi >= 0 && rssi <= 31) || rssi == 99)) signal_strength_.store(rssi);
+            }
+        } else {
+            signal_strength_.store(99);
         }
+        if (stop_flag_.load() || (xEventGroupWaitBits(event_group_, kEventStop, pdFALSE, pdFALSE,
+                pdMS_TO_TICKS(10000)) & kEventStop)) break;
     }
-    return signal_strength_;
 }
 
 UartEthModem::CellInfo UartEthModem::GetCellInfo() {
@@ -1008,7 +1024,7 @@ void UartEthModem::HandleRxData(UartUhci::RxBuffer* buffer) {
     // Update activity time
     last_activity_time_us_ = esp_timer_get_time();
 
-    uint8_t* data = buffer->data;
+    const uint8_t* data = buffer->data;
     size_t size = buffer->size;
     size_t offset = 0;
 
@@ -1027,7 +1043,7 @@ void UartEthModem::HandleRxData(UartUhci::RxBuffer* buffer) {
             }
 
             // Parse header
-            FrameHeader* header = reinterpret_cast<FrameHeader*>(data + offset);
+            const auto* header = reinterpret_cast<const FrameHeader*>(data + offset);
             if (!header->ValidateChecksum()) {
                 // Invalid header - likely end of valid data or corruption
                 // Don't scan further, just discard remaining data
@@ -1219,6 +1235,8 @@ void UartEthModem::EnterActiveState() {
         esp_err_t ret = uart_uhci_.StartReceive();
         if (ret != ESP_OK) {
             ESP_LOGE(kTag, "Failed to start UHCI receive: %s", esp_err_to_name(ret));
+            EnterIdleState();
+            return;
         }
     }
 
@@ -1274,14 +1292,15 @@ void UartEthModem::InitTaskRun() {
     // Wait for start signal
     xEventGroupWaitBits(event_group_, kEventStart, pdTRUE, pdTRUE, portMAX_DELAY);
 
+    esp_err_t result = ESP_ERR_INVALID_STATE;
     if (stop_flag_.load()) {
         goto exit;
     }
 
     // Run initialization sequence based on mode
     {
-        const esp_err_t init_ret = RunNormalModeInitSequence();
-        if (init_ret != ESP_OK) {
+        result = RunNormalModeInitSequence();
+        if (result != ESP_OK) {
             if (stop_flag_.load()) ESP_LOGI(kTag, "Initialization cancelled");
             else ESP_LOGE(kTag, "Initialization sequence failed");
             stop_flag_ = true;
@@ -1298,7 +1317,8 @@ void UartEthModem::InitTaskRun() {
             goto exit;
         }
 
-        if (InitIotEth() != ESP_OK) {
+        result = InitIotEth();
+        if (result != ESP_OK) {
             ESP_LOGE(kTag, "Failed to initialize iot_eth");
             SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "Failed to initialize network interface");
             stop_flag_ = true;
@@ -1313,15 +1333,24 @@ void UartEthModem::InitTaskRun() {
     }
 
 exit:
+    // 只有已完成且未被取消的初始化可自行归还；失败由 Stop 汇合并清理后归还。
+    // Only completed, uncancelled initialization can release here; Stop joins and cleans up failures.
+    const bool committed = result == ESP_OK && init_can_commit_.exchange(false);
+    if (committed) {
+        memory_peak_finish(init_peak_.exchange(0));
+        if (handshake_done_.load()) PollSignalUntilStop();
+    }
     ESP_LOGD(kTag, "Init task exiting");
     xEventGroupSetBits(event_group_, kEventInitTaskDone);
 }
 
 // Enqueue TX frame for non-blocking transmission
 esp_err_t UartEthModem::EnqueueTxFrame(const uint8_t* buf, size_t len) {
-    // Allocate frame with header (DMA compatible memory)
+    // 发送由 CPU 写 UART FIFO，不消耗控制器所需的片内 DMA 堆。
+    // TX writes the UART FIFO on the CPU; do not consume the controller's internal DMA heap.
     size_t total_len = sizeof(FrameHeader) + len;
-    uint8_t* buffer = static_cast<uint8_t*>(heap_caps_malloc(total_len, MALLOC_CAP_DMA));
+    uint8_t* buffer = static_cast<uint8_t*>(heap_caps_malloc_prefer(total_len, 2,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (!buffer) {
         ESP_LOGE(kTag, "Failed to allocate TX buffer for queue");
         return ESP_ERR_NO_MEM;
@@ -1357,9 +1386,9 @@ esp_err_t UartEthModem::EnqueueTxFrame(const uint8_t* buf, size_t len) {
 // Send frame (public interface): enqueue and wait for completion
 // All transmission goes through TxTaskRun to avoid resource contention.
 esp_err_t UartEthModem::SendFrame(const uint8_t* data, size_t length, FrameType type) {
-    // Allocate frame with header (DMA compatible memory)
     size_t total_len = sizeof(FrameHeader) + length;
-    uint8_t* buffer = static_cast<uint8_t*>(heap_caps_malloc(total_len, MALLOC_CAP_DMA));
+    uint8_t* buffer = static_cast<uint8_t*>(heap_caps_malloc_prefer(total_len, 2,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (!buffer) {
         ESP_LOGE(kTag, "Failed to allocate TX buffer");
         return ESP_ERR_NO_MEM;
@@ -1403,13 +1432,13 @@ esp_err_t UartEthModem::SendFrame(const uint8_t* data, size_t length, FrameType 
 }
 
 // Process frame data received via DMA
-void UartEthModem::ProcessReceivedFrame(uint8_t* data, size_t size) {
+void UartEthModem::ProcessReceivedFrame(const uint8_t* data, size_t size) {
     if (size < sizeof(FrameHeader)) {
         return;
     }
 
     // Parse header from DMA buffer
-    FrameHeader* header = reinterpret_cast<FrameHeader*>(data);
+    const auto* header = reinterpret_cast<const FrameHeader*>(data);
 
     // Validate checksum
     if (!header->ValidateChecksum()) {
@@ -1426,7 +1455,7 @@ void UartEthModem::ProcessReceivedFrame(uint8_t* data, size_t size) {
     }
 
     // Get payload pointer (data is in DMA buffer, need to copy for ownership)
-    uint8_t* payload = data + sizeof(FrameHeader);
+    const uint8_t* payload = data + sizeof(FrameHeader);
 
     // Handle frame based on type
     if (header->GetType() == FrameType::kEthernet) {
@@ -1440,7 +1469,7 @@ void UartEthModem::ProcessReceivedFrame(uint8_t* data, size_t size) {
         }
     } else if (header->GetType() == FrameType::kAtCommand) {
         // For AT responses, we can use the data in place (it will be copied in HandleAtResponse)
-        HandleAtResponse(reinterpret_cast<char*>(payload), payload_len);
+        HandleAtResponse(reinterpret_cast<const char*>(payload), payload_len);
     }
 }
 
@@ -1517,9 +1546,7 @@ esp_err_t UartEthModem::SendAtWithRetry(const std::string& cmd, std::string& res
             return ESP_ERR_INVALID_STATE;
         }
         ret = SendAt(cmd, response, timeout_ms);
-        if (ret == ESP_OK) {
-            return ESP_OK;
-        }
+        if (ret == ESP_OK || ret == ESP_ERR_NO_MEM) return ret;
         if (i < max_retries - 1) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -1581,6 +1608,7 @@ esp_err_t UartEthModem::AtDetect() {
         detect_baud_rate_ = config_.baud_rate;
         return ESP_OK;
     }
+    if (ret == ESP_ERR_NO_MEM || stop_flag_.load()) return ret;
     for (size_t i = 0; i < sizeof(baud_rates) / sizeof(baud_rates[0]); i++){
         uart_set_baudrate(config_.uart_num, baud_rates[i]);
         ESP_LOGI(kTag, "Trying baud rate: %d", baud_rates[i]);
@@ -1590,8 +1618,9 @@ esp_err_t UartEthModem::AtDetect() {
             ESP_LOGI(kTag, "Detected baud rate: %d", detect_baud_rate_);
             return ESP_OK;
         }
+        if (ret == ESP_ERR_NO_MEM || stop_flag_.load()) return ret;
     }
-    return ESP_FAIL;
+    return ret;
 }
 
 int UartEthModem::ParseSimSlot(const std::string& response) {
@@ -1636,8 +1665,12 @@ esp_err_t UartEthModem::RunNormalModeInitSequence() {
     ESP_LOGI(kTag, "Detecting modem...");
     ret = AtDetect();
     if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Modem not detected");
-        SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "Modem not detected (AT no response)");
+        if (ret == ESP_ERR_NO_MEM) {
+            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "移动网络检测内存不足");
+        } else if (!stop_flag_.load()) {
+            ESP_LOGE(kTag, "Modem not detected");
+            SetNetworkEvent(UartEthModemEvent::ErrorInitFailed, "Modem not detected (AT no response)");
+        }
         return ret;
     }
 

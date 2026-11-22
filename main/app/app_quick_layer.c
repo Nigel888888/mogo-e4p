@@ -6,7 +6,7 @@
  * English: Top quick layer extracted from the loop, owning previews, local presentation and service actions; the loop retains scheduling and lock gates.
  */
 #include "app_quick_layer.h"
-#include "weather_service.h"
+#include "memory_peak.h"
 #include "app_navigation.h"
 #include "app_device_settings_mode.h"
 #include "app_transfer_mode.h"
@@ -195,24 +195,23 @@ void app_quick_layer_present_buttons(app_ctx_t *ctx,const app_desc_t *current) {
     s_quick_status=status;s_fl_shown_on=s_quick.fl_on;s_quick_pressed=pressed;
 }
 
-static void quick_toggle_wifi(void) {
-    app_weather_cancel_join();
-    network_status_t status;
-    network_service_get_status(&status);
-    if (!status.wifi_enabled) {
-        ble_pt_sync(false);
-        (void)network_service_set_enabled(NETWORK_BEARER_WIFI, true);
-    } else {
-        (void)network_service_set_enabled(NETWORK_BEARER_WIFI, false);
-    }
+static void quick_show_notice(app_ctx_t *ctx, const app_desc_t *current, const char *notice) {
+    s_quick.network_notice = notice;
+    s_quick.rotation_notice = false;
+    s_rotation_notice_until = ctx->now_ms + 2200;
+    quick_rotation_notice_present(ctx, current);
 }
 
-static void quick_toggle_cellular(void) {
-    app_weather_cancel_join();
+static void quick_toggle_network(app_ctx_t *ctx, const app_desc_t *current, network_bearer_t bearer) {
     network_status_t status;
     network_service_get_status(&status);
-    if (status.cellular_capable)
-        (void)network_service_set_enabled(NETWORK_BEARER_CELLULAR, !status.cellular_enabled);
+    if (bearer == NETWORK_BEARER_CELLULAR && !status.cellular_capable) return;
+    const bool enabled = bearer == NETWORK_BEARER_WIFI ? status.wifi_enabled : status.cellular_enabled;
+    const esp_err_t err = network_service_set_enabled(bearer, !enabled);
+    if (err == ESP_OK) return;
+    const char *hint = memory_peak_hint(err);
+    if (!hint && !enabled && err == ESP_ERR_NO_MEM) hint = "内存不足，无法启动网络";
+    quick_show_notice(ctx, current, hint ? hint : "网络正在使用或启动失败");
 }
 
 // 前光开关改变层高时整层重绘；黑白滑杆拖动与松手共用完整 DU 差分，不追加定稿。
@@ -303,7 +302,8 @@ bool app_quick_layer_feed_frame(app_ctx_t *ctx, const app_desc_t *current, bool 
         s_quick.layout = *app_settings_quick_layout();
     ui_quick_event_t event;
     bool owned = ui_quick_menu_feed(&s_quick, ctx,
-        current->render && !current->holds_pmu && !usb_storage_active() && !pico_online_busy(),
+        current->render && !current->holds_pmu && !usb_storage_active() && !pico_online_busy() &&
+        (!current->modal_input_owned || !current->modal_input_owned(ctx)),
         &event);
     if (owned) ctx->consumed = true;
     if (event.action == UI_QUICK_OPEN || event.action == UI_QUICK_CLOSE) {
@@ -328,10 +328,15 @@ bool app_quick_layer_feed_frame(app_ctx_t *ctx, const app_desc_t *current, bool 
     // a whole-layer re-composite; its push already covers the new/old height
     // union with GL16, which carries the 264→480 growth.
     else if (event.action == UI_QUICK_EXPAND) app_quick_layer_present(ctx, current, false);
-    else if (event.action == UI_QUICK_WIFI) quick_toggle_wifi();
-    else if (event.action == UI_QUICK_CELLULAR) quick_toggle_cellular();
+    else if (event.action == UI_QUICK_WIFI) quick_toggle_network(ctx, current, NETWORK_BEARER_WIFI);
+    else if (event.action == UI_QUICK_CELLULAR) quick_toggle_network(ctx, current, NETWORK_BEARER_CELLULAR);
     else if (event.action == UI_QUICK_BLUETOOTH) {
         bool enable = !app_settings_ble_turner();
+        const char *blocked = enable ? ble_pt_enable_block_reason() : NULL;
+        if (blocked) {
+            quick_show_notice(ctx, current, blocked);
+            return owned;
+        }
         app_settings_set_ble_turner(enable);
         if (enable) ble_pt_reconnect_recent();
         else { ble_pt_cancel_recent(); ble_pt_sync(false); }
@@ -426,6 +431,7 @@ bool app_quick_layer_feed_frame(app_ctx_t *ctx, const app_desc_t *current, bool 
     }
     else if (event.action == UI_QUICK_ROTATION) {
         if (!s_quick.rotation_available || !current->on_rotation_toggle) {
+            s_quick.network_notice = NULL;
             s_quick.rotation_notice = true;
             s_rotation_notice_until = ctx->now_ms + 2200;
             quick_rotation_notice_present(ctx, current);
@@ -476,7 +482,8 @@ bool app_quick_layer_cancel_input(void) {
 }
 
 void app_quick_layer_sync_status(app_ctx_t *ctx, const app_desc_t *current) {
-    if (s_quick.open && s_quick.rotation_notice && ctx->now_ms >= s_rotation_notice_until) {
+    if (s_quick.open && (s_quick.rotation_notice || s_quick.network_notice) && ctx->now_ms >= s_rotation_notice_until) {
+        s_quick.network_notice = NULL;
         s_quick.rotation_notice = false;
         quick_rotation_notice_present(ctx, current);
     }

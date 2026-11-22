@@ -26,6 +26,7 @@ typedef int BaseType_t;
 typedef void (*frame_done_func_t)(void*);
 typedef struct { int current, last; } LineQueue_t;
 typedef struct {
+ bool frame_ended;
  int lines_consumed, lines_total, error, current_frame, cycle_frames;
  int frame_done, feed_done_smphr[2], feed_tasks[2];
  LineQueue_t line_queues[2];

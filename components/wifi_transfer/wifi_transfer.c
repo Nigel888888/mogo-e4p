@@ -6,8 +6,8 @@
  * AP/STA networking, HTTP reception and file commit; page injects capacity policy.
  * 冻结：分类上传限制书籍/图片/字体格式；目录中的「添加文件」接受任意格式，保留 UTF-8 名字并先验容量。
  * Frozen: Typed uploads limit book/image/font formats; Add File accepts any format within the TF root, preserving UTF-8 names and checking capacity first.
- * 为传入升级包等其他文件增加目录上传；分类上传仍保持原有限额和失败清理。
- * Directory uploads also accept upgrade packages; typed uploads retain their limits and failed-part cleanup.
+ * 书籍专用入口与 TF 的 books/ 路径预算对齐；图片、字体和内置存储保留原文件名上限。
+ * Typed TF book uploads share the books/ path budget; images, fonts and internal storage keep their previous filename limit.
  * 冻结：热点网页或停服设备触屏可配置网络，不自动切模式；凭据只存单个NVS blob，状态不含密码。
  * 用户要求保存多网络：版本化 NVS blob 最多保存八组，兼容旧单网络，最近选择的网络用于连接与对时。
  * User-requested multi-network storage: a versioned NVS blob holds eight profiles, accepts legacy data and connects/syncs using the latest selection.
@@ -24,6 +24,7 @@
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <dirent.h>
@@ -34,6 +35,35 @@
 
 #define IMAGE_UPLOAD_LIMIT (20u * 1024u * 1024u)
 #define FONT_UPLOAD_LIMIT (32u * 1024u * 1024u)
+#define TRANSFER_MEDIA_NAME_MAX 120
+#define TRANSFER_SD_PATH_MAX 238
+#define TRANSFER_BOOK_NAME_MAX (TRANSFER_SD_PATH_MAX - (sizeof("books/") - 1))
+#define BOOK_STAGE_PREFIX ".mogo-u-"
+#define PART_SUFFIX ".part"
+#define BACKUP_SUFFIX ".rename-backup"
+_Static_assert(TRANSFER_BOOK_NAME_MAX + sizeof(BOOK_STAGE_PREFIX BACKUP_SUFFIX) - 1 <= 255,
+               "book staging filename exceeds FatFs long filename budget");
+
+static size_t book_upload_name_limit(const char *root, bool is_flash) {
+    if (is_flash || strncmp(root, "/sdcard/", sizeof("/sdcard/") - 1)) return TRANSFER_MEDIA_NAME_MAX;
+    size_t prefix = strlen(root) - (sizeof("/sdcard") - 1);
+    if (prefix >= TRANSFER_SD_PATH_MAX) return 0;
+    size_t limit = TRANSFER_SD_PATH_MAX - prefix;
+    return limit < TRANSFER_BOOK_NAME_MAX ? limit : TRANSFER_BOOK_NAME_MAX;
+}
+
+static bool book_staging_name(const char *name, size_t len) {
+    const size_t prefix = sizeof(BOOK_STAGE_PREFIX) - 1;
+    if (len <= prefix + TRANSFER_MEDIA_NAME_MAX || strncasecmp(name, BOOK_STAGE_PREFIX, prefix)) return false;
+    const char *suffixes[] = {PART_SUFFIX, BACKUP_SUFFIX};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); ++i) {
+        const char *suffix = suffixes[i];
+        size_t tail = strlen(suffix);
+        if (len > prefix + tail + TRANSFER_MEDIA_NAME_MAX && len <= prefix + tail + TRANSFER_BOOK_NAME_MAX &&
+            !strncasecmp(name + len - tail, suffix, tail)) return true;
+    }
+    return false;
+}
 
 /* ---- 请求与存储 / Requests and storage ---- */
 static int hex_value(unsigned char c) {
@@ -43,21 +73,11 @@ static int hex_value(unsigned char c) {
     return -1;
 }
 
-static bool decode_name_limit(const char *encoded, char *out, size_t cap, unsigned kind) {
-    if (!cap) return false;
-    size_t n = 0;
-    while (*encoded) {
-        unsigned char c = (unsigned char)*encoded++;
-        if (c == '%') {
-            if (!encoded[0] || !encoded[1]) return false;
-            int a = hex_value(encoded[0]), b = hex_value(encoded[1]);
-            if (a < 0 || b < 0) return false;
-            c = (unsigned char)((a << 4) | b); encoded += 2;
-        }
-        if (n + 1 >= cap || c < 32 || c == 127 || strchr("/\\:*?\"<>|", c)) return false;
-        out[n++] = (char)c;
+static bool valid_typed_name(const char *out, size_t n, unsigned kind) {
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)out[i];
+        if (c < 32 || c == 127 || strchr("/\\:*?\"<>|", c)) return false;
     }
-    out[n] = 0;
     if (!n || out[0] == '.' || out[0] == ' ' || out[n - 1] == ' ' || strstr(out, "..")) return false;
     const char *ext = strrchr(out, '.');
     if (!ext || (kind == 1 ? (strcasecmp(ext, ".jpg") && strcasecmp(ext, ".jpeg") && strcasecmp(ext, ".png"))
@@ -82,19 +102,35 @@ static bool decode_name_limit(const char *encoded, char *out, size_t cap, unsign
     return true;
 }
 
-static bool decode_name(const char *encoded, char out[121]) { return decode_name_limit(encoded, out, 121, false); }
+typedef enum { NAME_INVALID, NAME_OK, NAME_TOO_LONG } transfer_name_result_t;
+
+static transfer_name_result_t decode_typed_name(const char *encoded, char *out, size_t cap, unsigned kind) {
+    if (!cap) return NAME_INVALID;
+    size_t n = 0;
+    while (*encoded) {
+        unsigned char c = (unsigned char)*encoded++;
+        if (c == '%') {
+            if (!encoded[0] || !encoded[1]) return NAME_INVALID;
+            int a = hex_value(encoded[0]), b = hex_value(encoded[1]);
+            if (a < 0 || b < 0) return NAME_INVALID;
+            c = (unsigned char)((a << 4) | b); encoded += 2;
+        }
+        if (n + 1 >= cap) return NAME_TOO_LONG;
+        out[n++] = (char)c;
+    }
+    out[n] = 0;
+    return valid_typed_name(out, n, kind) ? NAME_OK : NAME_INVALID;
+}
+
+static bool decode_name_limit(const char *encoded, char *out, size_t cap, unsigned kind) {
+    return decode_typed_name(encoded, out, cap, kind) == NAME_OK;
+}
 
 static bool raw_book_name(const char *entry, char *name, size_t cap) {
     size_t len = strlen(entry);
-    if (!len || len >= cap || len > 255) return false;
-    static const char digits[] = "0123456789ABCDEF";
-    char encoded[766];
-    for (size_t i = 0; i < len; ++i) {
-        unsigned char c = (unsigned char)entry[i];
-        encoded[i * 3] = '%'; encoded[i * 3 + 1] = digits[c >> 4]; encoded[i * 3 + 2] = digits[c & 15];
-    }
-    encoded[len * 3] = 0;
-    return decode_name_limit(encoded, name, cap, false);
+    if (len >= cap || len > 255 || !valid_typed_name(entry, len, 0)) return false;
+    memcpy(name, entry, len + 1);
+    return true;
 }
 
 // 两个存储根都是FAT；变更使用目录真实拼写，不明别名拒绝操作，避免漏清阅读记录。
@@ -154,7 +190,7 @@ static int resolve_mutation_path(const char *root, const char *name,
 static bool sd_relative_valid(const char *relative, bool allow_root) {
     size_t length = strlen(relative);
     if (!length) return allow_root;
-    if (length > 238 || relative[0] == '/' || relative[length - 1] == '/') return false;
+    if (length > TRANSFER_SD_PATH_MAX || relative[0] == '/' || relative[length - 1] == '/') return false;
     const char *segment = relative;
     for (const char *p = relative;; ++p) {
         unsigned char ch = (unsigned char)*p;
@@ -165,6 +201,7 @@ static bool sd_relative_valid(const char *relative, bool allow_root) {
         size_t n = (size_t)(p - segment);
         if (!n || n > 240 || (n == 1 && segment[0] == '.') ||
             (n == 2 && segment[0] == '.' && segment[1] == '.') ||
+            book_staging_name(segment, n) ||
             segment[0] == ' ' || segment[n - 1] == ' ' || segment[n - 1] == '.') return false;
         if (!ch) return true;
         segment = p + 1;
@@ -201,41 +238,57 @@ static int check_length(size_t total, size_t limit, uint64_t available) {
     return 0;
 }
 
-static bool temporary_basename(const char *entry, const char *suffix, char name[121]) {
-    size_t len = strlen(entry), tail = strlen(suffix);
-    if (len <= tail || len - tail > 120 || strcmp(entry + len - tail, suffix)) return false;
-    // 目录项已解码；重新百分号编码后复用校验，保留文件名里的字面百分号。
-    // Directory entries are already decoded; encode before validation to preserve literal percent signs.
-    static const char digits[] = "0123456789ABCDEF";
-    char encoded[361];
-    for (size_t i = 0; i < len - tail; ++i) {
-        unsigned char c = (unsigned char)entry[i];
-        encoded[i * 3] = '%'; encoded[i * 3 + 1] = digits[c >> 4]; encoded[i * 3 + 2] = digits[c & 15];
-    }
-    encoded[(len - tail) * 3] = 0;
-    return decode_name(encoded, name);
+static bool staged_book_path(const char *root, const char *name, const char *suffix, char *out, size_t cap) {
+    int len = snprintf(out, cap, "%s/%s%s%s", root, BOOK_STAGE_PREFIX, name, suffix);
+    return len >= 0 && (size_t)len < cap;
 }
 
-static int cleanup_interrupted(const char *root, unsigned *removed, unsigned *restored) {
+static bool temporary_basename(const char *entry, const char *suffix, size_t limit, bool *staged, char *name) {
+    *staged = book_staging_name(entry, strlen(entry));
+    if (*staged) entry += sizeof(BOOK_STAGE_PREFIX) - 1;
+    size_t len = strlen(entry), tail = strlen(suffix), max = *staged ? limit : TRANSFER_MEDIA_NAME_MAX;
+    if (len <= tail || len - tail > max || (*staged ? strcasecmp(entry + len - tail, suffix) : strcmp(entry + len - tail, suffix)) ||
+        (*staged && len - tail <= TRANSFER_MEDIA_NAME_MAX)) return false;
+    memcpy(name, entry, len - tail);
+    name[len - tail] = 0;
+    return valid_typed_name(name, len - tail, 0);
+}
+
+static int cleanup_interrupted(const char *root, size_t limit, unsigned *removed, unsigned *restored) {
     *removed = *restored = 0;
-    // 先恢复缺失的旧书，再删未提交片段；不递归、不删除已有完整书或其备份。
-    // Restore missing old books before removing uncommitted parts; never recurse or delete complete books or their backups.
+    // 先恢复缺失的旧书，再清片段；仅已提交的新版私有备份可清理，不动旧协议的备份。
+    // Restore missing books before clearing parts; only committed private backups are eligible for cleanup.
     for (int pass = 0; pass < 2; ++pass) {
         DIR *dir = opendir(root);
         if (!dir) return -1;
         int result = 0;
         struct dirent *entry;
         while (errno = 0, (entry = readdir(dir)) != NULL) {
-            char name[121], path[320], target[288];
-            if (!temporary_basename(entry->d_name, pass ? ".part" : ".rename-backup", name)) continue;
+            char name[TRANSFER_BOOK_NAME_MAX + 1], path[320], target[288];
+            bool staged;
+            if (!temporary_basename(entry->d_name, pass ? PART_SUFFIX : BACKUP_SUFFIX, limit, &staged, name)) continue;
             if (snprintf(path, sizeof(path), "%s/%s", root, entry->d_name) >= (int)sizeof(path) ||
                 snprintf(target, sizeof(target), "%s/%s", root, name) >= (int)sizeof(target)) { result = -1; break; }
             struct stat st;
             if (stat(path, &st)) { result = -1; break; }
             if (!S_ISREG(st.st_mode)) continue;
             if (!pass) {
-                if (!stat(target, &st)) continue;
-                if (errno != ENOENT || rename(path, target)) { result = -1; break; }
+                bool target_exists = stat(target, &st) == 0;
+                if (!target_exists && errno != ENOENT) { result = -1; break; }
+                bool target_regular = target_exists && S_ISREG(st.st_mode);
+                if (staged) {
+                    char part[320];
+                    if (!staged_book_path(root, name, PART_SUFFIX, part, sizeof(part))) { result = -1; break; }
+                    bool pending = stat(part, &st) == 0;
+                    if (!pending && errno != ENOENT) { result = -1; break; }
+                    // 临时片段是未提交标记；没有片段的备份不恢复，避免复活已删除的新书。
+                    // The part marks an uncommitted replacement; never restore a backup alone after a later deletion.
+                    if (!pending || !S_ISREG(st.st_mode) || target_exists) {
+                        if (!pending && target_regular && !remove(path)) ++*removed;
+                        continue;
+                    }
+                } else if (target_exists) continue;
+                if (rename(path, target)) { result = -1; break; }
                 ++*restored;
             } else {
                 if (remove(path)) { result = -1; break; }
@@ -249,17 +302,23 @@ static int cleanup_interrupted(const char *root, unsigned *removed, unsigned *re
     return 0;
 }
 
-static int commit_file(const char *part, const char *path) {
+enum { COMMIT_ROLLBACK_PENDING = -2 };
+
+static int commit_file(const char *part, const char *path, const char *staged_backup) {
     if (rename(part, path) == 0) return 0;
     // FatFs 不支持直接覆盖；保留旧书直至新文件成功就位。/ FatFs cannot replace directly; retain the old book until commit.
     if (errno != EEXIST && errno != EACCES) return -1;
     struct stat st;
     if (stat(path, &st) || !S_ISREG(st.st_mode)) return -1;
-    char backup[320];
-    if (snprintf(backup, sizeof(backup), "%s.rename-backup", path) >= (int)sizeof(backup)) return -1;
+    char legacy_backup[320];
+    if (!staged_backup && snprintf(legacy_backup, sizeof(legacy_backup), "%s" BACKUP_SUFFIX, path) >= (int)sizeof(legacy_backup)) return -1;
+    const char *backup = staged_backup ? staged_backup : legacy_backup;
     if (!stat(backup, &st) || errno != ENOENT) return -1;
     if (rename(path, backup)) return -1;
-    if (rename(part, path)) { rename(backup, path); return -1; }
+    if (rename(part, path)) {
+        if (rename(backup, path) && staged_backup) return COMMIT_ROLLBACK_PENDING;
+        return -1;
+    }
     // 新书已提交；备份删除失败只能报告警告，不能跳过进度失效回调。
     // The new book is committed; failed backup removal is a warning and must not skip progress invalidation.
     return remove(backup) ? 1 : 0;
@@ -268,10 +327,20 @@ static int commit_file(const char *part, const char *path) {
 typedef int (*receive_cb_t)(void *, char *, size_t);
 typedef void (*progress_cb_t)(size_t);
 enum { TRANSFER_COMMITTED_BACKUP_RETAINED = 299 };
-static int receive_file(const char *path, const char *part, size_t total, char *buf,
+static int receive_file(const char *path, const char *part, const char *staged_backup, size_t total, char *buf,
                         size_t cap, receive_cb_t recv, void *ctx, progress_cb_t progress) {
-    FILE *f = fopen(part, "wb");
-    if (!f) return 507;
+    FILE *f;
+    if (staged_backup) {
+        struct stat st;
+        if (!stat(staged_backup, &st) || errno != ENOENT) return 507;
+        int fd = open(part, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd < 0) return 507;
+        f = fdopen(fd, "wb");
+        if (!f) { close(fd); remove(part); return 507; }
+    } else {
+        f = fopen(part, "wb");
+        if (!f) return 507;
+    }
     // HTTP 常按小包到达；扩大文件缓冲可显著减少 TF 卡零碎写入。
     // HTTP arrives in small packets; a larger file buffer cuts fragmented SD writes.
 #ifdef ESP_PLATFORM
@@ -296,7 +365,8 @@ static int receive_file(const char *path, const char *part, size_t total, char *
     if (fclose(f) != 0) error = 507;
     free(write_buffer);
     if (!error) {
-        int committed = commit_file(part, path);
+        int committed = commit_file(part, path, staged_backup);
+        if (committed == COMMIT_ROLLBACK_PENDING) return 507;
         if (committed < 0) error = 507;
         else if (committed > 0) return TRANSFER_COMMITTED_BACKUP_RETAINED;
     }
@@ -325,12 +395,12 @@ static int destination_status(const char *path, bool overwrite) {
     return errno == ENOENT ? 0 : 507;
 }
 
-static file_result_t upload_managed(const char *path, const char *part, size_t total, size_t limit,
+static file_result_t upload_managed(const char *path, const char *part, const char *staged_backup, size_t total, size_t limit,
         uint64_t available, bool overwrite, char *buf, size_t cap, receive_cb_t recv, void *ctx,
         progress_cb_t progress, file_changed_cb_t changed) {
     int status = destination_status(path, overwrite);
     if (!status) status = check_length(total, limit, available);
-    if (!status) status = receive_file(path, part, total, buf, cap, recv, ctx, progress);
+    if (!status) status = receive_file(path, part, staged_backup, total, buf, cap, recv, ctx, progress);
     if (status && status != TRANSFER_COMMITTED_BACKUP_RETAINED) return (file_result_t){.status = status};
     file_result_t result = changed_result(path, changed);
     result.storage_cleanup_failed = status == TRANSFER_COMMITTED_BACKUP_RETAINED;
@@ -362,7 +432,7 @@ static file_result_t upload_directory_file(const char *root, const char *relativ
     if (close(fd)) { remove(part); return (file_result_t){.status = 507}; }
     // 空文件也有效；图书快捷上传仍由原来的长度策略拒绝空内容。
     // Empty general files are valid; typed book uploads still reject empty content.
-    status = receive_file(path, part, total, buf, cap, recv, ctx, progress);
+    status = receive_file(path, part, NULL, total, buf, cap, recv, ctx, progress);
     if (status && status != TRANSFER_COMMITTED_BACKUP_RETAINED) {
         remove(part);
         return (file_result_t){.status = status};
@@ -442,6 +512,7 @@ static int list_books(const char *root, const char *query, size_t page, transfer
 #include "wifi_transfer.h"
 #include "transfer_signature.h"
 #include "ble_page_turner.h"
+#include "memory_peak.h"
 static bool s_ble_network_reserved;
 #include "transfer_policy.h"
 #include "transfer_credentials_store.h"
@@ -479,7 +550,10 @@ void wifi_transfer_memory_usage(size_t *internal_bytes, size_t *psram_bytes) {
     if (psram_bytes) *psram_bytes = s_memory_psram;
     portEXIT_CRITICAL(&s_lock);
 }
-static bool s_stopping, s_upload_active;
+static bool s_stopping, s_upload_active, s_files_disabled;
+static memory_peak_token_t s_association_peak;
+static bool s_connect_calling;
+static unsigned s_cancel_attempts;
 static bool s_config_busy;
 // 对时独占 SNTP 与临时 WiFi；取消后等待清理完成，才允许拆网络或睡眠。
 // Time sync owns SNTP/temporary WiFi; wait for cleanup before network teardown or sleep.
@@ -687,6 +761,60 @@ esp_err_t wifi_transfer_import_wifi_backup(const wifi_transfer_wifi_backup_t *ba
     return err;
 }
 
+esp_err_t wifi_transfer_export_profiles_backup(wifi_transfer_profiles_backup_t *out) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (!claim_config()) return ESP_ERR_INVALID_STATE;
+    transfer_profiles_t profiles;
+    esp_err_t err = load_profiles(&profiles);
+    if (err == ESP_OK) {
+        out->count = profiles.count;
+        for (size_t i = 0; i < profiles.count; ++i) {
+            out->items[i].configured = 1;
+            memcpy(out->items[i].ssid, profiles.items[i].ssid, sizeof(out->items[i].ssid));
+            memcpy(out->items[i].password, profiles.items[i].password, sizeof(out->items[i].password));
+        }
+    }
+    clear_secret(&profiles, sizeof(profiles));
+    release_config();
+    return err;
+}
+
+bool wifi_transfer_profiles_backup_valid(const wifi_transfer_profiles_backup_t *backup) {
+    if (!backup || backup->count > WIFI_TRANSFER_SAVED_MAX) return false;
+    for (size_t i = 0; i < WIFI_TRANSFER_SAVED_MAX; ++i) {
+        const wifi_transfer_wifi_backup_t *item = &backup->items[i];
+        if (item->configured != (i < backup->count) || !wifi_transfer_wifi_backup_valid(item)) return false;
+        for (size_t j = 0; j < i && i < backup->count; ++j)
+            if (!strcmp(item->ssid, backup->items[j].ssid)) return false;
+    }
+    return true;
+}
+
+esp_err_t wifi_transfer_merge_profiles_backup(const wifi_transfer_profiles_backup_t *backup, bool apply) {
+    if (!wifi_transfer_profiles_backup_valid(backup)) return ESP_ERR_INVALID_ARG;
+    if (!backup->count) return ESP_OK;
+    if (!claim_config()) return ESP_ERR_INVALID_STATE;
+    transfer_profiles_t local, next = {.version = 2, .count = backup->count};
+    esp_err_t err = load_profiles(&local);
+    if (err == ESP_OK) {
+        for (size_t i = 0; i < backup->count; ++i) {
+            next.items[i].version = 1;
+            memcpy(next.items[i].ssid, backup->items[i].ssid, sizeof(next.items[i].ssid));
+            memcpy(next.items[i].password, backup->items[i].password, sizeof(next.items[i].password));
+        }
+        if (!merge_backup_profiles(&next, &local)) err = ESP_ERR_INVALID_SIZE;
+        else if (apply) {
+            err = store_profiles(&next);
+            if (err == ESP_OK && !s_wifi) publish_credentials(&next.items[0]);
+        }
+    }
+    clear_secret(&local, sizeof(local));
+    clear_secret(&next, sizeof(next));
+    release_config();
+    return err;
+}
+
 esp_err_t wifi_transfer_save_wifi(const char *ssid, const char *password) {
     if (!cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
     wifi_transfer_status_t status;
@@ -731,8 +859,14 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
         clear_secret(&saved, sizeof(saved));
         return err == ESP_OK ? ESP_ERR_NOT_FOUND : err;
     }
-    err = ble_pt_network_acquire();
-    if (err != ESP_OK) { clear_secret(&saved, sizeof(saved)); return err; }
+    memory_peak_token_t peak;
+    err = memory_peak_try_begin(MEMORY_PEAK_WIFI_TIME, &peak);
+    if (err == ESP_OK) err = ble_pt_network_acquire();
+    if (err != ESP_OK) {
+        clear_secret(&saved, sizeof(saved));
+        memory_peak_finish(peak);
+        return err;
+    }
     bool loop_owned = false, wifi_initialized = false, wifi_started = false;
     esp_netif_t *netif = NULL;
     esp_event_handler_instance_t wifi_handler = NULL, ip_handler = NULL;
@@ -746,7 +880,7 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
     wifi.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
     clear_secret(&saved, sizeof(saved));
     s_time_events = xEventGroupCreate();
-    if (!s_time_events) { clear_secret(&wifi, sizeof(wifi)); ble_pt_network_release(); return ESP_ERR_NO_MEM; }
+    if (!s_time_events) { err = ESP_ERR_NO_MEM; goto time_cleanup; }
     err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) goto time_cleanup;
     err = esp_event_loop_create_default();
@@ -797,6 +931,8 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
             if (err != ESP_OK) goto time_cleanup;
         }
     }
+    memory_peak_finish(peak);
+    peak = 0;
     err = time_sync_ntp(utc_seconds);
 time_cleanup:
     if (wifi_started) esp_wifi_stop();
@@ -805,10 +941,11 @@ time_cleanup:
     if (wifi_initialized) esp_wifi_deinit();
     if (netif) esp_netif_destroy_default_wifi(netif);
     if (loop_owned) esp_event_loop_delete_default();
-    vEventGroupDelete(s_time_events); s_time_events = NULL;
+    if (s_time_events) vEventGroupDelete(s_time_events);
+    s_time_events = NULL;
     clear_secret(&wifi, sizeof(wifi));
     ble_pt_network_release();
-
+    memory_peak_finish(peak);
     return err;
 }
 
@@ -823,7 +960,7 @@ static esp_err_t sync_time_online_impl(uint32_t *utc_seconds) {
     return time_sync_ntp(utc_seconds);
 }
 
-static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool automatic) {
+static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool automatic, bool publish_result) {
     if (!utc_seconds) return ESP_ERR_INVALID_ARG;
     *utc_seconds = 0;
     // 手动操作优先于自动任务；配置和对时的准入在同一个锁下，防止双初始化。
@@ -844,19 +981,24 @@ static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool aut
     if (!available) return ESP_ERR_INVALID_STATE;
     esp_err_t err = online_only ? sync_time_online_impl(utc_seconds) : sync_time_impl(utc_seconds);
     portENTER_CRITICAL(&s_lock);
-    if (err == ESP_OK) s_time_pending_utc = *utc_seconds;
+    if (err == ESP_OK && publish_result) s_time_pending_utc = *utc_seconds;
     s_time_active = s_time_automatic = s_config_busy = false;
     portEXIT_CRITICAL(&s_lock);
     return err;
 }
 esp_err_t wifi_transfer_sync_time(uint32_t *utc_seconds) {
-    return sync_time_run(utc_seconds, false, false);
+    return sync_time_run(utc_seconds, false, false, true);
 }
 esp_err_t wifi_transfer_sync_time_online(uint32_t *utc_seconds) {
-    return sync_time_run(utc_seconds, true, false);
+    return sync_time_run(utc_seconds, true, false, true);
+}
+esp_err_t wifi_transfer_sync_time_online_manual(uint32_t *utc_seconds) {
+    // 由上层租约保护，仍可取消；手动交接自行写入并回读 PMU，不另外发布自动事件。
+    // Protected by the caller's lease but cancellable; the manual PMU handoff consumes the result directly.
+    return sync_time_run(utc_seconds, true, true, false);
 }
 esp_err_t wifi_transfer_sync_time_auto(uint32_t *utc_seconds) {
-    return sync_time_run(utc_seconds, false, true);
+    return sync_time_run(utc_seconds, false, true, true);
 }
 /// 取消在途后台对时；仅自动任务可被打断，返回是否已无活动任务。
 /// Cancel an in-flight background sync; only an automatic run may be interrupted. True when idle.
@@ -943,16 +1085,18 @@ done:
     return best;
 }
 
-esp_err_t wifi_transfer_scan_wifi(wifi_transfer_network_t out[WIFI_TRANSFER_SCAN_MAX], size_t *count) {
-    if (!cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
+esp_err_t wifi_transfer_scan_admitted(wifi_transfer_network_t out[WIFI_TRANSFER_SCAN_MAX], size_t *count,
+                                     memory_peak_token_t admitted) {
     if (!out || !count) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out) * WIFI_TRANSFER_SCAN_MAX); *count = 0;
     wifi_transfer_status_t status;
     wifi_transfer_get_status(&status);
     if (s_wifi || s_http || s_netif || status.state != WIFI_TRANSFER_STOPPED) return ESP_ERR_INVALID_STATE;
     if (!claim_config()) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = ble_pt_network_acquire();
-    if (err != ESP_OK) { release_config(); return err; }
+    memory_peak_token_t peak = 0;
+    esp_err_t err = admitted ? ESP_OK : memory_peak_try_begin(MEMORY_PEAK_WIFI_SCAN, &peak);
+    if (err == ESP_OK) err = ble_pt_network_acquire();
+    if (err != ESP_OK) { release_config(); memory_peak_finish(peak); return err; }
     bool initialized = false, started = false;
     esp_netif_t *scan_netif = NULL;
     const char *stage = "netif";
@@ -1060,7 +1204,12 @@ cleanup:
     ESP_LOGI("transfer", "wifi scan result=%s count=%u", esp_err_to_name(err), (unsigned)*count);
     ble_pt_network_release();
     release_config();
+    memory_peak_finish(peak);
     return err;
+}
+
+esp_err_t wifi_transfer_scan_wifi(wifi_transfer_network_t out[WIFI_TRANSFER_SCAN_MAX], size_t *count) {
+    return wifi_transfer_scan_admitted(out, count, 0);
 }
 
 esp_err_t wifi_transfer_forget_saved_wifi(const char *ssid) {
@@ -1090,7 +1239,8 @@ esp_err_t wifi_transfer_forget_wifi(void) {
 
 static void set_error(esp_err_t err) {
     portENTER_CRITICAL(&s_lock);
-    if (s_status.mode == WIFI_TRANSFER_MODE_STA && s_connection.failed) err = ESP_ERR_TIMEOUT;
+    if (s_status.mode == WIFI_TRANSFER_MODE_STA && s_connection.failed)
+        err = s_status.last_error != ESP_OK ? s_status.last_error : ESP_ERR_TIMEOUT;
     s_status.last_error = err;
     s_status.state = err == ESP_OK ? (s_status.network_ready ? WIFI_TRANSFER_READY : WIFI_TRANSFER_STARTING) : WIFI_TRANSFER_ERROR;
     portEXIT_CRITICAL(&s_lock);
@@ -1101,6 +1251,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     int64_t now = esp_timer_get_time() / 1000;
     bool disconnected = false;
     portENTER_CRITICAL(&s_lock);
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) s_connection.cancel_pending = false;
     if (!s_stopping && base == WIFI_EVENT) {
         if (id == WIFI_EVENT_AP_STACONNECTED) s_status.sta_count++;
         if (id == WIFI_EVENT_AP_STADISCONNECTED && s_status.sta_count) s_status.sta_count--;
@@ -1164,11 +1315,68 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
 }
 
 void wifi_transfer_service_poll(void) {
-    if (!s_started || s_cfg.mode != WIFI_TRANSFER_MODE_STA) return;
-    int64_t now = esp_timer_get_time() / 1000;
+    const int64_t now = esp_timer_get_time() / 1000;
+    memory_peak_token_t completed = 0;
     portENTER_CRITICAL(&s_lock);
-    int action = s_stopping ? 0 : connection_poll(&s_connection, now);
-    unsigned attempts = s_connection.attempts;
+    if (!s_started || s_status.mode != WIFI_TRANSFER_MODE_STA) {
+        portEXIT_CRITICAL(&s_lock);
+        return;
+    }
+    const bool usable = !s_stopping && !s_config_busy && !s_connect_calling;
+    const bool expired = usable && !s_connection.online && !s_connection.failed && now >= s_connection.deadline_ms;
+    if (usable && s_association_peak && !s_connection.cancel_pending &&
+        (s_connection.online || s_connection.pending || s_connection.failed)) {
+        completed = s_association_peak;
+        s_association_peak = 0;
+    }
+    if (expired) {
+        (void)connection_poll(&s_connection, now);
+        s_connection.cancel_pending = s_association_peak != 0;
+        s_connection.next_ms = now;
+        s_cancel_attempts = 0;
+        s_status.network_ready = false; s_status.url[0] = 0;
+        if (s_status.state != WIFI_TRANSFER_UPLOADING) s_status.state = WIFI_TRANSFER_ERROR;
+        if (s_status.last_error == ESP_OK) s_status.last_error = ESP_ERR_TIMEOUT;
+    }
+    const bool cancel = usable && s_connection.cancel_pending && now >= s_connection.next_ms;
+    if (cancel) {
+        s_connect_calling = true;
+        s_connection.next_ms = now + 2000;
+        if (s_cancel_attempts < 3) ++s_cancel_attempts;
+    }
+    const bool due = usable && !expired && !cancel && !s_association_peak && !s_connection.online &&
+        !s_connection.failed && s_connection.pending && now >= s_connection.next_ms;
+    portEXIT_CRITICAL(&s_lock);
+    if (expired) ESP_LOGW("transfer", "sta connection timeout");
+    if (cancel) {
+        const esp_err_t result = esp_wifi_disconnect();
+        portENTER_CRITICAL(&s_lock);
+        const bool driver_down = result == ESP_ERR_WIFI_NOT_INIT || result == ESP_ERR_WIFI_NOT_STARTED;
+        if (driver_down) {
+            s_connection.cancel_pending = false;
+            s_started = false;
+        }
+        if (!s_connection.cancel_pending && s_association_peak) {
+            completed = s_association_peak;
+            s_association_peak = 0;
+        }
+        s_connect_calling = false;
+        portEXIT_CRITICAL(&s_lock);
+    }
+    memory_peak_finish(completed);
+    if (!due) return;
+    memory_peak_token_t peak;
+    if (memory_peak_try_begin(MEMORY_PEAK_WIFI_CONNECT, &peak) != ESP_OK) {
+        portENTER_CRITICAL(&s_lock);
+        // 忙不消耗一次关联尝试。/ Busy does not consume an association attempt.
+        if (s_connection.pending && s_connection.next_ms <= now) s_connection.next_ms = now + 1000;
+        portEXIT_CRITICAL(&s_lock);
+        return;
+    }
+    portENTER_CRITICAL(&s_lock);
+    const int action = (s_stopping || s_config_busy || s_connect_calling || s_association_peak)
+        ? 0 : connection_poll(&s_connection, now);
+    if (action != 0) s_connect_calling = true;
     if (action < 0) {
         s_status.network_ready = false; s_status.url[0] = 0;
         if (s_status.state != WIFI_TRANSFER_UPLOADING) s_status.state = WIFI_TRANSFER_ERROR;
@@ -1176,17 +1384,51 @@ void wifi_transfer_service_poll(void) {
     }
     portEXIT_CRITICAL(&s_lock);
     if (action < 0) {
-        ESP_LOGW("transfer", "sta connection timeout attempts=%u", attempts);
         esp_wifi_disconnect();
-    }
-    if (action == 1) {
-        esp_err_t err = esp_wifi_connect();
-        if (err != ESP_OK) {
-            portENTER_CRITICAL(&s_lock);
-            connection_lost(&s_connection, now); s_status.last_error = err;
-            portEXIT_CRITICAL(&s_lock);
+        portENTER_CRITICAL(&s_lock); s_connect_calling = false; portEXIT_CRITICAL(&s_lock);
+    } else if (action == 1) {
+        const esp_err_t result = esp_wifi_connect();
+        portENTER_CRITICAL(&s_lock);
+        if (result == ESP_OK) {
+            s_association_peak = peak;
+            peak = 0;
+        } else {
+            connection_lost(&s_connection, now);
+            s_status.last_error = result;
         }
+        s_connect_calling = false;
+        portEXIT_CRITICAL(&s_lock);
     }
+    memory_peak_finish(peak);
+}
+
+void wifi_transfer_recover_stuck_sta(void) {
+    const int64_t now = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&s_lock);
+    const bool retry = s_started && s_association_peak && s_connection.cancel_pending && s_cancel_attempts >= 3 &&
+        now >= s_connection.next_ms && !s_config_busy && !s_connect_calling && !s_upload_active && !s_time_active;
+    if (retry) {
+        s_connect_calling = s_stopping = true;
+        s_connection.next_ms = now + 2000;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (!retry) return;
+
+    // 调用方持有无线控制门且没有 Wi-Fi 租约；仅确认驱动停稳后归还。
+    // The caller holds the bearer gate without Wi-Fi leases; release only after the driver is down.
+    const esp_err_t stopped = esp_wifi_stop();
+    memory_peak_token_t completed = 0;
+    portENTER_CRITICAL(&s_lock);
+    if (stopped == ESP_OK || stopped == ESP_ERR_WIFI_NOT_STARTED || stopped == ESP_ERR_WIFI_NOT_INIT) {
+        s_started = s_connection.cancel_pending = false;
+        completed = s_association_peak;
+        s_association_peak = 0;
+    } else {
+        s_stopping = false;
+    }
+    s_connect_calling = false;
+    portEXIT_CRITICAL(&s_lock);
+    memory_peak_finish(completed);
 }
 
 static esp_err_t respond_error(httpd_req_t *req, int code) {
@@ -1227,6 +1469,9 @@ static esp_err_t info_handler(httpd_req_t *req) {
     if (!cJSON_AddBoolToObject(json, "is_flash", s_cfg.is_flash) ||
         !cJSON_AddNumberToObject(json, "free_bytes", (double)s_cfg.free_bytes_cb(s_cfg.free_bytes_ctx)) ||
         !cJSON_AddNumberToObject(json, "file_limit", (double)s_cfg.file_limit) ||
+        !cJSON_AddNumberToObject(json, "book_name_limit", book_upload_name_limit(s_root, s_cfg.is_flash)) ||
+        !cJSON_AddNumberToObject(json, "media_name_limit", TRANSFER_MEDIA_NAME_MAX) ||
+        !cJSON_AddNumberToObject(json, "relative_path_limit", TRANSFER_SD_PATH_MAX) ||
         !cJSON_AddStringToObject(json, "mode", status.mode == WIFI_TRANSFER_MODE_AP ? "ap" : "sta") ||
         !cJSON_AddBoolToObject(json, "wifi_configured", status.wifi_configured) ||
         !cJSON_AddStringToObject(json, "wifi_ssid", status.wifi_ssid) ||
@@ -1280,7 +1525,7 @@ static bool provisioning_request(httpd_req_t *req) {
 
 static bool receive_stopped(void *ctx) {
     (void)ctx;
-    portENTER_CRITICAL(&s_lock); bool stopping = s_stopping; portEXIT_CRITICAL(&s_lock);
+    portENTER_CRITICAL(&s_lock); bool stopping = s_stopping || s_files_disabled; portEXIT_CRITICAL(&s_lock);
     return stopping;
 }
 
@@ -1322,7 +1567,7 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
 }
 
 static int receive_http(void *ctx, char *buf, size_t n) {
-    portENTER_CRITICAL(&s_lock); bool stopping = s_stopping; portEXIT_CRITICAL(&s_lock);
+    portENTER_CRITICAL(&s_lock); bool stopping = s_stopping || s_files_disabled; portEXIT_CRITICAL(&s_lock);
     if (stopping) return -1;
     return httpd_req_recv(ctx, buf, n);
 }
@@ -1466,7 +1711,7 @@ static esp_err_t books_handler(httpd_req_t *req) {
     int resolved = resolve_mutation_path(s_root, name, path, sizeof(path));
     if (resolved) return respond_error(req, resolved);
     portENTER_CRITICAL(&s_lock);
-    bool accepted = admission_begin(s_stopping, &s_upload_active);
+    bool accepted = admission_begin(s_stopping || s_files_disabled, &s_upload_active);
     portEXIT_CRITICAL(&s_lock);
     if (!accepted) return wifi_response(req, "409 Conflict", "{\"error\":\"正在上传或切换网络，请稍后重试\"}");
     file_result_t result = retry ? (file_result_t){.status = !s_cfg.file_changed_cb || s_cfg.file_changed_cb(path) == ESP_OK ? 200 : 500} :
@@ -1507,7 +1752,7 @@ static esp_err_t signature_handler(httpd_req_t *req) {
         !recv_small_body(req, text, sizeof(text)) || !transfer_signature_valid(text, req->content_len)))
         return wifi_response(req, "400 Bad Request", "{\"error\":\"签名最多95字节，不能含换行或控制字符\"}");
     portENTER_CRITICAL(&s_lock);
-    bool accepted = admission_begin(s_stopping, &s_upload_active);
+    bool accepted = admission_begin(s_stopping || s_files_disabled, &s_upload_active);
     portEXIT_CRITICAL(&s_lock);
     if (!accepted) return wifi_response(req, "409 Conflict", "{\"error\":\"正在传输，请完成后再设置签名\"}");
     esp_err_t err = req->method == HTTP_POST ? s_cfg.signature_set_cb(text) :
@@ -1599,7 +1844,7 @@ static esp_err_t titles_handler(httpd_req_t *req) {
     const cJSON *title = json ? cJSON_GetObjectItemCaseSensitive(json, "title") : NULL;
     if (!cJSON_IsString(title) || !title->valuestring) { cJSON_Delete(json); return respond_error(req, 400); }
     portENTER_CRITICAL(&s_lock);
-    bool accepted = admission_begin(s_stopping, &s_upload_active);
+    bool accepted = admission_begin(s_stopping || s_files_disabled, &s_upload_active);
     portEXIT_CRITICAL(&s_lock);
     if (!accepted) { cJSON_Delete(json); return respond_error(req, 409); }
     esp_err_t err = s_cfg.title_set_cb(path, title->valuestring);
@@ -1613,16 +1858,30 @@ static esp_err_t titles_handler(httpd_req_t *req) {
 
 static esp_err_t upload_handler(httpd_req_t *req) {
     if (!management_request(req)) return wifi_response(req, "403 Forbidden", "{\"error\":\"请从设备显示的地址打开管理页面\"}");
-    char query[512], encoded[361], name[121], path[288], part[296], replace[8];
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
-        httpd_query_key_value(query, "name", encoded, sizeof(encoded)) != ESP_OK || !decode_name(encoded, name))
-        return respond_error(req, 400);
+    char query[800], encoded[TRANSFER_BOOK_NAME_MAX * 3 + 1], name[TRANSFER_BOOK_NAME_MAX + 1];
+    char path[288], part[296], backup[320], replace[8];
+    size_t limit = book_upload_name_limit(s_root, s_cfg.is_flash);
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return respond_error(req, 400);
+    esp_err_t query_status = httpd_query_key_value(query, "name", encoded, sizeof(encoded));
+    if (query_status != ESP_OK && query_status != ESP_ERR_HTTPD_RESULT_TRUNC) return respond_error(req, 400);
+    transfer_name_result_t decoded = query_status == ESP_OK ? decode_typed_name(encoded, name, limit + 1, 0) : NAME_TOO_LONG;
+    if (decoded == NAME_TOO_LONG) {
+        char body[112];
+        snprintf(body, sizeof(body), "{\"error\":\"文件名最多 %u 个 UTF-8 字节（含扩展名）\"}", (unsigned)limit);
+        return wifi_response(req, "400 Bad Request", body);
+    }
+    if (decoded != NAME_OK) return respond_error(req, 400);
     int resolved = resolve_mutation_path(s_root, name, path, sizeof(path));
     if (resolved) return respond_error(req, resolved);
-    snprintf(part, sizeof(part), "%s.part", path);
+    const char *actual = strrchr(path, '/') + 1;
+    bool staged = strlen(actual) > TRANSFER_MEDIA_NAME_MAX;
+    if (staged) {
+        if (!staged_book_path(s_root, actual, PART_SUFFIX, part, sizeof(part)) ||
+            !staged_book_path(s_root, actual, BACKUP_SUFFIX, backup, sizeof(backup))) return respond_error(req, 400);
+    } else if (snprintf(part, sizeof(part), "%s" PART_SUFFIX, path) >= (int)sizeof(part)) return respond_error(req, 400);
     bool overwrite = httpd_query_key_value(query, "overwrite", replace, sizeof(replace)) == ESP_OK && !strcmp(replace, "1");
     portENTER_CRITICAL(&s_lock);
-    if (!admission_begin(s_stopping, &s_upload_active)) {
+    if (!admission_begin(s_stopping || s_files_disabled, &s_upload_active)) {
         portEXIT_CRITICAL(&s_lock);
         return wifi_response(req, "503 Service Unavailable", "{\"error\":\"网络正在切换，请连接后重试\"}");
     }
@@ -1632,7 +1891,7 @@ static esp_err_t upload_handler(httpd_req_t *req) {
     portEXIT_CRITICAL(&s_lock);
     int64_t started = esp_timer_get_time();
     ESP_LOGI("transfer", "receive name=%s bytes=%u", name, (unsigned)req->content_len);
-    file_result_t result = upload_managed(path, part, req->content_len, s_cfg.file_limit,
+    file_result_t result = upload_managed(path, part, staged ? backup : NULL, req->content_len, s_cfg.file_limit,
         s_cfg.free_bytes_cb(s_cfg.free_bytes_ctx), overwrite, s_buffer, 16384, receive_http, req, upload_progress, s_cfg.file_changed_cb);
     portENTER_CRITICAL(&s_lock);
     s_upload_active = false;
@@ -1646,7 +1905,8 @@ static esp_err_t upload_handler(httpd_req_t *req) {
 static esp_err_t media_upload_handler(httpd_req_t *req, const char *root, unsigned kind, size_t limit) {
     if (!management_request(req)) return wifi_response(req, "403 Forbidden", "{\"error\":\"请从设备显示的地址打开管理页面\"}");
     if (s_cfg.is_flash) return wifi_response(req, "400 Bad Request", "{\"error\":\"请插入 TF 卡后重试\"}");
-    char query[512], encoded[361], name[121], path[320], part[328], replace[8];
+    char query[512], encoded[TRANSFER_MEDIA_NAME_MAX * 3 + 1], name[TRANSFER_MEDIA_NAME_MAX + 1];
+    char path[320], part[328], replace[8];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
         httpd_query_key_value(query, "name", encoded, sizeof(encoded)) != ESP_OK ||
         !decode_name_limit(encoded, name, sizeof(name), kind)) return respond_error(req, 400);
@@ -1660,7 +1920,7 @@ static esp_err_t media_upload_handler(httpd_req_t *req, const char *root, unsign
     if (set_wallpaper && !s_cfg.wallpaper_set_cb)
         return wifi_response(req, "503 Service Unavailable", "{\"error\":\"锁屏壁纸设置不可用\"}");
     portENTER_CRITICAL(&s_lock);
-    if (!admission_begin(s_stopping, &s_upload_active)) {
+    if (!admission_begin(s_stopping || s_files_disabled, &s_upload_active)) {
         portEXIT_CRITICAL(&s_lock);
         return wifi_response(req, "503 Service Unavailable", "{\"error\":\"网络正在切换，请稍后重试\"}");
     }
@@ -1668,7 +1928,7 @@ static esp_err_t media_upload_handler(httpd_req_t *req, const char *root, unsign
     memcpy(s_status.cur_name, name, strlen(name) + 1);
     s_status.cur_bytes = 0; s_status.cur_total = req->content_len;
     portEXIT_CRITICAL(&s_lock);
-    file_result_t result = upload_managed(path, part, req->content_len,
+    file_result_t result = upload_managed(path, part, NULL, req->content_len,
         set_wallpaper && limit > 2u * 1024u * 1024u ? 2u * 1024u * 1024u : limit,
         s_cfg.free_bytes_cb(s_cfg.free_bytes_ctx), overwrite, s_buffer, 16384, receive_http, req, upload_progress, NULL);
     bool wallpaper_failed = set_wallpaper && result.status == 200 && result.changed && !s_cfg.wallpaper_set_cb(path);
@@ -1700,7 +1960,7 @@ static esp_err_t file_upload_handler(httpd_req_t *req) {
     bool overwrite = httpd_query_key_value(query, "overwrite", replace, sizeof(replace)) == ESP_OK && !strcmp(replace, "1");
     const char *name = strrchr(relative, '/'); name = name ? name + 1 : relative;
     portENTER_CRITICAL(&s_lock);
-    if (!admission_begin(s_stopping, &s_upload_active)) {
+    if (!admission_begin(s_stopping || s_files_disabled, &s_upload_active)) {
         portEXIT_CRITICAL(&s_lock);
         return wifi_response(req, "503 Service Unavailable", "{\"error\":\"网络正在切换，请稍后重试\"}");
     }
@@ -1759,7 +2019,7 @@ static esp_err_t files_list_handler(httpd_req_t *req) {
         while ((entry = readdir(dir))) {
             if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
             size_t len = strlen(entry->d_name);
-            if (!len || len >= sizeof(items[0].name)) continue;
+            if (!len || len >= sizeof(items[0].name) || book_staging_name(entry->d_name, len)) continue;
             char child[512];
             if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) >= (int)sizeof(child)) continue;
             struct stat st;
@@ -2002,7 +2262,7 @@ static esp_err_t files_mutation_handler(httpd_req_t *req) {
     }
     bool accepted;
     portENTER_CRITICAL(&s_lock);
-    accepted = admission_begin(s_stopping, &s_upload_active);
+    accepted = admission_begin(s_stopping || s_files_disabled, &s_upload_active);
     if (accepted) s_status.state = WIFI_TRANSFER_UPLOADING;
     portEXIT_CRITICAL(&s_lock);
     if (!accepted) { cJSON_Delete(json); return files_error(req, "503 Service Unavailable", "{\"error\":\"设备正忙，请稍后重试\"}"); }
@@ -2070,19 +2330,51 @@ static esp_err_t files_mutation_handler(httpd_req_t *req) {
 
 /* ---- 生命周期 / Lifecycle ---- */
 bool wifi_transfer_try_stop_if_idle(void) {
-    if (!cancel_time_sync(false)) return false;
     portENTER_CRITICAL(&s_lock);
-    bool accepted = admission_stop(&s_stopping, s_upload_active);
+    const bool accepted = !s_time_active && !s_config_busy && !s_connect_calling &&
+        admission_stop(&s_stopping, s_upload_active);
     portEXIT_CRITICAL(&s_lock);
-    if (accepted) wifi_transfer_stop();
-    return accepted;
+    if (!accepted) return false;
+    wifi_transfer_stop();
+    wifi_transfer_status_t status;
+    wifi_transfer_get_status(&status);
+    return status.state == WIFI_TRANSFER_STOPPED;
+}
+
+void wifi_transfer_block_local_files(uint32_t session_id) {
+    portENTER_CRITICAL(&s_lock);
+    if (session_id && s_status.session_id == session_id && !s_status.network_only) s_files_disabled = true;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+bool wifi_transfer_detach_http(bool media_lost) {
+    portENTER_CRITICAL(&s_lock);
+    const bool allowed = s_status.mode == WIFI_TRANSFER_MODE_STA && !s_config_busy &&
+        (!s_upload_active || media_lost);
+    if (allowed) s_files_disabled = true;
+    portEXIT_CRITICAL(&s_lock);
+    if (!allowed) return false;
+    if (s_http && httpd_stop(s_http) != ESP_OK) return false;
+    s_http = NULL;
+    const uint32_t session = s_cfg.session_id;
+    s_cfg = (wifi_transfer_cfg_t){.mode = WIFI_TRANSFER_MODE_STA, .network_only = true};
+    free(s_buffer);
+    s_buffer = NULL;
+    portENTER_CRITICAL(&s_lock);
+    s_memory_internal = s_memory_psram = 0;
+    s_status.network_only = true;
+    // 保留状态快照的编号和变更计数供原页面读取；恢复配置不再持有页面资源。
+    // Keep owner and counts in the snapshot; restore no longer retains page resources.
+    s_status.session_id = session;
+    portEXIT_CRITICAL(&s_lock);
+    return true;
 }
 
 bool wifi_transfer_pause_for_sleep(void) {
     if (!cancel_time_sync(false)) return false;
     wifi_transfer_status_t status;
     wifi_transfer_get_status(&status);
-    if (status.state == WIFI_TRANSFER_STOPPED) return true;
+    if (!status.owns_radio) return true;
     if (status.state == WIFI_TRANSFER_UPLOADING) return false;
     wifi_transfer_cfg_t saved = s_cfg;
     if (saved.root_dir) {
@@ -2095,56 +2387,118 @@ bool wifi_transfer_pause_for_sleep(void) {
     return true;
 }
 
-void wifi_transfer_resume_after_sleep(void) {
-    if (!s_sleep_paused) return;
-    s_sleep_paused = false;
-    esp_err_t err = wifi_transfer_start(&s_sleep_cfg);
-    if (err != ESP_OK) ESP_LOGW("transfer", "resume after sleep: %s", esp_err_to_name(err));
+esp_err_t wifi_transfer_resume_after_sleep(void) {
+    if (!s_sleep_paused) return ESP_OK;
+    const esp_err_t err = wifi_transfer_start(&s_sleep_cfg);
+    if (!memory_peak_is_busy(err)) s_sleep_paused = false;
+    if (err != ESP_OK && !memory_peak_is_busy(err))
+        ESP_LOGW("transfer", "resume after sleep: %s", esp_err_to_name(err));
+    return err;
+}
+
+static void wifi_release_ble(void) {
+    if (!s_ble_network_reserved) return;
+    s_ble_network_reserved = false;
+    ble_pt_network_release();
 }
 
 void wifi_transfer_stop(void) {
     if (!cancel_time_sync(false)) return;
     portENTER_CRITICAL(&s_lock); s_stopping = true; portEXIT_CRITICAL(&s_lock);
-    if (s_http) { httpd_stop(s_http); s_http = NULL; }
+    esp_err_t result = ESP_OK;
+    memory_peak_token_t association = 0;
+    if (s_http) {
+        result = httpd_stop(s_http);
+        if (result != ESP_OK) goto stop_failed;
+        s_http = NULL;
+    }
     portENTER_CRITICAL(&s_lock); s_memory_internal = 0; portEXIT_CRITICAL(&s_lock);
-    if (s_started) { esp_wifi_stop(); s_started = false; }
+    if (s_started) {
+        result = esp_wifi_stop();
+        if (result != ESP_OK && result != ESP_ERR_WIFI_NOT_STARTED && result != ESP_ERR_WIFI_NOT_INIT) goto stop_failed;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_started = false;
+    association = s_association_peak;
+    s_association_peak = 0;
+    portEXIT_CRITICAL(&s_lock);
     if (s_events) { esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_events); s_events = NULL; }
     if (s_ip_events) { esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, s_ip_events); s_ip_events = NULL; }
-    if (s_wifi) { esp_wifi_deinit(); s_wifi = false; }
+    if (s_wifi) {
+        result = esp_wifi_deinit();
+        if (result != ESP_OK && result != ESP_ERR_WIFI_NOT_INIT) goto stop_failed;
+        s_wifi = false;
+    }
     if (s_netif) { esp_netif_destroy_default_wifi(s_netif); s_netif = NULL; }
     if (s_loop_owned) { esp_event_loop_delete_default(); s_loop_owned = false; }
     portENTER_CRITICAL(&s_lock); s_memory_psram = 0; portEXIT_CRITICAL(&s_lock);
     free(s_buffer); s_buffer = NULL;
-    if (s_ble_network_reserved) { s_ble_network_reserved = false; ble_pt_network_release(); }
+    wifi_release_ble();
     portENTER_CRITICAL(&s_lock);
     s_status.state = WIFI_TRANSFER_STOPPED; s_status.sta_count = 0;
+    s_status.owns_radio = false;
     s_status.network_ready = false; s_status.url[0] = 0;
     s_upload_active = false;
     memset(&s_connection, 0, sizeof(s_connection));
     portEXIT_CRITICAL(&s_lock);
+    memory_peak_finish(association);
+    return;
+stop_failed:
+    portENTER_CRITICAL(&s_lock);
+    s_status.state = WIFI_TRANSFER_ERROR;
+    s_status.network_ready = false;
+    if (!s_connection.failed || s_status.last_error == ESP_OK) s_status.last_error = result;
+    if (s_association_peak) {
+        // 停驱动失败：继续等待断开确认，禁止再接收文件。/ Failed to stop the driver: keep seeking disconnect confirmation, with HTTP writes blocked.
+        s_files_disabled = true;
+        s_stopping = false;
+        if (!s_connection.failed) {
+            s_connection.failed = s_connection.cancel_pending = true;
+            s_connection.next_ms = 0;
+            s_cancel_attempts = 0;
+        }
+    }
+    portEXIT_CRITICAL(&s_lock);
+    memory_peak_finish(association);
 }
 
-esp_err_t wifi_transfer_start(const wifi_transfer_cfg_t *cfg) {
+esp_err_t wifi_transfer_start_admitted(const wifi_transfer_cfg_t *cfg, memory_peak_token_t admitted) {
     if (!cfg || (cfg->network_only && cfg->mode != WIFI_TRANSFER_MODE_STA) ||
         (!cfg->network_only && (!cfg->root_dir || !cfg->free_bytes_cb)) ||
         (cfg->root_dir && strlen(cfg->root_dir) >= sizeof(s_root)) ||
         (cfg->mode != WIFI_TRANSFER_MODE_AP && cfg->mode != WIFI_TRANSFER_MODE_STA)) return ESP_ERR_INVALID_ARG;
-    if (!cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
     if (!claim_config()) return ESP_ERR_INVALID_STATE;
     if (s_wifi || s_netif || s_http) { release_config(); return ESP_ERR_INVALID_STATE; }
-    // 先回收 BLE 内存，再创建 WiFi/HTTP；失败不半途启动。/ Reclaim BLE before WiFi/HTTP allocation; never start partially on a failed stop.
-    const esp_err_t reserve = ble_pt_network_acquire();
-    if (reserve != ESP_OK) { release_config(); return reserve; }
+    memory_peak_token_t peak = 0;
+    esp_err_t reserve = admitted ? ESP_OK : memory_peak_try_begin(MEMORY_PEAK_WIFI, &peak);
+    if (reserve == ESP_OK) reserve = ble_pt_network_acquire();
+    if (reserve != ESP_OK) { release_config(); memory_peak_finish(peak); return reserve; }
     s_ble_network_reserved = true;
+    // 仅核对明确的 HTTP 栈和传输缓冲，不猜测驱动峰值。/ Check only known HTTP stack and transfer buffer, not driver peaks.
+    if (!cfg->network_only) {
+        reserve = memory_peak_check((memory_peak_heap_t){12288, 12288, 16384, 16384});
+        if (reserve != ESP_OK) {
+            wifi_release_ble();
+            release_config();
+            memory_peak_finish(peak);
+            return reserve;
+        }
+    }
+    const wifi_transfer_cfg_t previous = s_cfg;
+    char previous_root[sizeof(s_root)];
+    memcpy(previous_root, s_root, sizeof(previous_root));
     s_cfg = *cfg;
-    if (cfg->root_dir) strcpy(s_root, cfg->root_dir);
-    else s_root[0] = 0;
+    if (cfg->root_dir && cfg->root_dir != s_root) strcpy(s_root, cfg->root_dir);
+    else if (!cfg->root_dir) s_root[0] = 0;
     s_cfg.root_dir = s_root;
     portENTER_CRITICAL(&s_lock);
     memset(&s_status, 0, sizeof(s_status)); s_status.state = WIFI_TRANSFER_STARTING;
     s_stopping = s_upload_active = false;
     s_status.mode = cfg->mode;
     s_status.network_only = cfg->network_only;
+    s_status.session_id = cfg->session_id;
+    s_status.owns_radio = true;
+    s_files_disabled = false;
     portEXIT_CRITICAL(&s_lock);
     transfer_credentials_t saved = {0};
     wifi_config_t wifi = {0};
@@ -2156,7 +2510,7 @@ esp_err_t wifi_transfer_start(const wifi_transfer_cfg_t *cfg) {
         struct stat st;
         if (stat(cfg->root_dir, &st) || !S_ISDIR(st.st_mode)) { err = ESP_ERR_NOT_FOUND; goto fail; }
         unsigned removed = 0, restored = 0;
-        if (cleanup_interrupted(cfg->root_dir, &removed, &restored)) {
+        if (cleanup_interrupted(cfg->root_dir, book_upload_name_limit(cfg->root_dir, cfg->is_flash), &removed, &restored)) {
             ESP_LOGW("transfer", "cleanup failed removed=%u restored=%u", removed, restored);
             err = ESP_FAIL; goto fail;
         }
@@ -2284,7 +2638,7 @@ esp_err_t wifi_transfer_start(const wifi_transfer_cfg_t *cfg) {
     if (power_err != ESP_OK) ESP_LOGW("transfer", "disable wifi power save: %s", esp_err_to_name(power_err));
     err = esp_wifi_set_max_tx_power(48); // 0.25 dBm units, vendor kMetalioWifiMaxTxPower / 0.25 dBm 单位，同厂商 kMetalioWifiMaxTxPower
     if (err != ESP_OK) ESP_LOGW("transfer", "cap tx power 12 dBm: %s", esp_err_to_name(err));
-    s_started = true;
+    portENTER_CRITICAL(&s_lock); s_started = true; portEXIT_CRITICAL(&s_lock);
     if (cfg->mode == WIFI_TRANSFER_MODE_AP) {
         portENTER_CRITICAL(&s_lock);
         s_status.network_ready = true; strcpy(s_status.url, WIFI_TRANSFER_URL);
@@ -2294,12 +2648,31 @@ esp_err_t wifi_transfer_start(const wifi_transfer_cfg_t *cfg) {
     } else {
         int64_t now = esp_timer_get_time() / 1000;
         portENTER_CRITICAL(&s_lock); connection_begin(&s_connection, now); portEXIT_CRITICAL(&s_lock);
-        wifi_transfer_service_poll();
     }
     release_config();
+    memory_peak_finish(peak);
+    if (!admitted && cfg->mode == WIFI_TRANSFER_MODE_STA) wifi_transfer_service_poll();
     return ESP_OK;
 fail:
     clear_secret(&wifi, sizeof(wifi)); clear_secret(&saved, sizeof(saved));
-    wifi_transfer_stop(); release_config(); set_error(err); return err;
+    wifi_transfer_stop();
+    if (!s_wifi && !s_netif && !s_http) {
+        // 恢复事务仍需上一会话的配置；未拆干净时不可覆盖活动回调。
+        // Keep the previous config for rollback; never overwrite callbacks while teardown is incomplete.
+        s_cfg = previous;
+        memcpy(s_root, previous_root, sizeof(s_root));
+    }
+    release_config(); set_error(err);
+    memory_peak_finish(peak);
+    return err;
 }
+esp_err_t wifi_transfer_start(const wifi_transfer_cfg_t *cfg) {
+    return wifi_transfer_start_admitted(cfg, 0);
+}
+
+esp_err_t wifi_transfer_restore_admitted(memory_peak_token_t admitted) {
+    const wifi_transfer_cfg_t saved = s_cfg;
+    return wifi_transfer_start_admitted(&saved, admitted);
+}
+
 #endif

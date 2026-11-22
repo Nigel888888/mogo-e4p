@@ -28,6 +28,7 @@ void epd_set_rotation(enum EpdRotation value){rotation=value;}
 typedef struct {bool active;uint16_t x,y;} point_t;
 typedef struct {bool touched;uint8_t count;uint16_t x,y;point_t points[2];uint8_t raw[16];} app_touch_t;
 typedef int esp_err_t;
+typedef struct {bool physical_touch_active;int64_t screen_touch_cutoff_ms;} app_ctx_t;
 #define ESP_OK 0
 '''
 policy += re.search(r'typedef struct \{[^{}]*\} app_input_touch_filter_t;',
@@ -35,8 +36,8 @@ policy += re.search(r'typedef struct \{[^{}]*\} app_input_touch_filter_t;',
 policy += "\n".join(re.findall(r'^#define UI_KEY[^\n]*',
                                (ROOT / "main/ui/ui_menu.h").read_text(), re.M)) + "\n"
 policy += function("ui_key_hit_test", ROOT / "main/ui/ui_menu.c") + "\n"
-policy += function("app_input_filter_screen_touch", ROOT / "main/app/app_input.c") + "\n"
-policy += function("app_input_rotate_touch", ROOT / "main/app/app_input.c")
+policy += function("app_input_rotate_touch", ROOT / "main/app/app_input.c") + "\n"
+policy += function("app_input_filter_screen_touch", ROOT / "main/app/app_input.c")
 policy += r'''
 static void physical(int x,int y,int *px,int *py){
  switch(rotation){case 0:*px=x;*py=y;break;case 1:*px=1215-y;*py=x;break;
@@ -47,6 +48,7 @@ static bool stable(reader_orientation_t *s,int x,int y,int z,int64_t t,display_o
  return reader_orientation_feed(s,x,y,z,false,t+500,next);
 }
 int main(void){
+ app_ctx_t ctx={0};
  for(int d=0;d<4;++d){
   display_orientation_set(d);assert(display_orientation_get()==(display_orientation_t)d);
   // 每个屏内像素都必须落到原竖屏触点对应的同一物理像素。
@@ -56,22 +58,22 @@ int main(void){
    assert(px==y&&py==683-x);
    app_input_touch_filter_t filter={0};
    app_touch_t blocked={.touched=true,.count=1,.x=x,.y=y};
-   assert(app_input_filter_screen_touch(&filter,&blocked,ESP_OK,true));
-   app_input_rotate_touch(&blocked);assert(!blocked.touched&&!blocked.count);
+   assert(app_input_filter_screen_touch(&filter,&blocked,ESP_OK,true,&ctx,0));
+   assert(!blocked.touched&&!blocked.count);
   }
   app_touch_t touch={.touched=true,.x=15,.y=34,.points={{true,15,34},{true,650,1100}}};
   memset(touch.raw,0xa6,sizeof(touch.raw));uint16_t x=650,y=1100;display_orientation_touch(&x,&y);
-  app_input_rotate_touch(&touch);assert(touch.x==touch.points[0].x&&touch.y==touch.points[0].y);
+  assert(app_input_rotate_touch(&touch));assert(touch.x==touch.points[0].x&&touch.y==touch.points[0].y);
   assert(touch.points[1].x==x&&touch.points[1].y==y);
   for(unsigned i=0;i<sizeof(touch.raw);++i)assert(touch.raw[i]==0xa6);
   touch=(app_touch_t){.touched=true,.x=240,.y=1500,.points={{true,240,1500},{false,12,13}}};
-  app_input_rotate_touch(&touch);assert(touch.x==240&&touch.y==1500&&touch.points[0].y==1500);
+  assert(app_input_rotate_touch(&touch));assert(touch.x==240&&touch.y==1500&&touch.points[0].y==1500);
   assert(touch.points[1].x==12&&touch.points[1].y==13);
   for(int key=0;key<UI_KEY_COUNT;++key){
    app_input_touch_filter_t filter={0};
    touch=(app_touch_t){.touched=true,.count=1,.x=key*UI_KEY_PITCH+80,.y=1500};
-   assert(!app_input_filter_screen_touch(&filter,&touch,ESP_OK,true));
-   app_input_rotate_touch(&touch);assert(touch.touched&&touch.x==key*UI_KEY_PITCH+80&&touch.y==1500);
+   assert(!app_input_filter_screen_touch(&filter,&touch,ESP_OK,true,&ctx,0));
+   assert(touch.touched&&touch.x==key*UI_KEY_PITCH+80&&touch.y==1500);
   }
  }
  reader_orientation_t state={0};display_orientation_t next=DISPLAY_ORIENTATION_PORTRAIT;
@@ -100,6 +102,7 @@ int main(void){
 # Reuse the fake font while exercising the real orientation transaction, session and paginator.
 layout = (ROOT / "tools/book_layout_host_test.c").read_text().split("static void session_layout_lifecycle(void) {")[0]
 layout += r'''
+#include "memory_peak.h"
 #include "reader_orientation.h"
 #define UI_BAR_H 96
 #define UI_BAR_MARGIN 24
@@ -112,7 +115,11 @@ enum {MARGIN_LEFT,MARGIN_RIGHT,MARGIN_TOP,MARGIN_BOTTOM,MARGIN_COUNT};
 enum {READING,SHELF,TOC};
 enum {READER_PANEL_NONE,READER_PANEL_TOOLS,READER_PANEL_SETTINGS};
 typedef struct {int unused;} book_shake_gate_t;
-typedef struct {void *acc;uint8_t *fb;} app_ctx_t;
+typedef struct {void *acc;uint8_t *fb;int64_t now_ms;} app_ctx_t;
+typedef enum {APP_REDRAW_NONE, APP_REDRAW_PAGE} app_redraw_t;
+static char s_reader_notice[128];
+static int64_t s_reader_notice_until;
+static void copy_text(char *out, size_t size, const char *text){snprintf(out,size,"%s",text);}
 static reader_session_t s_reader_session;
 static reader_orientation_t s_orientation;
 static display_orientation_t direction;
@@ -141,6 +148,7 @@ static int64_t esp_timer_get_time(void){return 123000000;}
 static void lock_draw(void){assert(!locks);++locks;}
 static void unlock_draw(void){assert(locks==1);--locks;test_zero_width=false;}
 static void invalidate_prep(void){++invalidates;}
+static void reader_prefetch_discard(void){assert(!locks);invalidate_prep();}
 static void release_page_images(void){++releases;}
 static void prepare_inline_image(void){++prepared;}
 static void save_progress(void){++saves;}
@@ -160,10 +168,11 @@ static reader_dims_ctx_t s_reader_dims_ctx;
 static void reader_bind_chapter(void){s_text=s_reader_session.content.utf8;}
 static void app_font_activate_system(void){}
 '''
+layout += re.search(r'^static const char s_landscape_turn_notice\[\] = .+;$', BOOK.read_text(), re.M).group(0) + "\n"
 for name in ("reader_footer_height", "reader_area", "body_rect_for_tracking", "body_rect",
              "reader_status_area", "progress_rect", "reader_tools_area", "reader_page_offset",
              "free_book", "reader_reflow_build", "reader_orientation_apply", "reader_orientation_portrait",
-             "reader_orientation_sync", "rotation_available", "rotation_enabled", "on_rotation_toggle", "on_system_overlay"):
+             "reader_orientation_sync", "reader_notice_tick", "rotation_available", "rotation_enabled", "on_rotation_toggle", "on_system_overlay"):
     layout += function(name, BOOK) + "\n"
 layout += r'''
 static char text[24001];
@@ -185,20 +194,26 @@ int main(void){
   book_layout_set_vertical(vertical);s_chrome_visible[0]=s_chrome_visible[1]=!full;statusbar=status;
   for(int d=1;d<=4;++d){
    display_orientation_t next=(display_orientation_t)(d%4);assert(reader_orientation_apply(next));s_orientation.locked=next;
+   bool landscape=next==DISPLAY_ORIENTATION_LEFT||next==DISPLAY_ORIENTATION_RIGHT;
+   assert(landscape?(!strcmp(s_reader_notice,s_landscape_turn_notice)&&s_reader_notice_until==126000):!s_reader_notice[0]);
    assert(!locks&&reader_page_offset(s_reader_session.position.page)==anchor);
    size_t page=s_reader_session.position.page;assert(book_layout_page_start_offset(page)<=anchor&&book_layout_page_start_offset(page+1)>anchor);
    in_screen(body_rect());in_screen(reader_area());if(status||!full)in_screen(reader_status_area());if(!full)in_screen(progress_rect());in_screen(reader_tools_area());
    if(next){int before=rendered;on_system_overlay(&ctx);assert(direction==0&&rendered==before+1&&s_orientation.locked==next&&s_orientation.automatic);
-    assert(reader_orientation_sync()&&direction==next&&reader_page_offset(s_reader_session.position.page)==anchor);}
+    assert(reader_orientation_sync()&&direction==next&&reader_page_offset(s_reader_session.position.page)==anchor);
+    assert(!s_reader_notice[0]);}
   }
  }
  s_chrome_visible[0]=s_chrome_visible[1]=true;statusbar=true;book_layout_set_vertical(false);
  assert(reader_orientation_apply(DISPLAY_ORIENTATION_RIGHT));s_orientation.locked=DISPLAY_ORIENTATION_RIGHT;
+ assert(strstr(s_reader_notice,"仅支持普通翻页"));
+ ctx.now_ms=s_reader_notice_until-1;assert(reader_notice_tick(&ctx)==APP_REDRAW_NONE&&s_reader_notice[0]);
+ ++ctx.now_ms;assert(reader_notice_tick(&ctx)==APP_REDRAW_PAGE&&!s_reader_notice[0]);
  on_rotation_toggle(&ctx);assert(!s_orientation.automatic&&s_orientation.locked==DISPLAY_ORIENTATION_RIGHT);
  s_reader_panel=READER_PANEL_SETTINGS;assert(!rotation_available(&ctx)&&reader_orientation_sync()&&direction==0);
  s_reader_panel=READER_PANEL_NONE;assert(reader_orientation_sync()&&direction==1);
  int before=saves;fail_mask=1;build_attempt=0;
- assert(!reader_orientation_apply(DISPLAY_ORIENTATION_LEFT));assert(direction==1&&saves==before&&!locks);
+ assert(!reader_orientation_apply(DISPLAY_ORIENTATION_LEFT));assert(direction==1&&saves==before&&!locks&&!s_reader_notice[0]);
  assert(reader_page_offset(s_reader_session.position.page)==anchor&&s_orientation_retry_ms==125000);
  // 竖屏目标失败但原布局恢复：系统入口仍必须清理到竖屏；双失败也不能留下无效借用。
  // If portrait fails but the old layout restores, the system boundary still closes in portrait; double failures must also release invalid borrows.
@@ -206,9 +221,9 @@ int main(void){
  open_book();s_orientation.automatic=true;fail_mask=3;build_attempt=0;
  assert(reader_orientation_apply(DISPLAY_ORIENTATION_RIGHT));assert(direction==0&&s_view==SHELF&&!s_text&&!s_reader_session.layout_owned&&!s_orientation.automatic);
  fail_mask=0;open_book();assert(reader_orientation_apply(DISPLAY_ORIENTATION_LEFT));s_orientation.automatic=true;
- free_book();assert(direction==0&&!s_text&&!s_reader_session.layout_owned&&!s_orientation.automatic&&!s_orientation_retry_ms&&!locks);
+ free_book();assert(direction==0&&!s_text&&!s_reader_session.layout_owned&&!s_orientation.automatic&&!s_orientation_retry_ms&&!locks&&!s_reader_notice[0]);
  assert(invalidates>10&&releases>10&&prepared>10&&saves>10);
- puts("PASS: real reader/session/paginator preserve text anchors through four orientations, chrome bounds, system round trips, manual lock, rollback, double failure and close cleanup");
+ puts("PASS: real reader/session/paginator preserve text anchors through four orientations, chrome bounds, system round trips, manual lock, landscape notice/timeout, rollback, double failure and close cleanup");
 }
 '''
 
@@ -221,9 +236,9 @@ with tempfile.TemporaryDirectory(prefix="reader-orientation-") as directory:
     flags = ["-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-Wno-unused-variable",
              "-g", "-fsanitize=address,undefined", "-Imain/book", "-Imain/display"]
     for name, source, extra in (
-        ("policy", policy, ["-I" + str(stub), "main/display/display_orientation.c", "main/book/reader_orientation.c"]),
+        ("policy", policy, ["-I" + str(stub), "main/display/display_orientation.c", "components/epdiy/src/epd_output_offset.c", "-Icomponents/epdiy/src", "main/book/reader_orientation.c"]),
         ("layout", layout, ["-Itools/book_layout_stubs", "-Itools/book_source_host_stubs", "main/book/reader_session.c",
-                            "main/book/book_layout.c", "main/book/html_text.c", "main/book/reader_orientation.c"]),
+                            "main/book/book_layout.c", "main/book/book_hyphen_en.c", "main/book/html_text.c", "main/book/reader_orientation.c"]),
     ):
         path, binary = work / f"{name}.c", work / name
         path.write_text(source)

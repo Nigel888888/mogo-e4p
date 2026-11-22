@@ -15,6 +15,8 @@
 typedef struct {
     EpdRect area;
     EpdRect crop_to;
+    int offset_x; ///< 原生横向扫描偏移 / Native horizontal scan offset
+    int offset_y; ///< 原生纵向扫描偏移 / Native vertical scan offset
     const bool* drawn_lines;
     const uint8_t* data_ptr;
 
@@ -64,12 +66,15 @@ typedef struct {
 
     /// LUT lookup function. Must not be NULL.
     lut_func_t lut_lookup_func;
+    bool lut_msb_first;
     /// LUT building function. Must not be NULL
     lut_build_func_t lut_build_func;
 
     // 同一物理扫描中的逐行或逐列错相 LUT。/ Per-line or per-column staggered LUTs in one physical scan.
     const uint8_t* const* phase_luts;
     const int8_t* line_phase;
+    const uint8_t* line_outer_lut;
+    int line_inner_x0, line_inner_x1;
     const int* col_band_x0;
     const int* col_band_x1;
     const int8_t* col_band_phase;
@@ -114,5 +119,5 @@ void prepare_context_for_next_frame(RenderContext_t* ctx);
  * don't inline for to ensure availability in tests.
  */
 void __attribute__((noinline)) epd_populate_line_mask(
-    uint8_t* line_mask, const uint8_t* dirty_columns, int mask_len
+    uint8_t* line_mask, const uint8_t* dirty_columns, int mask_len, bool msb_first
 );

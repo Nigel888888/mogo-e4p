@@ -19,6 +19,8 @@ typedef enum {
 } book_kind_t;
 /// 打开并替换当前书源。/ Open and replace the current source.
 esp_err_t book_open(const char *path);
+/// 已知的单个必需 PSRAM 块下限；零表示需解析书源才能估算。/ Known mandatory PSRAM block; zero means the source must be parsed first.
+size_t book_open_min_psram_block(const char *path);
 /// 关闭书源并释放目录。/ Close the source and free its index.
 void book_close(void);
 /// 当前书是 EPUB 时切换书内自带字体；TXT/MOBI 无事发生。改动在下一章解析时生效。
@@ -42,8 +44,8 @@ esp_err_t book_chapter_title(size_t i, char *buf, size_t cap);
 esp_err_t book_chapter_source_name(size_t i, char *buf, size_t cap);
 /// 加载 NUL 结尾的 PSRAM UTF-8；调用方 free。/ Load NUL-terminated PSRAM UTF-8; caller frees it.
 esp_err_t book_chapter_load(size_t i, char **utf8, size_t *len);
-/// 保留 EPUB/MOBI 标题/段落块，并为 TXT 章节标题生成正文行块；调用方 html_text_free。
-/// Preserve EPUB/MOBI heading/paragraph blocks and build TXT heading/line blocks; caller uses html_text_free.
+/// 保留 EPUB/MOBI 标题/段落块；TXT 的 blocks 为 NULL，调用方 html_text_free。
+/// Preserve EPUB/MOBI heading/paragraph blocks; TXT has NULL blocks; caller uses html_text_free.
 esp_err_t book_chapter_load_blocks(size_t i, html_text_t *out);
 esp_err_t book_chapter_load_blocks_anchor(size_t i, const char *anchor,
                                            size_t *anchor_offset, html_text_t *out);
@@ -63,8 +65,7 @@ uint32_t book_chapter_byte_offset(size_t i);
 /// 当前类型；关闭时默认 TXT。/ Current kind, defaulting to TXT when closed.
 book_kind_t book_kind(void);
 
-/// 当前三种书源都能提供章节题头；阅读路径只在有正文时调用它。
-/// All three source kinds can provide chapter headings; the reader calls this only with content.
-static inline bool book_has_chapter_headings(void) { return true; }
+/// 按书源能力启用章节题头，MOBI 不伪装为 EPUB。/ Enable chapter headings by capability without disguising MOBI as EPUB.
+static inline bool book_has_chapter_headings(void) { return book_kind() != BOOK_KIND_TXT; }
 
 esp_err_t book_chapter_image_dimensions(size_t chapter, const char *src, unsigned *width, unsigned *height);

@@ -26,8 +26,8 @@ reader_turn_result_t reader_turn_move(reader_position_t *position, int direction
 
 reader_turn_effects_t reader_turn_effects(const reader_turn_frame_t *frame) {
     return (reader_turn_effects_t){
-        .text = !frame->chrome_changed && frame->area_redraw && frame->from_text &&
-                !frame->images && !frame->background,
+        .text = !frame->chrome_changed && frame->area_redraw && !frame->images &&
+                (frame->background ? frame->from_stable : frame->from_text),
         .water = !frame->chrome_changed && frame->area_redraw && !frame->cleanup &&
                  frame->water_effect && frame->from_stable && !frame->images,
         .footer_strong = !frame->chrome_changed && !frame->cleanup && frame->chapter_changed,

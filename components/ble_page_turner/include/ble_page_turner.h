@@ -21,6 +21,10 @@
 
 #include "esp_err.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // 扫描结果上限；满了就不再收新的，覆盖会打乱列表。/ Scan capacity; later results are dropped.
 #define BLE_PT_MAX_DEVICES 24
 // 已配对设备上限。/ Maximum bonded peers.
@@ -150,10 +154,20 @@ esp_err_t ble_pt_stop(uint32_t timeout_ms);
 /// sleep -- its first HCI command after wake trips an internal BTDM controller assert.
 esp_err_t ble_pt_stop_for_sleep(uint32_t timeout_ms);
 bool ble_pt_running(void);
-/// WiFi 分配前释放蓝牙并禁止重启，结束后释放占用；失败不允许继续分配网络。
-/// Stop BLE before WiFi allocations and inhibit restarts until released; abort networking on failure.
+/// 无副作用的冲突预检；实际取得占用时会在同一生命周期锁下复核。/ Non-mutating preflight; acquisition rechecks under the lifecycle gate.
+esp_err_t ble_pt_network_check(void);
+/// WiFi 只暂停空闲蓝牙；连接、配对或扫描时拒绝。/ WiFi may suspend idle BLE only; reject an active link, pairing or scan.
 esp_err_t ble_pt_network_acquire(void);
 void ble_pt_network_release(void);
+/// NT26 服务独占持有；停止并清理后归还，不改变 BLE 开关。/ NT26 owns this until teardown; never changes the BLE preference.
+esp_err_t ble_pt_cellular_acquire(void);
+void ble_pt_cellular_release(void);
+bool ble_pt_cellular_paused(void);
+/// 网络独占实际持有暂停权。/ An exclusive network user actually holds the pause.
+bool ble_pt_network_paused(void);
+/// 新开启的只读预检；非空为静态提示，不更改开关、失败计数或租约。起栈仍重新检查。
+/// Read-only preflight for a new enable; non-null is a static hint. No settings, counters, or lease changes. Start still rechecks.
+const char *ble_pt_enable_block_reason(void);
 
 /// 主循环每次迭代泵一次：驱动自动重连与按键自动重复。很轻，不阻塞。
 /// Pump once per main-loop iteration: drives auto-reconnect and key auto-repeat. Cheap.
@@ -279,3 +293,7 @@ ble_pt_action_t ble_pt_action_for_frame(const ble_pt_frame_t *frame);
 /// Resolve a HID usage to an action via the built-in map only; separate because a usage has
 /// no raw code. The built-in map covers the YueXingTong protocol: 0x01 previous, 0x02 next.
 ble_pt_action_t ble_pt_action_for_usage(uint8_t usage, uint8_t mods);
+
+#ifdef __cplusplus
+}
+#endif

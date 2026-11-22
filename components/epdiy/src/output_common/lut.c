@@ -426,14 +426,15 @@ void IRAM_ATTR epd_apply_line_mask(uint8_t* buf, const uint8_t* mask, int len) {
 }
 
 LutFunctionPair find_lut_functions(enum EpdDrawMode mode, uint32_t lut_size) {
-    LutFunctionPair pair;
-    pair.build_func = NULL;
-    pair.lookup_func = NULL;
+    LutFunctionPair pair = {0};
 
     if (mode & MODE_PACKING_1PPB_DIFFERENCE) {
         if (!(mode & MODE_FORCE_NO_PIE) && lut_size >= 1024) {
             pair.build_func = &epd_build_1ppB_lut_1k;
             pair.lookup_func = &calc_epd_input_1ppB_1k_S3_VE;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+            pair.msb_first = true;
+#endif
             return pair;
         } else if (lut_size >= 1 << 16) {
             pair.build_func = &build_1ppB_lut_64k;

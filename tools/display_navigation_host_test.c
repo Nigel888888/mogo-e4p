@@ -15,12 +15,12 @@
 #define W 1216
 #define H 684
 #define BYTES (W * H / 2)
-const EpdWaveform E0470_WAVEFORM = {0}, E0470_FOLLOW_WAVEFORM = {1},
-    E0470_FULL_WAVEFORM = {2}, E0470_GRAY8_WAVEFORM = {3},
-    E0470_CAPSULE_DRAG_WAVEFORM = {4}, E0470_CAPSULE_WHITE_WAVEFORM = {5},
-    E0470_CAPSULE_GRAY_WAVEFORM = {6}, E0470_APPLY_WAVEFORM = {7};
-static const EpdWaveform main_gray = {4}, main_exit = {5}, main_water = {6}, main_bw = {7}, main_acrylic = {8}, main_acrylic_clean = {9};
-static const EpdWaveform reader_soft = {10}, reader_water = {11};
+const EpdWaveform E0470_WAVEFORM = {.num_modes=0}, E0470_FOLLOW_WAVEFORM = {.num_modes=1},
+    E0470_FULL_WAVEFORM = {.num_modes=2}, E0470_GRAY8_WAVEFORM = {.num_modes=3},
+    E0470_CAPSULE_DRAG_WAVEFORM = {.num_modes=4}, E0470_CAPSULE_WHITE_WAVEFORM = {.num_modes=5},
+    E0470_CAPSULE_GRAY_WAVEFORM = {.num_modes=6}, E0470_APPLY_WAVEFORM = {.num_modes=7};
+static const EpdWaveform main_gray = {.num_modes=4}, main_exit = {.num_modes=5}, main_water = {.num_modes=6}, main_bw = {.num_modes=7}, main_acrylic = {.num_modes=8}, main_acrylic_clean = {.num_modes=9};
+static const EpdWaveform reader_soft = {.num_modes=10}, reader_water = {.num_modes=11};
 const EpdWaveform* display_reader_text_waveform(void) {return &reader_soft;}
 const EpdWaveform* display_reader_water_waveform(void) {return &reader_water;}
 static app_main_refresh_mode_t main_mode=APP_MAIN_REFRESH_FAST;
@@ -87,6 +87,17 @@ bool epd_power_scan_allowed(void) { return board_rails_on(); }
 void epd_power_session_begin(void) {}
 void epd_power_session_end(void) {}
 EpdRect epd_full_screen(void) { return (EpdRect){0, 0, W, H}; }
+void epd_leading_skip_discard(void) {}
+void epd_leading_skip_forget_waveform(void) {}
+enum EpdDrawError epd_draw_base(EpdRect area, const uint8_t* data, EpdRect crop,
+    enum EpdDrawMode mode, int temperature, const bool* lines,
+    const uint8_t* columns, const EpdWaveform* waveform) {
+    (void)area; (void)data; (void)crop; (void)mode; (void)temperature;
+    (void)lines; (void)columns; (void)waveform;
+    assert(false);
+    return EPD_DRAW_OTHER_ERROR;
+}
+
 
 bool board_epd_release_drive(void) {return true;}
 void epd_poweroff(void) {}
@@ -117,6 +128,13 @@ enum EpdDrawError e0470_page_turn_with_waveform_compact(EpdiyHighlevelState* sta
     assert(ota_display_depth);
     assert(waveform==&main_water && bands==E0470_TURN_FAST_BANDS && turn_tick_us==E0470_TURN_FAST_TICK_US);
     return e0470_page_turn(state,area,dir);
+}
+
+enum EpdDrawError e0470_page_turn_reader(EpdiyHighlevelState* state, EpdRect area,
+    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned pushes) {
+    (void)state; (void)area; (void)dir; (void)waveform; (void)pushes;
+    assert(false);
+    return EPD_DRAW_OTHER_ERROR;
 }
 
 // panel 独立于 back；失败只改变物理屏，绝不假装回写已经成功。

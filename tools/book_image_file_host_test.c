@@ -19,6 +19,25 @@ int main(int argc, char **argv) {
         } else {
             assert(book_image_file_dimensions(argv[i], png, &w, &h));
             assert(book_image_file_grayscale(argv[i], png, ow, oh, pixels));
+            if (!strcmp(argv[1], "pixels")) {
+                char reference[4096];
+                assert(snprintf(reference,sizeof(reference),"%s.raw",argv[i])<(int)sizeof(reference));
+                FILE *f=fopen(reference,"rb");assert(f);
+                const size_t bytes=(size_t)ow*oh;
+                uint8_t *expected=malloc(bytes*3),*gray=malloc(bytes),*alpha=malloc(bytes);
+                assert(expected&&gray&&alpha&&fread(expected,bytes,3,f)==3&&fgetc(f)==EOF&&!fclose(f));
+                assert(!memcmp(pixels,expected,bytes));
+                assert(book_png_file_layer(argv[i],ow,oh,gray,alpha));
+                assert(!memcmp(gray,expected+bytes,bytes)&&!memcmp(alpha,expected+2*bytes,bytes));
+                free(expected);free(gray);free(alpha);
+            }
+            if (!strcmp(argv[1], "compare")) {
+                char reference[4096];
+                assert(snprintf(reference,sizeof(reference),"%s-rgb.png",argv[i])<(int)sizeof(reference));
+                uint8_t *expected=malloc((size_t)ow*oh);assert(expected);
+                assert(book_image_file_grayscale(reference,true,ow,oh,expected));
+                assert(!memcmp(pixels,expected,(size_t)ow*oh));free(expected);
+            }
             unsigned sum = 0;
             for (unsigned j = 0; j < ow * oh; ++j) sum += pixels[j];
             assert(sum > 30u * ow * oh && sum < 230u * ow * oh);

@@ -22,6 +22,7 @@
 #include "nvs.h"
 #include "device_power.h"
 #include "network_service.h"
+#include "memory_peak.h"
 #include "settings.h"
 #include "sleep.h"
 #include "time_sync_policy.h"
@@ -34,6 +35,10 @@
 // Below this state of charge, and while not charging, keep the radio off; an unknown gauge passes.
 #define CLOCK_MIN_BATTERY_PERCENT 10
 static atomic_bool s_running;
+static atomic_bool s_cancel_requested, s_manual_network_done;
+static bool s_manual_job, s_manual_result_ready;
+static esp_err_t s_manual_network_error;
+static app_time_sync_result_t s_manual_result;
 static bool s_loaded;
 static uint64_t s_last_sync;
 static int64_t s_next_attempt_us = 15000000;
@@ -42,17 +47,49 @@ static int64_t s_next_attempt_us = 15000000;
 // there is no cooldown basis, so only a first attempt is allowed.
 static unsigned s_boot_attempts;
 
+static bool clock_cancelled(void) { return atomic_load(&s_cancel_requested); }
+
 static void clock_worker(void *arg) {
-    (void)arg;
+    // 进 worker 后栈已存在；先交还创建额度，再申请无线阶段，避免自冲突。
+    // The worker stack is now live; finish creation before requesting the radio phase.
+    memory_peak_finish((memory_peak_token_t)(uintptr_t)arg);
     uint32_t utc = 0;
-    esp_err_t err = network_service_sync_time(&utc, true);
-    ESP_LOGI("clock", "background calibration: %s", esp_err_to_name(err));
+    const bool manual = s_manual_job;
+    esp_err_t err = clock_cancelled() ? ESP_ERR_INVALID_STATE : network_service_sync_time(&utc, !manual, clock_cancelled);
+    if (manual) {
+        s_manual_network_error = err;
+        atomic_store(&s_manual_network_done, true);
+    } else {
+        ESP_LOGI("clock", "background calibration: %s", esp_err_to_name(err));
+    }
     atomic_store(&s_running, false);
     vTaskDelete(NULL);
 }
 
+bool app_time_service_busy(void) { return atomic_load(&s_running); }
+
+static esp_err_t start_clock_worker(bool manual) {
+    if (app_time_service_busy()) return MEMORY_PEAK_BUSY;
+    memory_peak_token_t peak;
+    esp_err_t err = memory_peak_try_begin(MEMORY_PEAK_WIFI_TIME, &peak);
+    if (err != ESP_OK) return err;
+    err = memory_peak_check((memory_peak_heap_t){.internal_free = 6144, .internal_block = 6144});
+    if (err == ESP_OK) {
+        s_manual_job = manual;
+        atomic_store(&s_cancel_requested, false);
+        atomic_store(&s_running, true);
+        // 仅在对时期间保留任务栈。/ Retain a task stack only during calibration.
+        if (xTaskCreate(clock_worker, "rtc_sync", 6144, (void *)(uintptr_t)peak, 1, NULL) == pdPASS) return ESP_OK;
+        atomic_store(&s_running, false);
+        err = ESP_ERR_NO_MEM;
+    }
+    memory_peak_finish(peak);
+    return err;
+}
+
 void app_time_service_cancel(void) {
-    if (atomic_load(&s_running)) {
+    if (app_time_service_busy()) {
+        atomic_store(&s_cancel_requested, true);
         // 让组件内 100 ms 分片的 SNTP 等待感知取消；worker 收尾后自行清 running。
         // The component's 100 ms sliced SNTP wait notices the cancel; the worker clears running.
         network_service_cancel_time_sync();
@@ -77,13 +114,12 @@ void app_time_service_note_success(uint32_t utc_seconds) {
     }
 }
 
-app_time_sync_result_t app_time_service_sync_manual(void) {
+static void finish_manual_sync(void) {
+    if (!atomic_exchange(&s_manual_network_done, false)) return;
     uint32_t utc = 0;
     network_status_t network = {0};
     network_service_get_status(&network);
-    // 手动对时优先：网络服务先取消自动任务，再按用户路由取得承载。
-    // Manual sync goes first: the network service cancels automatic work before acquiring the selected bearer.
-    esp_err_t err = network_service_sync_time(&utc, false);
+    esp_err_t err = s_manual_network_error;
     bool network_time_received = err == ESP_OK;
     if (network_time_received) {
         // 临时网络承载收尾可能耗时；写入 PMU 时取当前 S3 时间，避免回写旧秒数。
@@ -104,11 +140,29 @@ app_time_sync_result_t app_time_service_sync_manual(void) {
     ESP_LOGI("device_settings", "time sync network=%d ready=%d utc=%lu result=%s",
              network.active_bearer, network.wifi_ready || network.cellular_ready,
              (unsigned long)utc, esp_err_to_name(err));
-    return (app_time_sync_result_t){.error = err, .network_time_received = network_time_received};
+    s_manual_result = (app_time_sync_result_t){.error = err, .network_time_received = network_time_received};
+    s_manual_result_ready = true;
+}
+
+esp_err_t app_time_service_start_manual(void) {
+    finish_manual_sync();
+    esp_err_t err = start_clock_worker(true);
+    if (err == ESP_OK) s_manual_result_ready = false;
+    return err;
+}
+
+bool app_time_service_take_manual_result(app_time_sync_result_t *out) {
+    if (!out) return false;
+    finish_manual_sync();
+    if (!s_manual_result_ready) return false;
+    *out = s_manual_result;
+    s_manual_result_ready = false;
+    return true;
 }
 
 void app_time_service_poll(bool idle) {
     if (!idle) return;
+    finish_manual_sync();
     if (!s_loaded) {
         nvs_handle_t handle;
         if (nvs_open("kiiko_clock", NVS_READONLY, &handle) == ESP_OK) {
@@ -163,12 +217,9 @@ void app_time_service_poll(bool idle) {
     int percent = pmu_battery_percent(pmu);
     if (percent >= 0 && percent < CLOCK_MIN_BATTERY_PERCENT && !pmu_battery_charging(pmu)) return;
     s_next_attempt_us = monotonic + CLOCK_RETRY_US;
-    atomic_store(&s_running, true);
-    // 仅对时期间保留任务栈；不创建常驻无线任务或页面缓存。
-    // Keep a task stack only during calibration; no permanent radio task or page cache.
-    if (xTaskCreate(clock_worker, "rtc_sync", 6144, NULL, 1, NULL) != pdPASS) {
-        atomic_store(&s_running, false);
-        ESP_LOGW("clock", "background calibration deferred: no task memory");
+    const esp_err_t err = start_clock_worker(false);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NO_MEM) ESP_LOGW("clock", "background calibration deferred: no task memory");
         return;
     }
     // 失败也要记预算：attempt 记在尝试开始，冷却由 next_attempt_us 与策略头共同兜底。

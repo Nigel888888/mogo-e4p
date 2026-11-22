@@ -38,13 +38,41 @@ static void ui_draw_button(uint8_t *fb,EpdRect r,const char *s,bool on){
 static EpdRect ui_row_rect(int i,int n,int y,int h){int w=(604-(n-1)*12)/n;return(EpdRect){40+i*(w+12),y,w,h};}
 '''.replace('"../components/', '"' + str(ROOT / 'components') + '/')
     source = PAGE.read_text()
-    code += source[source.index("typedef enum { TRANSFER_METHODS"):source.index("static void render(app_ctx_t* ctx")]
+    code += source[source.index("typedef enum { TRANSFER_HOME"):source.index("static void render(app_ctx_t* ctx")]
     for name, path in (("ui_draw_selected_round_rect", KIT), ("ui_draw_pressed_round_rect", KIT),
                        ("ui_hairline", KIT), ("ui_nav_wifi_icon", ROOT / "main/ui/ui_nav.c"),
                        *((name, PAGE) for name in (
                            "transfer_header", "fit_label", "network_control_rect", "provisioning_button",
                            "network_border", "network_button", "saved_network_index", "draw_networks"))):
         code += host.function(name, path) + "\n"
+    code += r'''
+#include <strings.h>
+#include "assets/cloudzao_download_qr.h"
+#include "assets/cloudzao_mark.h"
+#include "services/cloudzao_receive.h"
+static cz_status_t s_cloud_status, s_cloud_bind_status;
+static bool s_cloud_cancelling;
+static cz_history_status_t s_cloud_history;
+static bool s_cloud_history_confirm, s_cloud_history_clearing, s_cloud_history_clear_failed;
+static unsigned s_cloud_history_page;
+static bool cloudzao_history_item(unsigned i, cz_history_item_t *item) {
+    static const char *const names[] = {"山茶文具店.epub", "阅读札记.txt", "霞鹜文楷.ttf", "海边.png"};
+    if (i >= s_cloud_history.count) return false;
+    *item = (cz_history_item_t){.file = {.size = 153600, .state = CZ_ROW_SAVED}, .utc = 1795276800};
+    snprintf(item->file.name, sizeof(item->file.name), "%s", names[i % 4]);
+    return true;
+}
+'''
+    code += source[source.index("typedef enum { CLOUD_PANEL_TRANSFER"):source.index("static bool cloud_notice_input_owned")]
+    code += source[source.index("enum { CLOUD_BIND, CLOUD_RECEIVE }"):source.index("static EpdRect cloud_button")]
+    code += source[source.index("#define CLOUD_BATCH_PAGE_ROWS"):source.index("static EpdRect cloud_pager(")]
+    for name in ("cloud_notice_button", "draw_cloud_notice", "cloud_error", "cloud_button",
+                 "cloud_bind_title", "cloud_bind_detail", "cloud_bind_action_enabled", "cloud_notice_entry",
+                 "draw_cloud_app_download", "draw_cloud_settings", "draw_cloud_header", "cloud_tab", "cloud_tabs",
+                 "cloud_pager", "cloud_bytes", "cloud_row_label", "cloud_history_format", "draw_cloud_history_row",
+                 "draw_cloud_history_pager", "cloud_history_clear_button", "cloud_history_confirm_button",
+                 "cloud_history_can_clear", "draw_cloud_history_confirmation", "draw_cloud_history"):
+        code += host.function(name, PAGE) + "\n"
     code += r'''
 static void fixture(void){
     s_saved_count=8;s_saved_configured=true;strcpy(s_saved_ssid,"103");
@@ -58,6 +86,17 @@ static void fixture(void){
     }
     for(size_t i=0;i<s_saved_count;++i){strcpy(s_saved_networks[i].ssid,names[i]);s_saved_networks[i].requires_password=true;}
 }
+static void cloud_settings_preview(uint8_t *fb){
+    ui_clear_page(fb);s_cloud_panel=CLOUD_PANEL_SETTINGS;
+    draw_cloud_header(fb);cloud_tabs(fb);draw_cloud_settings(fb);
+    // 222px 白底含四模块静区；每个模块保持纯黑或纯白。/ 222px square has a four-module quiet zone and binary modules.
+    for(int y=0;y<222;++y)for(int x=0;x<222;++x){
+        const int mx=x/6-4,my=y/6-4;
+        const bool ink=mx>=0&&my>=0&&mx<CLOUDZAO_DOWNLOAD_QR_SIDE&&my<CLOUDZAO_DOWNLOAD_QR_SIDE&&
+            (cloudzao_download_qr_rows[my]&(UINT32_C(1)<<mx));
+        assert(ui_read_pixel(fb,396+x,736+y)==(ink?0:15));
+    }
+}
 static void arrows(uint8_t *fb){
     for(int id=7;id<=9;id+=2){
         EpdRect r=network_control_rect(id);unsigned ink=0;
@@ -69,6 +108,24 @@ int main(int argc,char **argv){
     assert(argc==2);assert(ttf_font_open_builtin()==ESP_OK);
     uint8_t *fb=malloc(684*1216/2);assert(fb);char path[1024];
     for(font_percent=100;font_percent<=200;font_percent+=10){
+        if (font_percent == 100 || font_percent == 200) {
+            s_cloud_bind_status=(cz_status_t){0};cloud_settings_preview(fb);
+            snprintf(path,sizeof(path),"%s/cloudzao-settings-download-%u.raw",argv[1],font_percent);save(path,fb);
+            s_cloud_bind_status=(cz_status_t){.code="012345"};cloud_settings_preview(fb);
+            snprintf(path,sizeof(path),"%s/cloudzao-settings-binding-%u.raw",argv[1],font_percent);save(path,fb);
+            ui_clear_page(fb);s_cloud_notice=CLOUD_NOTICE_FIRST_READ;s_cloud_notice_save_failed=false;
+            draw_cloud_notice(fb);
+            snprintf(path,sizeof(path),"%s/cloudzao-first-read-%u.raw",argv[1],font_percent);save(path,fb);
+            ui_clear_page(fb);s_cloud_notice_save_failed=true;draw_cloud_notice(fb);
+            snprintf(path,sizeof(path),"%s/cloudzao-save-failed-%u.raw",argv[1],font_percent);save(path,fb);
+            ui_clear_page(fb);s_cloud_notice=CLOUD_NOTICE_REVIEW;s_cloud_notice_save_failed=false;
+            draw_cloud_notice(fb);
+            snprintf(path,sizeof(path),"%s/cloudzao-review-%u.raw",argv[1],font_percent);save(path,fb);
+            ui_clear_page(fb);s_cloud_panel=CLOUD_PANEL_HISTORY;
+            s_cloud_history=(cz_history_status_t){.count=CLOUDZAO_HISTORY_ROWS};
+            draw_cloud_header(fb);cloud_tabs(fb);draw_cloud_history(fb);
+            snprintf(path,sizeof(path),"%s/cloudzao-history-%u.raw",argv[1],font_percent);save(path,fb);
+        }
         fixture();draw_networks(fb);arrows(fb);
         snprintf(path,sizeof(path),"%s/nearby-%u.raw",argv[1],font_percent);save(path,fb);
         s_network_page=1;draw_networks(fb);arrows(fb);

@@ -17,6 +17,7 @@
  */
 
 #include "ble_page_turner.h"
+#include "memory_peak.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -49,7 +50,11 @@ static const char *TAG = "ble_pt";
 // 网络占用先登记，再串行拆栈，防止主循环同时重建蓝牙。/ Reserve network memory before serial teardown to prevent a concurrent BLE restart.
 static atomic_flag s_lifecycle = ATOMIC_FLAG_INIT;
 static atomic_uint s_network_users;
+static atomic_bool s_cellular_pause;
 static TaskHandle_t s_host_task;
+static atomic_uint s_host_peak, s_connect_peak;
+#define BLE_PT_CONNECT_DEFERRED (-1)
+static uint32_t s_host_start_ms;
 static bool lifecycle_take(uint32_t timeout_ms) {
     const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     while (atomic_flag_test_and_set(&s_lifecycle)) {
@@ -102,6 +107,8 @@ static void lifecycle_give(void) { atomic_flag_clear(&s_lifecycle); }
 // 自动重连间隔。取值同 CrossMux 的 kReconnectBackoffMs。
 // Auto-reconnect interval, matching CrossMux's kReconnectBackoffMs.
 #define BLE_PT_RECONNECT_MS 4000
+// HCI 0x07 是控制器容量不足。/ HCI 0x07 is Memory Capacity Exceeded.
+#define BLE_PT_HCI_MEM_CAPACITY BLE_HS_HCI_ERR(0x07)
 #define NVS_NS_BLE_STATE "rp_blestate"
 
 // 报告帧与键环的容量。报告一般 8-9 字节，留 16 足够覆盖带 report id 的复合设备。
@@ -180,7 +187,7 @@ static atomic_bool s_recent_requested;
 // Pending target: picking another peer while a link exists or is coming up records it here, and
 // poll() starts it once the disconnect has landed.
 static char s_pending_addr[18];
-static volatile bool s_connected, s_connecting, s_scanning;
+static atomic_bool s_connected, s_connecting, s_scanning;
 // 建立链路的进度标志：服务发现是否走完（成功失败都算）、加密阶段是否结束。
 // 回调写、状态机读，定义在这里是因为服务发现回调比状态机更早用到它们。
 // Bring-up progress flags: whether service discovery finished (either way) and whether the
@@ -201,7 +208,7 @@ static atomic_bool s_running;
 // Whether the GAP link exists. Separate from s_connected, which also requires discovery to have
 // finished. Reconnect must key off this: keyed off s_connected it tears down a perfectly good
 // link whenever discovery has not completed, which reads as a connection that keeps dropping.
-static volatile bool s_link_up;
+static atomic_bool s_link_up;
 static uint32_t s_connect_ms;
 static volatile uint32_t s_passkey;
 static volatile bool s_passkey_ready;
@@ -777,7 +784,7 @@ static int scan_cb(struct ble_gap_event *event, void *arg) {
     }
 }
 
-void ble_pt_scan_start(uint32_t ms) {
+static void scan_start_locked(uint32_t ms) {
     if (!s_running || s_scanning || s_connected || s_connecting) return;
     s_device_count = 0;  // 重扫时清空，免得新旧混在一起 / clear on rescan so old and new do not mix
     // 扫描参数用协议栈默认值：曾经照 CrossMux 设成 itvl=window=160（100% 占空比），
@@ -798,6 +805,12 @@ void ble_pt_scan_start(uint32_t ms) {
         // rejects extended scanning from a parameter or state problem.
         ESP_LOGW(TAG, "scan start failed: %d", rc);
     }
+}
+
+void ble_pt_scan_start(uint32_t ms) {
+    if (!lifecycle_take(0)) return;
+    if (!ble_pt_network_paused()) scan_start_locked(ms);
+    lifecycle_give();
 }
 
 void ble_pt_scan_stop(void) {
@@ -1297,21 +1310,26 @@ static void step_poll(void) {
             if (s_link_up) {
                 ble_pt_crumb(BLE_PT_CRUMB_LINK);
                 step_begin(STEP_DISCOVER);
-            } else if (!s_connecting || step_over(10000)) {
-                // 连接失败事件到了就立刻处理，不用干等满 10 秒；超时也走同一条路。
-                // A connect-failure event is handled the moment it lands instead of waiting out the
-                // full 10 s, and a timeout takes the same route.
+            } else if (!s_connecting && step_over(300)) {
+                // 等待 NimBLE 确认连接失败或超时；不得把旧过程和换地址重试重叠。
+                // Wait for NimBLE's failure/timeout event before another address-type attempt.
                 // 换另一种地址类型再试一次，和 CrossMux 一样。
                 // Retry with the other address type, exactly as CrossMux does.
                 if (!s_alt_type_tried && s_conn_addr[0]) {
-                    s_alt_type_tried = true;
                     const uint8_t alt = s_conn_addr_type == BLE_ADDR_PUBLIC ? BLE_ADDR_RANDOM
                                                                            : BLE_ADDR_PUBLIC;
-                    if (start_connect(s_conn_addr, alt) == 0) {
+                    const int result = start_connect(s_conn_addr, alt);
+                    if (result == BLE_PT_CONNECT_DEFERRED) {
+                        step_begin(STEP_LINK);
+                        break;
+                    }
+                    s_alt_type_tried = true;
+                    if (result == 0) {
                         step_begin(STEP_LINK);
                         break;
                     }
                 }
+                s_reconnect_at = now_ms();
                 step_fail("连接失败");
             }
             break;
@@ -1399,6 +1417,10 @@ static const char *crumb_name(uint8_t id) {
 
 void ble_pt_crumb(uint8_t id) { rp_crash_log("%s", crumb_name(id)); }
 
+static void finish_connect_peak(void) {
+    memory_peak_finish(atomic_exchange(&s_connect_peak, 0));
+}
+
 static int gap_cb(struct ble_gap_event *event, void *arg) {
     (void)arg;
     switch (event->type) {
@@ -1414,6 +1436,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg) {
                 // Whether to retry another address type or give up belongs to the state machine;
                 // this only reports the outcome.
                 snprintf(s_failure, sizeof(s_failure), "连接失败 (%d)", event->connect.status);
+                finish_connect_peak();
                 return 0;
             }
             s_conn_handle = event->connect.conn_handle;
@@ -1458,6 +1481,7 @@ static int gap_cb(struct ble_gap_event *event, void *arg) {
             // 明文设备不会回这个事件，加密步骤靠状态机的超时放行。
             // A plaintext peer never answers this, and the state machine's timeout lets it pass.
             (void)ble_gap_security_initiate(s_conn_handle);
+            finish_connect_peak();
             return 0;
 
         case BLE_GAP_EVENT_CONN_UPDATE_REQ: {
@@ -1607,6 +1631,8 @@ static int start_connect(const char *addr, uint8_t type) {
     // 0x12 (Invalid HCI Command Parameters, NimBLE reports 530): those values are valid through
     // NimBLE-Arduino but not through this native API on this controller. Connecting comes first;
     // hardening such as an 8 s supervision timeout can follow.
+    memory_peak_token_t peak;
+    if (memory_peak_try_begin(MEMORY_PEAK_BLE_CONNECT, &peak) != ESP_OK) return BLE_PT_CONNECT_DEFERRED;
     s_connecting = true;
     s_rest_known = false;
     raw_reset();
@@ -1618,20 +1644,17 @@ static int start_connect(const char *addr, uint8_t type) {
     s_held_usage = 0;
     s_subscribed_count = 0;
     s_conn_addr_type = type;
+    atomic_store(&s_connect_peak, peak);
     const int rc = ble_gap_connect(s_own_addr_type, &peer, 10000, NULL, gap_cb, NULL);
     if (rc != 0) {
+        finish_connect_peak();
         s_connecting = false;
-        // 以前这里只写 s_failure：界面弹"连接失败请重试"，串口却一个字都没有，
-        // 谁也看不出是扫描没停（EBUSY）还是参数非法。
-        // This used to write s_failure alone: the UI said "connection failed, try again" while the
-        // log stayed silent, leaving no way to tell a scan that had not stopped (EBUSY) from an
-        // invalid parameter.
     }
     return rc;
 }
 
-esp_err_t ble_pt_connect(const char *addr) {
-    if (!s_running || !addr || !addr[0]) {
+static esp_err_t connect_admitted_locked(const char *addr) {
+    if (ble_pt_network_paused() || !s_running || !addr || !addr[0]) {
         return ESP_ERR_INVALID_STATE;
     }
     if (s_link_up || s_connecting) {
@@ -1668,6 +1691,7 @@ esp_err_t ble_pt_connect(const char *addr) {
     s_alt_type_tried = false;
     note_peer(addr, NULL);
     const int rc = start_connect(addr, type);
+    if (rc == BLE_PT_CONNECT_DEFERRED) return MEMORY_PEAK_BUSY;
     if (rc != 0) {
         if (rc == BLE_HS_EBUSY) {
             // 控制器还忙着（扫描取消没落地）：记下目标，poll() 下一轮重来。
@@ -1687,6 +1711,14 @@ esp_err_t ble_pt_connect(const char *addr) {
     return ESP_OK;
 }
 
+esp_err_t ble_pt_connect(const char *addr) {
+    if (!lifecycle_take(0)) return MEMORY_PEAK_BUSY;
+    const esp_err_t result = connect_admitted_locked(addr);
+    lifecycle_give();
+    return result;
+}
+
+
 void ble_pt_reconnect_recent(void) { atomic_store(&s_recent_requested,true); }
 void ble_pt_cancel_recent(void) { atomic_store(&s_recent_requested,false); }
 
@@ -1697,7 +1729,8 @@ static void reconnect_recent_requested(void) {
     s_reconnect_at=(uint32_t)(esp_timer_get_time()/1000);
     // 复用异步连接/扫描取消和原有4秒重试，不等待配对、不扫描未知外设。
     // Reuse asynchronous connect/scan cancellation and the existing four-second retry; never wait for pairing or scan unknown peers.
-    (void)ble_pt_connect(s_reconnect_addr);
+    if (memory_peak_is_busy(connect_admitted_locked(s_reconnect_addr)))
+        snprintf(s_pending_addr, sizeof(s_pending_addr), "%s", s_reconnect_addr);
 }
 
 void ble_pt_disconnect(void) {
@@ -1707,6 +1740,7 @@ void ble_pt_disconnect(void) {
     s_reconnect_addr[0] = 0;
     s_step = STEP_IDLE;  // 用户主动断开：建立流程就地结束 / an explicit disconnect ends the bring-up here
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(s_conn_handle, 0x13);
+    else if (s_connecting) (void)ble_gap_conn_cancel();
 }
 
 // 界面上的"已连接"就是"链路建立了"，与我们的 HID 订阅是否成功无关。以前这里报的是
@@ -1738,39 +1772,56 @@ bool ble_pt_take_passkey(uint32_t *out) {
 static void on_sync(void) {
     if (ble_hs_util_ensure_addr(0) != 0) {
         ESP_LOGE(TAG, "no usable address");
+        memory_peak_finish(atomic_exchange(&s_host_peak, 0));
         return;
     }
     ble_hs_id_infer_auto(0, &s_own_addr_type);
+    memory_peak_finish(atomic_exchange(&s_host_peak, 0));
 }
 
 static void host_task(void *param) {
     (void)param;
     nimble_port_run();
+    finish_connect_peak();
+    memory_peak_finish(atomic_exchange(&s_host_peak, 0));
     s_host_task = NULL;
     vTaskDelete(NULL);
 }
 
-static esp_err_t start_locked(void) {
-    if (atomic_load(&s_network_users)) return ESP_ERR_INVALID_STATE;
+static memory_peak_heap_t ble_start_heap(void) {
+    const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    return (memory_peak_heap_t){
+        .internal_free = heap_caps_get_free_size(internal_caps),
+        .internal_block = heap_caps_get_largest_free_block(internal_caps),
+        .psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+    };
+}
+
+static esp_err_t ble_check_start_heap(memory_peak_heap_t heap) {
+    if (heap.internal_free < BLE_PT_MIN_FREE_INTERNAL || heap.psram_free < BLE_PT_MIN_FREE_PSRAM)
+        return MEMORY_PEAK_CAPACITY;
+    if (heap.internal_block < BLE_PT_MIN_LARGEST_INTERNAL) return MEMORY_PEAK_FRAGMENT;
+    return ESP_OK;
+}
+
+const char *ble_pt_enable_block_reason(void) {
+    if (ble_pt_cellular_paused()) return "4G 使用中，请先关闭移动网络";
+    if (ble_pt_network_paused()) return "Wi-Fi 使用中，请先结束 Wi-Fi";
+    if (ble_pt_running()) return NULL;
+    return memory_peak_hint(ble_check_start_heap(ble_start_heap()));
+}
+
+static esp_err_t start_locked(memory_peak_token_t *peak) {
+    if (ble_pt_network_paused()) return ESP_ERR_INVALID_STATE;
     if (s_running) return ESP_OK;
 
-    // 内存闸门：NimBLE 的 host 动态分配走 PSRAM（CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL），
-    // 但控制器与协议栈任务必须落在内部 RAM——它跑在硬件路径上，读不到 PSRAM。所以卡住的
-    // 是内部 RAM，不是 PSRAM。不够就当场拒绝，绝不进到一半再崩。
-    // Memory gate. NimBLE's host allocations go to PSRAM
-    // (CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL), but the controller and the stack task must live
-    // in internal RAM - they sit on the hardware path and cannot read PSRAM. So the binding
-    // constraint is internal RAM, not PSRAM. Refuse outright rather than half-initialise.
-    const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t largest_internal =
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    if (free_internal < BLE_PT_MIN_FREE_INTERNAL ||
-        largest_internal < BLE_PT_MIN_LARGEST_INTERNAL || free_psram < BLE_PT_MIN_FREE_PSRAM) {
+    // 起栈时按同一门槛复检；控制器和任务依然需要内部 RAM。/ Recheck the same floors at startup; controller and task still require internal RAM.
+    const memory_peak_heap_t heap = ble_start_heap();
+    if (ble_check_start_heap(heap) != ESP_OK) {
         ESP_LOGW(TAG, "not enough memory: internal %u B free / %u B largest, psram %u B free",
-                 (unsigned)free_internal, (unsigned)largest_internal, (unsigned)free_psram);
+                 (unsigned)heap.internal_free, (unsigned)heap.internal_block, (unsigned)heap.psram_free);
         snprintf(s_failure, sizeof(s_failure), "内存不足（内部 %uK，最大块 %uK）",
-                 (unsigned)(free_internal / 1024), (unsigned)(largest_internal / 1024));
+                 (unsigned)(heap.internal_free / 1024), (unsigned)(heap.internal_block / 1024));
         return ESP_ERR_NO_MEM;
     }
 
@@ -1805,13 +1856,17 @@ static esp_err_t start_locked(void) {
 
     bonds_load();
     // 检查任务分配结果，失败时完整回收，避免假启动及停止死等。/ Check task allocation and unwind failures instead of claiming a running host.
+    s_host_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    atomic_store(&s_host_peak, *peak);
     if (xTaskCreatePinnedToCore(host_task, "nimble_host", CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE,
                                NULL, configMAX_PRIORITIES - 4, &s_host_task,
                                CONFIG_BT_NIMBLE_PINNED_TO_CORE) != pdPASS) {
+        atomic_store(&s_host_peak, 0);
         s_host_task = NULL;
         (void)nimble_port_deinit();
         return ESP_ERR_NO_MEM;
     }
+    *peak = 0;  // 已由 host 持有。/ Now owned by the host.
     s_running = true;
     ESP_LOGI(TAG, "started, %u bond(s)", (unsigned)s_bond_count);
     // 配对策略摘要：日志里一眼就能看出这一版报的是什么能力、分发哪些密钥，
@@ -1847,8 +1902,11 @@ static esp_err_t stop_locked(void) {
 }
 
 esp_err_t ble_pt_start(void) {
-    if (!lifecycle_take(2000)) return ESP_ERR_TIMEOUT;
-    const esp_err_t error = start_locked();
+    if (!lifecycle_take(0)) return MEMORY_PEAK_BUSY;
+    memory_peak_token_t peak = 0;
+    esp_err_t error = s_running ? ESP_OK : memory_peak_try_begin(MEMORY_PEAK_BLE, &peak);
+    if (error == ESP_OK) error = start_locked(&peak);
+    memory_peak_finish(peak);
     lifecycle_give();
     return error;
 }
@@ -1875,17 +1933,45 @@ esp_err_t ble_pt_stop_for_sleep(uint32_t timeout_ms) {
     }
     return error;
 }
-esp_err_t ble_pt_network_acquire(void) {
-    atomic_fetch_add(&s_network_users, 1);
-    const esp_err_t error = ble_pt_stop(2000);
-    if (error != ESP_OK) atomic_fetch_sub(&s_network_users, 1);
+static bool network_conflict_locked(void) {
+    return s_link_up || s_connected || s_connecting || s_scanning || s_pending_addr[0];
+}
+
+esp_err_t ble_pt_network_check(void) {
+    if (!lifecycle_take(0)) return MEMORY_PEAK_BUSY;
+    const bool conflict = network_conflict_locked();
+    lifecycle_give();
+    return conflict ? MEMORY_PEAK_CONFLICT : ESP_OK;
+}
+
+static esp_err_t network_acquire(bool cellular) {
+    if (!lifecycle_take(0)) return MEMORY_PEAK_BUSY;
+    if (network_conflict_locked()) {
+        lifecycle_give();
+        return MEMORY_PEAK_CONFLICT;
+    }
+    char target[sizeof(s_reconnect_addr)];
+    memcpy(target, s_reconnect_addr, sizeof(target));
+    const esp_err_t error = stop_locked();
+    if (error == ESP_OK) {
+        memcpy(s_reconnect_addr, target, sizeof(target));
+        if (cellular) atomic_store(&s_cellular_pause, true);
+        else atomic_fetch_add(&s_network_users, 1);
+    }
+    lifecycle_give();
     return error;
 }
+esp_err_t ble_pt_network_acquire(void) { return network_acquire(false); }
+esp_err_t ble_pt_cellular_acquire(void) { return network_acquire(true); }
+void ble_pt_cellular_release(void) { atomic_store(&s_cellular_pause, false); }
+bool ble_pt_cellular_paused(void) { return atomic_load(&s_cellular_pause); }
+
 void ble_pt_network_release(void) {
     unsigned users = atomic_load(&s_network_users);
     while (users && !atomic_compare_exchange_weak(&s_network_users, &users, users - 1)) {}
 }
 
+bool ble_pt_network_paused(void) { return ble_pt_cellular_paused() || atomic_load(&s_network_users) != 0; }
 bool ble_pt_running(void) { return s_running; }
 
 /* ---- 启动策略 / Start policy ---- */
@@ -1938,7 +2024,7 @@ static bool why_load(char *out, size_t cap) {
 #define BLE_PT_WANT_DEBOUNCE_MS 2000
 
 void ble_pt_sync(bool wanted) {
-    if (atomic_load(&s_network_users)) wanted = false;
+    if (ble_pt_network_paused()) return;
     // 停用立即生效；仅重新启动防抖，网络不能等两秒再释放内存。/ Stop immediately; debounce only restarts so networking never waits two seconds for memory.
     if (!wanted && s_running) {
         if (ble_pt_stop(2000) != ESP_OK) return;
@@ -1973,14 +2059,20 @@ void ble_pt_sync(bool wanted) {
     if (!wanted) {
         if (s_running) ble_pt_stop(1000);
         s_retry_after_ms = 0;
-        // 这里不清崩溃计数：WiFi 抢占射频时也会走到这个分支，清掉就等于把自锁削弱了。
-        // 计数只在栈稳定跑满 BLE_PT_STABLE_MS 之后才清零。
-        // The failure count is deliberately not cleared here: WiFi taking over the radio also
-        // lands in this branch, and clearing would weaken the self-lock. It is only cleared once
-        // the stack has run stably for BLE_PT_STABLE_MS.
+        // 显式关闭不清崩溃计数；起栈稳定后才清。/ Explicit off does not clear the crash count; a stable start does.
         return;
     }
     if (s_running) {
+        if (atomic_load(&s_host_peak)) {
+            if (now_ms - s_host_start_ms >= BLE_PT_STABLE_MS &&
+                (!s_retry_after_ms || now_ms >= s_retry_after_ms)) {
+                s_retry_after_ms = now_ms + BLE_PT_RETRY_BACKOFF_MS;
+                // 主机退出才归还，不能仅根据超时释放仍在使用的名额。
+                // Only host exit returns its token; a timeout cannot release a live startup.
+                (void)ble_pt_stop_for_sleep(0);
+            }
+            return;
+        }
         // 稳定跑够时间才认为这次启动是好的。/ Only a stack that stayed up counts as a good start.
         const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (!s_stable_since) s_stable_since = now;
@@ -2013,8 +2105,13 @@ void ble_pt_sync(bool wanted) {
     // Record first, then act: a hard crash after this point still leaves the count raised.
     boot_tries_store((uint8_t)(tries + 1));
     const esp_err_t err = ble_pt_start();
-    if (err == ESP_ERR_INVALID_STATE && atomic_load(&s_network_users)) {
+    if (memory_peak_is_busy(err) || memory_peak_is_memory_error(err) ||
+        (err == ESP_ERR_INVALID_STATE && ble_pt_network_paused())) {
         boot_tries_store(tries);
+        s_retry_after_ms = now + BLE_PT_RETRY_BACKOFF_MS;
+        const char *hint = memory_peak_hint(err);
+        if (hint || err == ESP_ERR_NO_MEM) snprintf(s_start_failure, sizeof(s_start_failure),
+            "%s", hint ? hint : "蓝牙启动内存不足，请稍后重试");
         return;
     }
     if (err != ESP_OK) {
@@ -2070,13 +2167,13 @@ static void poll_locked(void) {
     // has been up the target is remembered and retried with a back-off. Scanning must be excluded:
     // the scan page scans continuously, and letting both drive the controller at once makes them
     // fight, which shows up as an unstable connection (CrossMux guards with !scanning_ too).
-    if (!s_link_up && !s_connecting && !s_scanning && s_reconnect_addr[0]) {
+    if (s_step == STEP_IDLE && !s_pending_addr[0] && !s_link_up && !s_connecting && !s_scanning && s_reconnect_addr[0]) {
         const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (now - s_reconnect_at >= BLE_PT_RECONNECT_MS) {
             s_reconnect_at = now;
             char addr[18];
             snprintf(addr, sizeof(addr), "%s", s_reconnect_addr);
-            if (ble_pt_connect(addr) == ESP_OK)
+            if (connect_admitted_locked(addr) == ESP_OK)
                 ESP_LOGI(TAG, "reconnecting to %s", s_conn_name);
         }
     }
@@ -2105,7 +2202,9 @@ static void poll_locked(void) {
         snprintf(addr, sizeof(addr), "%s", s_pending_addr);
         s_pending_addr[0] = 0;
         s_pending_at = (uint32_t)(esp_timer_get_time() / 1000);
-        if (ble_pt_connect(addr) == ESP_OK) ESP_LOGI(TAG, "connecting to %s", s_conn_name);
+        const esp_err_t result = connect_admitted_locked(addr);
+        if (memory_peak_is_busy(result)) snprintf(s_pending_addr, sizeof(s_pending_addr), "%s", addr);
+        if (result == ESP_OK) ESP_LOGI(TAG, "connecting to %s", s_conn_name);
     }
 
     // 原始边沿的收尾：遥控器不发松开报告时，静默够久就把这一次按下结束掉，下一次按下

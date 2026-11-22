@@ -12,6 +12,38 @@ typedef struct {
     unsigned x, y, width, height; ///< 源窗口坐标与尺寸 / Source window coordinates and dimensions
 } book_crop_t;
 
+/// 面板范围内的灰阶封面绘制；中心对齐、双线性、无额外位图。
+/// Center-aligned bilinear drawing for panel-sized cover windows; no extra bitmap.
+typedef struct { int32_t start, step, last; } image_gray_axis_t;
+typedef struct { const uint8_t *top, *bottom; unsigned frac; } image_gray_row_t;
+
+static inline image_gray_axis_t image_gray_axis(unsigned source, unsigned target) {
+    const int32_t step = (int32_t)((source << 16) / target);
+    return (image_gray_axis_t){ (step - 65536) / 2, step, (int32_t)((source - 1) << 16) };
+}
+
+static inline unsigned image_gray_coord(image_gray_axis_t axis, unsigned at) {
+    const int32_t q = axis.start + (int32_t)at * axis.step;
+    return q < 0 ? 0u : (unsigned)(q > axis.last ? axis.last : q);
+}
+
+static inline image_gray_row_t image_gray_row(const uint8_t *pixels, unsigned stride,
+                                                image_gray_axis_t ys, unsigned y) {
+    const unsigned q = image_gray_coord(ys, y);
+    const uint8_t *top = pixels + (size_t)(q >> 16) * stride;
+    return (image_gray_row_t){top, q < (unsigned)ys.last ? top + stride : top, (q >> 8) & 255u};
+}
+
+static inline uint8_t image_gray_sample(image_gray_row_t row, image_gray_axis_t xs, unsigned x) {
+    const unsigned q = image_gray_coord(xs, x), a = q >> 16;
+    const unsigned fx = (q >> 8) & 255u;
+    if (!fx && !row.frac) return row.top[a];
+    const unsigned b = q < (unsigned)xs.last ? a + 1 : a;
+    const unsigned u = row.top[a] * (256u - fx) + row.top[b] * fx;
+    const unsigned v = row.bottom[a] * (256u - fx) + row.bottom[b] * fx;
+    return (uint8_t)((u * (256u - row.frac) + v * row.frac + 32768u) >> 16);
+}
+
 /// 兼容既有调用名；仅计算窗口，不读取文件。/ Retain the existing API name; calculate the crop without file I/O.
 book_crop_t book_cover_crop(unsigned src_width, unsigned src_height,
                             unsigned dst_width, unsigned dst_height);

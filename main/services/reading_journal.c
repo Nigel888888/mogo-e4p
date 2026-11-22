@@ -94,13 +94,11 @@ static bool load_storage(void) {
 failed:
     reading_journal_clear(&slots[0]); reading_journal_clear(&slots[1]); return false;
 }
-bool app_reading_journal_flush(void) {
-    if (!s_started) return true;
-    if (!s_loaded) { s_storage_error=true; return false; }
-    if (!s_dirty) return true;
-    size_t length=reading_journal_encode(&s_model,s_sequence+1,NULL,0);
+static bool save_snapshot(const reading_journal_model_t *model) {
+    if (s_sequence == UINT64_MAX) return false;
+    size_t length=reading_journal_encode(model,s_sequence+1,NULL,0);
     uint8_t *bytes=heap_caps_malloc(length,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
-    bool ok=bytes && reading_journal_encode(&s_model,s_sequence+1,bytes,length)==length;
+    bool ok=bytes && reading_journal_encode(model,s_sequence+1,bytes,length)==length;
     bool guarded=ok && epd_flash_begin();
     if (guarded) {
         char path[128]; snprintf(path,sizeof(path),"%s-%d.bin",READING_JOURNAL_STORAGE,1-s_slot);
@@ -113,9 +111,18 @@ bool app_reading_journal_flush(void) {
         }
         epd_flash_end();
     } else ok=false;
-    free(bytes); s_storage_error=!ok;
+    free(bytes);
+    if (ok) { ++s_sequence; s_slot=1-s_slot; }
+    return ok;
+}
+bool app_reading_journal_flush(void) {
+    if (!s_started) return true;
+    if (!s_loaded) { s_storage_error=true; return false; }
+    if (!s_dirty) return true;
+    bool ok=save_snapshot(&s_model);
+    s_storage_error=!ok;
     s_saved_us=esp_timer_get_time();
-    if (ok) { ++s_sequence; s_slot=1-s_slot; s_dirty=false; }
+    if (ok) s_dirty=false;
     return ok;
 }
 static bool poll_at(int64_t wall) {
@@ -136,6 +143,54 @@ static bool poll_at(int64_t wall) {
     return changed || old_error!=s_storage_error;
 }
 bool app_reading_journal_poll(void) { return poll_at(wall_ms()); }
+esp_err_t app_reading_journal_backup_write(FILE *file) {
+    (void)app_reading_journal_poll();
+    if (!s_loaded) return ESP_ERR_INVALID_STATE;
+    bool present = s_model.records || s_model.streak.day || s_model.scene_ready;
+    if (fputc(present, file) == EOF) return ESP_FAIL;
+    if (!present) return ESP_OK;
+    size_t length = reading_journal_encode(&s_model, 0, NULL, 0);
+    uint8_t *bytes = heap_caps_malloc(length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!bytes) return ESP_ERR_NO_MEM;
+    bool ok = reading_journal_encode(&s_model, 0, bytes, length) == length &&
+        fwrite(bytes, 1, length, file) == length;
+    free(bytes);
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t app_reading_journal_backup_read(FILE *file, bool apply) {
+    int present = fgetc(file);
+    if (present == 0) return ESP_OK;
+    uint8_t header[8];
+    if (present != 1 || fread(header, 1, sizeof(header), file) != sizeof(header) || memcmp(header, "KJR2", 4))
+        return ESP_ERR_INVALID_RESPONSE;
+    size_t length = header[4] | (size_t)header[5] << 8 | (size_t)header[6] << 16 | (size_t)header[7] << 24;
+    if (length < 68 || length > READING_JOURNAL_FILE_LIMIT) return ESP_ERR_INVALID_RESPONSE;
+    uint8_t *bytes = heap_caps_malloc(length, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!bytes) return ESP_ERR_NO_MEM;
+    memcpy(bytes, header, sizeof(header));
+    reading_journal_model_t restored = {0};
+    bool valid = fread(bytes + sizeof(header), 1, length - sizeof(header), file) == length - sizeof(header) &&
+        reading_journal_decode(&restored, NULL, bytes, length);
+    free(bytes);
+    if (!valid) return ESP_ERR_INVALID_RESPONSE;
+    esp_err_t err = ESP_OK;
+    if (apply) {
+        // 先持久化新快照，失败保留现有手账与插画。/ Commit a new slot before replacing the live journal and its scene.
+        (void)app_reading_journal_poll();
+        if (!s_loaded || !save_snapshot(&restored)) err = ESP_FAIL;
+        else {
+            reading_journal_clear(&s_model);
+            s_model = restored;
+            memset(&restored, 0, sizeof(restored));
+            s_dirty = s_manual = s_storage_error = s_capacity_error = false;
+            s_saved_us = esp_timer_get_time();
+        }
+    }
+    reading_journal_clear(&restored);
+    return err;
+}
+
 bool app_reading_journal_relocate(const char *old_path, const char *new_path, uint32_t size) {
     (void)app_reading_journal_poll();
     if (!s_loaded) return false;

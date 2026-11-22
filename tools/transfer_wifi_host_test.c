@@ -121,6 +121,15 @@ static void test_profiles(void) {
     assert(store_credentials(&next) == ESP_ERR_NO_MEM);
     assert(load_profiles(&profiles) == ESP_OK && profiles.count == WIFI_TRANSFER_SAVED_MAX);
     assert(profile_index(&profiles, "legacy") >= 0 && profile_index(&profiles, "overflow") < 0);
+    transfer_profiles_t restored = {.version = 2, .count = 1, .items = {next}};
+    assert(!merge_backup_profiles(&restored, &profiles));
+    assert(load_profiles(&profiles) == ESP_OK && profile_index(&profiles, "overflow") < 0);
+    restored = (transfer_profiles_t){.version = 2, .count = 1};
+    assert(credentials_from_text("legacy", "backup-pass", &restored.items[0]));
+    assert(merge_backup_profiles(&restored, &profiles));
+    assert(restored.count == profiles.count && !strcmp(restored.items[0].password, "backup-pass"));
+    assert(!strcmp(restored.items[1].ssid, profiles.items[0].ssid));
+    clear_secret(&restored, sizeof(restored));
     fail_commit = 1;
     assert(forget_credentials("legacy", &next) == ESP_FAIL && !next.version && !handles);
     fail_commit = 0;

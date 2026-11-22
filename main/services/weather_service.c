@@ -1,13 +1,14 @@
 /*
  * 中文：平台天气代理、独占短连和本地两日缓存；搜索批次仅暂存RAM，不保存密钥或完整城市字典。
  * English: Platform weather proxy, exclusive short connections and two-day cache; search batches stay in RAM, without keys or a full city dictionary.
- * 冻结：不抢占传书/升级；页面离开、锁屏、关机和快捷WiFi前必须取消等待。
- * Frozen: Never steal transfer/update sessions; cancel and join before exit, lock, shutdown or quick WiFi.
+ * 冻结：不抢占传书/升级；离页仅通知取消，防止弱网阻塞导航；休眠/关机前仍确认交还。按用户要求，非天气页空闲时可借用已就绪网络静默刷新。
+ * Frozen: Never steal transfer/update sessions. Navigation signals cancellation without waiting on weak links; sleep/shutdown still require handoff. Per user request, idle non-weather pages may refresh quietly over an already-ready link.
  */
 #include "weather_service.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
+#include "esp_log.h"
 #include "esp_tls_errors.h"
 #include "esp_timer.h"
 #include "epdiy.h"
@@ -18,6 +19,8 @@
 #include "ota_online.h"
 #include "device_power.h"
 #include "ble_page_turner.h"
+#include "memory_peak.h"
+#include "memory_manager.h"
 #include "time_service.h"
 #include "wifi_transfer.h"
 #include "network_service.h"
@@ -32,6 +35,7 @@
 #ifndef CONFIG_PICO_COMPONENT_API_ORIGIN
 #define CONFIG_PICO_COMPONENT_API_ORIGIN "https://mogo.mantake.shop"
 #endif
+#define WEATHER_DEFER_US (5LL * 1000000)
 #define WEATHER_RETRY_US (5LL * 60 * 1000000)
 #define WEATHER_SESSION_US (45LL * 1000000)
 #define WEATHER_CONNECT_US (6LL * 1000000)
@@ -39,7 +43,7 @@
 #define WEATHER_CELLULAR_CONNECT_US (20LL * 1000000)
 #define WEATHER_CELLULAR_RESPONSE_US (10LL * 1000000)
 #define WEATHER_IO_POLL_MS 200
-#define WEATHER_REFRESH_SECONDS (6LL * 60 * 60)
+#define WEATHER_TASK_STACK_BYTES 8192u
 typedef struct weather_search_batch {
     struct weather_search_batch *next;
     unsigned page, count;
@@ -74,16 +78,18 @@ typedef struct {
 static app_weather_view_t s_view;
 static weather_result_t s_result;
 static app_weather_request_t s_request;
+static network_use_t s_network_use;
 static char s_query[193];
 static char s_cached_query[193];
 static weather_search_batch_t *s_search_batches;
 static bool s_search_total_known, s_requested_total_known;
 static unsigned s_search_total, s_requested_total, s_requested_missing[2], s_requested_missing_count;
 static weather_location_t s_requested_city;
-static bool s_requested_has_city, s_loaded, s_pending;
+static bool s_requested_has_city, s_background_cache, s_loaded, s_pending;
 static bool s_auto_attempted;
 static unsigned s_search_generation, s_requested_search_generation, s_requested_page;
 static atomic_bool s_busy, s_cancel;
+static bool s_fetch_after_cancel;
 static SemaphoreHandle_t s_done;
 static int64_t s_next_attempt, s_deadline;
 static int32_t s_display_day;
@@ -98,8 +104,11 @@ static int64_t clock_now(const weather_clock_t *clock) {
 }
 int64_t app_weather_now(void) { return clock_now(&s_clock); }
 
-static bool write_blob(const char *key, const void *value, size_t size) {
+static bool persist_blob(const char *key, const void *value, size_t size, bool cancellable) {
     if (!epd_flash_begin()) return false;
+    // 取得面板安全锁后再检查取消，避免旧城市请求晚于新设置写入。
+    // Recheck cancellation under the panel guard so an old city's request cannot write after new preferences.
+    if (cancellable && atomic_load(&s_cancel)) { epd_flash_end(); return false; }
     nvs_handle_t h;
     esp_err_t err = nvs_open("kiiko_weather", NVS_READWRITE, &h);
     if (err == ESP_OK) {
@@ -110,6 +119,9 @@ static bool write_blob(const char *key, const void *value, size_t size) {
     }
     epd_flash_end();
     return err == ESP_OK;
+}
+static bool write_blob(const char *key, const void *value, size_t size) {
+    return persist_blob(key, value, size, false);
 }
 static bool save_preferences(bool enabled, bool auto_refresh, bool has_city, const weather_location_t *city) {
     weather_preferences_t p = {.schema = 3, .enabled = enabled, .has_city = has_city, .auto_refresh = auto_refresh};
@@ -202,6 +214,7 @@ static bool http_get_once(const char *path, char *body, weather_clock_t *respons
     esp_err_t init_error;
     esp_http_client_handle_t client = network_http_client_init(&config, bearer, &s_http_session, &init_error);
     if (!client) {
+        if (init_error == ESP_ERR_NO_MEM) result_notice(APP_WEATHER_FAILED, "内存不足，请稍后重试");
         *retryable = init_error == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME && !cancelled();
         network_diagnostics_http_failure("weather", NULL, "init", init_error, bearer);
         return false;
@@ -326,18 +339,24 @@ static bool search_show_page(unsigned page) {
     return true;
 }
 static void weather_worker(void *arg) {
-    (void)arg;
     network_lease_t lease = {0};
-    char *body = heap_caps_malloc(WEATHER_BODY_LIMIT + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *body = cancelled() ? NULL : mm_alloc(MM_OWNER_NETWORK, MM_POOL_PSRAM, WEATHER_BODY_LIMIT + 1, 0, 0);
+    // 已知分配完成后再交还闸门，随后才能申请无线，不能持有名额等待网络。
+    // Finish known allocations before acquiring the radio; never hold the startup slot while waiting for the network.
+    memory_peak_finish((memory_peak_token_t)(uintptr_t)arg);
     result_notice(APP_WEATHER_FAILED, "天气更新失败，可稍后重试");
+    if (cancelled()) goto done;
     if (!body) {
-
         result_notice(APP_WEATHER_FAILED, "内存不足，请稍后重试"); goto done;
     }
-    if (cancelled()) goto done;
-    if (network_service_acquire(NETWORK_USE_WEATHER, &lease) != ESP_OK ||
-        !network_service_wait_ready(&lease, 30000)) {
-        result_notice(APP_WEATHER_UNAVAILABLE, "当前联网方式不可用，请检查网络设置");
+    if (ble_pt_connected()) {
+        result_notice(APP_WEATHER_UNAVAILABLE, "翻页器正在使用，请先关闭蓝牙");
+        goto done;
+    }
+    const esp_err_t acquire = network_service_acquire(s_network_use, &lease);
+    if (acquire != ESP_OK || !network_service_wait_ready_cancelable(&lease, 30000, cancelled)) {
+        const char *hint = memory_peak_hint(acquire);
+        result_notice(APP_WEATHER_UNAVAILABLE, hint ? hint : "当前联网方式不可用，请检查网络设置");
         goto done;
     }
     network_diagnostics_snapshot("weather", lease.bearer);
@@ -387,7 +406,7 @@ static void weather_worker(void *arg) {
         s_result.has_city = true; s_result.city = city;
     }
     char path[256];
-    snprintf(path, sizeof(path), "/components/weather/forecast?locationId=%s", city.id);
+    snprintf(path, sizeof(path), "/components/weather/forecast?locationId=%s&maxAgeHours=%d", city.id, WEATHER_MAX_AGE_HOURS);
     weather_clock_t clock = s_requested_clock, response_clock;
     if (!http_get(path, body, &response_clock, lease.bearer)) goto done;
     // 仅接受同一可信HTTPS预报的时间；旧响应不能倒退参照或延长原始有效期。
@@ -404,10 +423,16 @@ static void weather_worker(void *arg) {
     s_result.has_forecast = true; result_notice(APP_WEATHER_READY, "");
 done:
     network_service_release(&lease);
-    heap_caps_free(body);
+    if (body) (void)mm_free(body);
     if (cancelled() && s_result.state == APP_WEATHER_READY) {
         s_result.has_forecast = false;
         result_notice(APP_WEATHER_FAILED, "天气更新失败，可稍后重试");
+    }
+    if (s_background_cache && !atomic_load(&s_cancel)) {
+        if (s_result.has_forecast) {
+            weather_cache_t cache = {.schema=2,.forecast=s_result.forecast};
+            (void)persist_blob("cache", &cache, sizeof(cache), true);
+        } else if (s_result.clear_cache) (void)persist_blob("cache", NULL, 0, true);
     }
     if (s_result.state != APP_WEATHER_READY) search_free_batches(&s_result.batches);
     atomic_store(&s_busy, false);
@@ -417,6 +442,10 @@ done:
 static bool collect_result(void) {
     if (!s_pending || app_weather_busy() || xSemaphoreTake(s_done, 0) != pdTRUE) return false;
     s_pending = false;
+    if (atomic_load(&s_cancel)) {
+        search_free_batches(&s_result.batches);
+        return false;
+    }
     if (s_request == APP_WEATHER_SEARCH && s_requested_search_generation != s_search_generation) {
         search_free_batches(&s_result.batches);
         s_view.state = APP_WEATHER_IDLE; s_view.notice[0] = 0; ++s_view.revision; return true;
@@ -430,12 +459,17 @@ static bool collect_result(void) {
             snprintf(s_view.notice, sizeof(s_view.notice), "城市保存失败，请检查设置存储");
         }
     }
-    if (s_result.clear_cache) { s_view.has_forecast = false; (void)write_blob("cache", NULL, 0); }
+    if (s_result.clear_cache) {
+        s_view.has_forecast = false;
+        if (!s_background_cache) (void)write_blob("cache", NULL, 0);
+    }
     else if (s_result.has_forecast) {
         s_clock = s_result.clock;
         s_view.forecast = s_result.forecast; s_view.has_forecast = true;
-        weather_cache_t cache = {.schema=2,.forecast=s_view.forecast};
-        (void)write_blob("cache", &cache, sizeof(cache));
+        if (!s_background_cache) {
+            weather_cache_t cache = {.schema=2,.forecast=s_view.forecast};
+            (void)write_blob("cache", &cache, sizeof(cache));
+        }
     }
     if (s_request == APP_WEATHER_SEARCH) {
         if (s_result.state == APP_WEATHER_READY) {
@@ -452,35 +486,60 @@ static bool collect_result(void) {
     }
     ++s_view.revision; return true;
 }
-void app_weather_cancel_join(void) {
+void app_weather_cancel(void) {
+    s_fetch_after_cancel = false;
     if (!s_pending) return;
-    atomic_store(&s_cancel, true);
+    if (!atomic_exchange(&s_cancel, true)) {
+        s_view.state = APP_WEATHER_IDLE;
+        s_view.notice[0] = 0;
+        ++s_view.revision;
+    }
+    (void)collect_result();
+}
+void app_weather_reap_cancelled(void) {
+    if (s_pending && atomic_load(&s_cancel)) (void)collect_result();
+}
+void app_weather_cancel_join(void) {
+    app_weather_cancel();
+    if (!s_pending) return;
     xSemaphoreTake(s_done, portMAX_DELAY);
     s_pending = false;
     search_free_batches(&s_result.batches);
-    s_view.state = APP_WEATHER_IDLE;
-    s_view.notice[0] = 0;
-    ++s_view.revision;
 }
 bool app_weather_set_enabled(bool enabled) {
-    app_weather_init(); app_weather_cancel_join();
+    app_weather_init(); app_weather_cancel();
     if (!save_preferences(enabled, s_view.auto_refresh, s_view.has_city, &s_view.city)) return false;
     s_view.enabled = enabled; s_next_attempt = 0; ++s_view.revision; return true;
 }
 bool app_weather_set_auto_refresh(bool enabled) {
-    app_weather_init(); app_weather_cancel_join();
+    app_weather_init(); app_weather_cancel();
     if (!save_preferences(s_view.enabled, enabled, s_view.has_city, &s_view.city)) return false;
     s_view.auto_refresh = enabled; s_next_attempt = 0; ++s_view.revision; return true;
 }
 bool app_weather_select(const weather_location_t *city) {
     if (!weather_location_valid(city)) return false;
-    app_weather_init(); app_weather_cancel_join();
+    app_weather_init(); app_weather_cancel();
     if (!save_preferences(s_view.enabled, s_view.auto_refresh, true, city)) return false;
     s_view.city = *city; s_view.has_city = true; s_view.has_forecast = false;
     app_weather_clear_search();
     s_view.state = APP_WEATHER_IDLE; s_view.notice[0] = 0;
     (void)write_blob("cache", NULL, 0);
     s_next_attempt = 0; ++s_view.revision; return true;
+}
+bool app_weather_restore_preferences(bool auto_refresh, bool has_city, const weather_location_t *city) {
+    if (has_city && !weather_location_valid(city)) return false;
+    app_weather_init();
+    app_weather_cancel();
+    if (!save_preferences(s_view.enabled, auto_refresh, has_city, city)) return false;
+    s_view.auto_refresh = auto_refresh;
+    s_view.has_city = has_city;
+    s_view.city = has_city ? *city : (weather_location_t){0};
+    s_view.has_forecast = false;
+    s_display_valid = false;
+    s_view.state = APP_WEATHER_IDLE;
+    app_weather_clear_search();
+    s_next_attempt = 0;
+    return true;
 }
 void app_weather_clear_search(void) {
     ++s_search_generation;
@@ -490,16 +549,23 @@ void app_weather_clear_search(void) {
     s_view.result_count = s_view.result_total = s_view.result_page = 0;
     memset(s_view.results, 0, sizeof(s_view.results)); ++s_view.revision;
 }
-static bool request_page(app_weather_request_t request, const char *query, unsigned page) {
+static bool start_request(app_weather_request_t request, const char *query, unsigned page, bool manual, bool quiet) {
     app_weather_init(); (void)collect_result();
-    if (s_pending || pico_online_busy()) return false;
+    if (s_pending || pico_online_busy() || app_time_service_busy()) {
+        if (!manual) s_next_attempt = esp_timer_get_time() + WEATHER_DEFER_US;
+        return false;
+    }
     if (!weather_clock_valid(time(NULL))) {
         s_view.state = APP_WEATHER_UNAVAILABLE;
         snprintf(s_view.notice, sizeof(s_view.notice), "请先校准系统日期与时间"); ++s_view.revision; return false;
     }
     if (ble_pt_connected()) {
-        s_view.state = APP_WEATHER_UNAVAILABLE;
-        snprintf(s_view.notice, sizeof(s_view.notice), "蓝牙翻页器正在使用，请稍后更新"); ++s_view.revision; return false;
+        if (manual) {
+            s_view.state = APP_WEATHER_UNAVAILABLE;
+            snprintf(s_view.notice, sizeof(s_view.notice), "翻页器正在使用，请先关闭蓝牙");
+            ++s_view.revision;
+        }
+        return false;
     }
     const pmu_snapshot_t *pmu = device_power_get();
     int percent = pmu_battery_percent(pmu);
@@ -516,9 +582,30 @@ static bool request_page(app_weather_request_t request, const char *query, unsig
         snprintf(s_query, sizeof(s_query), "%s", query);
     }
     s_requested_page = page;
+    memory_peak_token_t peak;
+    if (memory_peak_try_begin(MEMORY_PEAK_WEATHER, &peak) != ESP_OK) {
+        if (!manual) s_next_attempt = esp_timer_get_time() + WEATHER_DEFER_US;
+        return false;
+    }
+    const esp_err_t capacity = memory_peak_check((memory_peak_heap_t){
+        .internal_free = WEATHER_TASK_STACK_BYTES, .internal_block = WEATHER_TASK_STACK_BYTES,
+        .psram_free = WEATHER_BODY_LIMIT + 1, .psram_block = WEATHER_BODY_LIMIT + 1,
+    });
+    if (capacity != ESP_OK) {
+        memory_peak_finish(peak);
+        if (manual) {
+            s_view.state = APP_WEATHER_FAILED;
+            snprintf(s_view.notice, sizeof(s_view.notice), "内存不足，请稍后重试");
+            ++s_view.revision;
+        }
+        return false;
+    }
     if (!s_done) s_done = xSemaphoreCreateBinary();
-    if (!s_done) return false;
+    if (!s_done) { memory_peak_finish(peak); return false; }
     s_request = request; s_requested_city = s_view.city; s_requested_has_city = s_view.has_city;
+    s_background_cache = !manual && request == APP_WEATHER_FETCH && s_requested_has_city;
+    s_network_use = quiet ? NETWORK_USE_WEATHER_BACKGROUND :
+        manual && request == APP_WEATHER_FETCH ? NETWORK_USE_WEATHER_MANUAL : NETWORK_USE_WEATHER;
     s_requested_clock = s_clock;
     if(request==APP_WEATHER_LOCATE||(request==APP_WEATHER_FETCH&&!s_view.has_city))s_auto_attempted=true;
     memset(&s_result, 0, sizeof(s_result));
@@ -531,43 +618,80 @@ static bool request_page(app_weather_request_t request, const char *query, unsig
             if (!search_batch(batch)) s_requested_missing[s_requested_missing_count++] = batch;
     }
     atomic_store(&s_cancel, false); atomic_store(&s_busy, true);
-    // 先公布忙状态，主循环不再调度自动校时/OTA；等待旧校时释放后才启动网络。
-    // Publish busy before suppressing automatic time/OTA scheduling; let the old sync release its session first.
-    app_time_service_cancel();
     s_next_attempt = esp_timer_get_time() + WEATHER_RETRY_US;
     s_deadline = esp_timer_get_time() + WEATHER_SESSION_US;
-    if (xTaskCreate(weather_worker, "weather", 8192, NULL, 1, NULL) != pdPASS) {
-
+    // TLS 的软件大整数运算可在单次调用内持续占用 CPU；与 Idle 同级确保它仍可喂看门狗。
+    // TLS software bignum work may run for a long time in one call; share idle priority so Idle still runs.
+    if (xTaskCreate(weather_worker, "weather", WEATHER_TASK_STACK_BYTES, (void *)(uintptr_t)peak,
+                    tskIDLE_PRIORITY, NULL) != pdPASS) {
+        memory_peak_finish(peak);
         atomic_store(&s_busy, false);
         s_view.state = APP_WEATHER_FAILED;
         snprintf(s_view.notice, sizeof(s_view.notice), "内存不足，请稍后重试"); ++s_view.revision; return false;
     }
-    s_pending = true; s_view.state = APP_WEATHER_LOADING; s_view.notice[0] = 0;
+    s_pending = true;
     s_requested_search_generation = s_search_generation;
-    ++s_view.revision; return true;
+    if (!quiet && (manual || !s_view.has_forecast || !weather_forecast_valid(&s_view.forecast, app_weather_now()))) {
+        s_view.state = APP_WEATHER_LOADING; s_view.notice[0] = 0; ++s_view.revision;
+    }
+    return true;
+}
+static bool request_page(app_weather_request_t request, const char *query, unsigned page, bool manual) {
+    return start_request(request, query, page, manual, false);
 }
 bool app_weather_request(app_weather_request_t request, const char *query) {
-    return request_page(request, query, 0);
+    if (request_page(request, query, 0, true)) return true;
+    // 选城后的显式更新不能被旧请求取消吞掉；只保留一个待更新标志，不分配任务。
+    // Preserve one explicit refresh after city selection without allocating a queued task.
+    if (request == APP_WEATHER_FETCH && s_pending && atomic_load(&s_cancel)) {
+        s_fetch_after_cancel = true;
+        return true;
+    }
+    return false;
 }
 bool app_weather_search(const char *query, unsigned page) {
     app_weather_init(); (void)collect_result();
     if (s_pending || !weather_query_valid(query) || page >= (WEATHER_SEARCH_TOTAL_LIMIT + WEATHER_CITY_LIMIT - 1) / WEATHER_CITY_LIMIT) return false;
     if (!strcmp(s_cached_query, query) && search_show_page(page)) return true;
-    return request_page(APP_WEATHER_SEARCH, query, page);
+    return request_page(APP_WEATHER_SEARCH, query, page, true);
+}
+static bool auto_due(int64_t now, bool valid) {
+    return s_view.auto_refresh && (s_view.has_city || !s_auto_attempted) && !s_pending &&
+        esp_timer_get_time() >= s_next_attempt && s_view.state != APP_WEATHER_CITY_REQUIRED &&
+        (!valid || now >= s_view.forecast.fetched + WEATHER_MAX_AGE_SECONDS ||
+         !weather_day_for(&s_view.forecast, now, true));
+}
+void app_weather_background_pause(void) {
+    if (s_pending && s_network_use == NETWORK_USE_WEATHER_BACKGROUND && !collect_result()) app_weather_cancel();
+}
+void app_weather_background_poll(void) {
+    app_weather_init();
+    if (s_pending && s_network_use == NETWORK_USE_WEATHER_BACKGROUND) (void)collect_result();
+    if (!s_view.has_city) return;
+    const int64_t now = app_weather_now();
+    if (!auto_due(now, s_view.has_forecast && weather_forecast_valid(&s_view.forecast, now))) return;
+    network_status_t status;
+    network_service_get_status(&status);
+    if (status.active_bearer == NETWORK_BEARER_NONE) return;
+    s_next_attempt = esp_timer_get_time() + WEATHER_RETRY_US;
+    (void)start_request(APP_WEATHER_FETCH, NULL, 0, false, true);
 }
 bool app_weather_poll(bool automatic) {
     app_weather_init(); unsigned revision = s_view.revision;
-    (void)collect_result(); int64_t now = app_weather_now();
+    (void)collect_result();
+    if (s_fetch_after_cancel && !s_pending) {
+        s_fetch_after_cancel = false;
+        (void)request_page(APP_WEATHER_FETCH, NULL, 0, true);
+    }
+    int64_t now = app_weather_now();
     bool valid = s_view.has_forecast && weather_forecast_valid(&s_view.forecast, now);
     int32_t day = weather_local_day(now);
     if (day != s_display_day || valid != s_display_valid) {
         s_display_day = day; s_display_valid = valid; ++s_view.revision;
     }
-    if (automatic && s_view.auto_refresh && (s_view.has_city||!s_auto_attempted) && !s_pending && esp_timer_get_time() >= s_next_attempt &&
-        s_view.state != APP_WEATHER_CITY_REQUIRED &&
-        (!valid || now >= s_view.forecast.fetched + WEATHER_REFRESH_SECONDS || !weather_day_for(&s_view.forecast, now, true))) {
+    if (automatic && auto_due(now, valid)) {
         s_next_attempt = esp_timer_get_time() + WEATHER_RETRY_US;
-        (void)app_weather_request(APP_WEATHER_FETCH, NULL);
+        (void)request_page(APP_WEATHER_FETCH, NULL, 0, false);
     }
     return revision != s_view.revision;
 }

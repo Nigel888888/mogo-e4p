@@ -45,9 +45,9 @@ Details, streaks and scenes live in alternating internal-volume snapshots, indep
 
 Dirty data saves approximately once a minute, with immediate attempts on lock, exit or manual scene changes. Unavailable storage retains the current RAM session, retries every thirty seconds and merges it with disk after recovery. Power loss can lose unsaved changes. Limits are 512 book/day rows and 8192 chapter bits per row; allocation/capacity/storage failures show notices without claiming success. Titles are bounded to 127 bytes at UTF-8 boundaries and further elided for display.
 
-首页布局仍纳入v33设置备份，但**手账明细、打卡摘要与插画选择不纳入现有设置/书籍备份恢复**；恢复旧票根不会回填手账。固件版本仍沿用当前正式版，本地测试不创建OTA版本或更换发布附件。
+首页布局自 v33 纳入设置备份。v48 起备份当前手账明细、打卡摘要和插画选择；有内容的快照恢复会替换现有手账，空快照或旧备份不改现值。恢复旧票根不会回填手账。
 
-Home placement remains in v33 settings backups, but **journal records, streaks and scene choices are excluded from existing settings/book backup/restore**. Restored tickets do not populate the journal. Local testing keeps the published version without creating OTA versions or replacing release assets.
+Home placement is included since v33. Version 48 adds journal records, streaks and scene choices; a nonempty backup snapshot replaces the current journal. Empty snapshots and older backups leave it unchanged. Restored tickets do not populate the journal.
 
 ## 素材与验证 / Assets And Verification
 

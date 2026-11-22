@@ -52,6 +52,12 @@ static void forecast_rejections(void) {
     int64_t fetched=weather_timestamp("2026-11-02T00:20:00Z");
     assert(parse_result(root,fetched-121)==WEATHER_PARSE_CLOCK);
     assert(parse_result(root,fetched+21600)==WEATHER_PARSE_EXPIRED);
+    cJSON_ReplaceItemInObject(root,"freshUntil",cJSON_CreateString("2026-11-02T10:20:00Z"));
+    cJSON_ReplaceItemInObject(root,"serveUntil",cJSON_CreateString("2026-11-02T10:20:00Z"));
+    assert(parse_result(root,fetched+WEATHER_MAX_AGE_SECONDS-1)==WEATHER_PARSE_OK);
+    assert(parse_result(root,fetched+WEATHER_MAX_AGE_SECONDS)==WEATHER_PARSE_EXPIRED);
+    cJSON_ReplaceItemInObject(root,"serveUntil",cJSON_CreateString("2026-11-02T10:20:01Z"));
+    assert(parse_result(root,now)==WEATHER_PARSE_VALIDITY);
     // Production timestamps may contain all nine nanosecond digits.
     cJSON_ReplaceItemInObject(root,"fetchedAt",cJSON_CreateString("2026-11-02T00:20:00.835869030Z"));
     cJSON_ReplaceItemInObject(root,"freshUntil",cJSON_CreateString("2026-11-02T06:20:00.835869030Z"));

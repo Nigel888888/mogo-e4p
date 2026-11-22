@@ -22,10 +22,12 @@ typedef struct {
 void home_library_enter(void);
 /// 离页停任务，保留最多五张有效封面；返回时检查文件并按书籍身份复用。/ Stop work on exit, keeping up to five covers for identity-checked reuse on return.
 void home_library_leave(void);
+/// 锁屏时取消扫描，恢复首页后按需重试。/ Cancel scans on lock and retry as needed after the home page resumes.
+void home_library_pause(void);
 void home_library_media_lost(void);
 void home_library_invalidate(void);
-/// 只在UI事件任务调用；扫描借用取消回调，绘制不调用。/ UI event task only; scans borrow a cancellation hook, never called by painting.
-bool home_library_poll(bool (*cancel)(void *ctx), void *ctx);
+/// UI任务只提交或接收后台扫描，绘制不调用。/ The UI task submits or collects background scans; never called by painting.
+bool home_library_poll(void);
 home_library_view_t home_library_view(void);
 bool home_library_recent(bool recent);
 void home_library_shuffle(void);

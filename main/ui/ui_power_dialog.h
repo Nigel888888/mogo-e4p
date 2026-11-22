@@ -53,3 +53,6 @@ void ui_power_dialog_end(void);
 void ui_power_dialog_draw(uint8_t *fb, const ui_power_dialog_t *dialog);
 EpdRect ui_power_dialog_rect(void);
 void ui_power_final_draw(uint8_t *fb, bool restarting);
+/// 事件路径生成关机画面；自定义图片仅访问TF缓存，票根/拼贴可读取卡上阅读素材。
+/// Event-only shutdown art; custom images use SD caches, while ticket/collage may read card sources.
+void ui_power_shutdown_prepare(uint8_t *fb);

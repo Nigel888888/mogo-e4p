@@ -91,31 +91,6 @@ static void txt_heading_regressions(void) {
     write_bytes(s, strlen(s)); roundtrip(s, strlen(s));
     assert(book_open(path) == ESP_OK);
     assert(book_chapter_title(0, title, sizeof(title)) == ESP_OK && !strcmp(title, "第一章 单章"));
-    html_text_t title_blocks = {0};
-    assert(book_chapter_load_blocks(0, &title_blocks) == ESP_OK);
-    assert(title_blocks.count == 2 && title_blocks.blocks[0].heading &&
-           title_blocks.blocks[0].chapter_start && title_blocks.blocks[0].offset == 0 &&
-           title_blocks.blocks[1].offset > title_blocks.blocks[0].offset);
-    html_text_free(&title_blocks);
-    book_close();
-    s = "内容简介：\n一段简介正文\n\n序章 大荒\n序章的正文\n\n第0001章 朝气蓬勃\n本章正文\n";
-    write_bytes(s, strlen(s)); assert(book_open(path) == ESP_OK);
-    assert(book_chapter_count() == 3);
-    assert(book_chapter_title(0, title, sizeof(title)) == ESP_OK && !strcmp(title, "内容简介："));
-    assert(book_chapter_title(1, title, sizeof(title)) == ESP_OK && !strcmp(title, "序章 大荒"));
-    assert(book_chapter_title(2, title, sizeof(title)) == ESP_OK && !strcmp(title, "第0001章 朝气蓬勃"));
-    html_text_t synopsis_blocks = {0}, prologue_blocks = {0}, chapter_blocks = {0};
-    assert(book_chapter_load_blocks(0, &synopsis_blocks) == ESP_OK);
-    assert(synopsis_blocks.count == 2 && synopsis_blocks.blocks[0].heading);
-    assert(book_chapter_load_blocks(1, &prologue_blocks) == ESP_OK);
-    assert(prologue_blocks.count == 2 && prologue_blocks.blocks[0].heading &&
-           prologue_blocks.blocks[0].len == strlen("序章 大荒") &&
-           !strncmp(prologue_blocks.utf8 + prologue_blocks.blocks[0].offset, "序章 大荒", prologue_blocks.blocks[0].len));
-    assert(book_chapter_load_blocks(2, &chapter_blocks) == ESP_OK);
-    assert(chapter_blocks.count == 2 && chapter_blocks.blocks[0].heading &&
-           chapter_blocks.blocks[0].len == strlen("第0001章 朝气蓬勃") &&
-           !strncmp(chapter_blocks.utf8 + chapter_blocks.blocks[0].offset, "第0001章 朝气蓬勃", chapter_blocks.blocks[0].len));
-    html_text_free(&synopsis_blocks); html_text_free(&prologue_blocks); html_text_free(&chapter_blocks);
     book_close();
     s = "第1章 开始\n正文\n第1章 开始\n另一段正文\n第2章 结束";
     write_bytes(s, strlen(s)); roundtrip(s, strlen(s));
@@ -189,7 +164,7 @@ int main(int argc, char **argv) {
             assert(book_chapter_load(i, &out, &len) == ESP_OK); assert(out[len] == 0);
             html_text_t blocks = {0}; assert(book_chapter_load_blocks(i, &blocks) == ESP_OK);
             assert(blocks.len == len && !memcmp(blocks.utf8, out, len));
-            if (blocks.blocks) assert(blocks.count > 0);
+            assert(epub ? blocks.blocks != NULL && blocks.count > 0 : blocks.blocks == NULL && blocks.count == 0);
             if (strstr(argv[a], "河边记事_图文.epub")) {
                 assert(blocks.image_count == 60);
                 size_t images = 0;

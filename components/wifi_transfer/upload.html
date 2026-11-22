@@ -159,7 +159,7 @@ ul{list-style:none;padding:0;margin:0}svg{fill:none;stroke:currentColor;stroke-l
   <div id="signature-view" class="view" hidden><div class="settings-layout"><section id="signatureSettings" class="settings-intro"><h2>状态栏签名</h2><p>在墨水屏顶部居中显示。<br>保存后重启仍会保留，留空保存即可隐藏。</p><label class="field-label" for="signatureText">签名内容</label><input id="signatureText" type="text" maxlength="95" placeholder="写下你的签名" aria-describedby="signatureLimit" disabled><p class="meta" id="signatureLimit">最多 95 字节，约 31 个汉字</p><button id="signatureSave" class="primary" disabled><svg aria-hidden="true"><use href="#icon-check"/></svg>保存签名</button><p id="signatureResult" class="result" role="status">正在读取签名…</p><button id="signatureRetry" class="secondary" hidden>重试读取签名</button></section><section class="reader-preview" aria-label="墨水屏签名效果示意"><div class="reader-screen"><div class="reader-top"><span>mogo</span><span id="signaturePreview"></span><svg aria-hidden="true"><use href="#icon-battery-full"/></svg></div><div class="reader-body"><h2>从百草园到三味书屋</h2><p>我家的后面有一个很大的园，相传叫作百草园。现在是早已并屋子一起卖给朱文公的子孙了，连那最末次的相见也已经隔了七八年，其中似乎确凿只有一些野草；但那时却是我的乐园。</p><p>不必说碧绿的菜畦，光滑的石井栏，高大的皂荚树，紫红的桑椹；也不必说鸣蝉在树叶里长吟，肥胖的黄蜂伏在菜花上……</p></div><div class="reader-footer">朝花夕拾<span>签名效果示意</span></div></div></section></div></div>
   <footer class="page-footer"><span>mogo / 让阅读回到阅读</span><span>本地 WiFi 传输</span></footer>
 </main>
-<dialog id="editor"><form id="editorForm"><div class="dialog-heading"><h2 id="editorTitle"></h2><button id="editorClose" type="button" class="icon-button" aria-label="关闭" title="关闭"><svg aria-hidden="true"><use href="#icon-x"/></svg></button></div><p id="editorDescription"></p><label id="editorLabel" for="editorName">名称</label><input id="editorName" type="text" maxlength="238"><p id="editorError" class="danger" role="alert"></p><div class="dialog-actions"><button id="editorCancel" class="secondary" type="button">取消</button><button id="editorConfirm" class="primary" type="submit">保存</button></div></form></dialog>
+<dialog id="editor"><form id="editorForm"><div class="dialog-heading"><h2 id="editorTitle"></h2><button id="editorClose" type="button" class="icon-button" aria-label="关闭" title="关闭"><svg aria-hidden="true"><use href="#icon-x"/></svg></button></div><p id="editorDescription"></p><label id="editorLabel" for="editorName">名称</label><input id="editorName" type="text"><p id="editorNameBudget" class="result" aria-live="polite" hidden></p><p id="editorError" class="danger" role="alert"></p><div class="dialog-actions"><button id="editorCancel" class="secondary" type="button">取消</button><button id="editorConfirm" class="primary" type="submit">保存</button></div></form></dialog>
 <div id="rowMenu" class="row-menu" hidden aria-label="文件操作"></div>
 <script>
 const $ = id => document.getElementById(id);
@@ -172,6 +172,19 @@ const types = {
 const fixedPaths = {book:'books', font:'fonts', picture:'pictures'};
 const size = n => n >= 1073741824 ? (n/1073741824).toFixed(1)+' GB' : n >= 1048576 ? (n/1048576).toFixed(1)+' MB' : n >= 1024 ? Math.ceil(n/1024)+' KB' : n+' B';
 const join = (dir, name) => dir ? dir+'/'+name : name;
+const utf8 = new TextEncoder();
+const nameBytes = name => utf8.encode(name).length;
+const relativePathLimit = () => policy?.relative_path_limit ?? 238;
+function uploadNameLimit(kind,destination) {
+  if(kind==='file') return Math.max(0,relativePathLimit()-nameBytes(destination?destination+'/':''));
+  return (kind==='book'?policy?.book_name_limit:policy?.media_name_limit) ?? 120;
+}
+function uploadNameBudget(name,kind,destination) {
+  return nameBytes(name)+' / '+uploadNameLimit(kind,destination)+' 个 UTF-8 字节（含扩展名）';
+}
+function uploadNameTooLong(name,kind,destination) {
+  return nameBytes(name)>uploadNameLimit(kind,destination);
+}
 let policy=null, connected=false, busy=false, path='', page=0, pages=0, total=0;
 let directoryItems=[], directoryLoading=false, directoryEpoch=0, directoryReady=false, descending=false;
 let selected=new Set(), records=[], expandedQueue=false, editorAction=null, signatureLoaded=false;
@@ -259,7 +272,7 @@ function updateUpload() {
   $('uploadTitle').textContent=config.title; $('uploadFormats').textContent=config.formats;
   $('filePicker').accept=config.accept; $('uploadDestination').textContent='保存到 /'+path;
   const limit=config.limit || (kind==='book' && policy && policy.file_limit);
-  $('uploadLimit').textContent=(limit?'单文件不超过 '+size(limit)+'。':'')+'同名文件上传前确认，逐个传输。';
+  $('uploadLimit').textContent=(limit?'单文件不超过 '+size(limit)+'。':'')+'文件名最多 '+uploadNameLimit(kind,path)+' 个 UTF-8 字节（含扩展名）。同名文件上传前确认。';
   document.querySelectorAll('[data-folder]').forEach(el=>el.setAttribute('aria-pressed',String(el.dataset.folder===path)));
 }
 function filteredItems() {
@@ -342,17 +355,53 @@ function openEditor(action,item) {
   editorAction={action,source:item?join(path,item.name):path,dir:path,item,items};
   $('editorTitle').textContent={rename:'重命名',copy:'复制',delete:'删除',mkdir:'新建文件夹','bulk-delete':'删除所选文件'}[action];
   $('editorDescription').textContent=deleting?(bulk?'所选 '+items.length+' 项':join(path,item.name))+'（文件夹会删除其中所有文件）':'位置：/'+path;
-  $('editorError').textContent=''; $('editorName').hidden=$('editorLabel').hidden=deleting;
+  $('editorError').textContent=''; $('editorNameBudget').hidden=true;
+  $('editorLabel').textContent='名称'; $('editorName').hidden=$('editorLabel').hidden=deleting;
   $('editorName').value=action==='copy'?(item.directory?item.name+' 副本':item.name.replace(/(\.[^.]+)?$/,' 副本$1')):item?item.name:'';
   $('editorConfirm').textContent=deleting?'确认删除':'保存';
   $('editor').showModal(); if(!deleting) $('editorName').focus();
 }
+function openUploadNameEditor(entry) {
+  if(busy || entry.status!=='error' || !entry.file) return;
+  const dot=entry.name.lastIndexOf('.');
+  const extension=dot>0?entry.name.slice(dot):'';
+  editorAction={action:'upload-name',entry,extension};
+  $('editorTitle').textContent='修改保存名称';
+  $('editorDescription').textContent='仅修改设备 /'+entry.destination+' 中的保存名称，不会更改本地文件。';
+  $('editorLabel').textContent=extension?'文件名（扩展名 '+extension+' 不变）':'文件名';
+  $('editorName').hidden=$('editorLabel').hidden=false;
+  $('editorName').value=extension?entry.name.slice(0,dot):entry.name;
+  $('editorConfirm').textContent='保存并重试';
+  $('editorNameBudget').hidden=false;
+  updateEditorNameBudget();
+  $('editor').showModal(); $('editorName').focus();
+}
+function updateEditorNameBudget() {
+  if(editorAction?.action!=='upload-name') return;
+  const {entry,extension}=editorAction;
+  $('editorNameBudget').textContent=uploadNameBudget($('editorName').value+extension,entry.kind,entry.destination);
+  $('editorError').textContent='';
+}
+function uploadNameIsValid(name,kind) {
+  if(!name || /[\x00-\x1f\x7f\\/:*?"<>|]/.test(name) || name.startsWith(' ') || name.endsWith(' ')) return false;
+  if(kind==='file') return !name.endsWith('.');
+  return !name.startsWith('.') && !name.includes('..') && types[kind].re.test(name);
+}
 async function submitEditor() {
   if(busy || !editorAction) return;
   const {action,source,dir,items}=editorAction, deleting=action==='delete'||action==='bulk-delete';
+  if(action==='upload-name') {
+    const {entry,extension}=editorAction, stem=$('editorName').value, name=stem+extension;
+    updateEditorNameBudget();
+    if(!stem || !uploadNameIsValid(name,entry.kind)) { $('editorError').textContent='名称无效，请检查空格、斜杠或特殊符号'; return; }
+    if(uploadNameTooLong(name,entry.kind,entry.destination)) { $('editorError').textContent='文件名仍然过长，请再缩短一些'; return; }
+    entry.name=name;
+    $('editor').close(); editorAction=null;
+    return sendFiles([entry.file],entry.kind,entry.destination,entry);
+  }
   const name=$('editorName').value.trim(), target=join(dir,name);
   if(!deleting && (!name || name==='.' || name==='..' || /[\\/:*?"<>|]/.test(name))) { $('editorError').textContent='名称不能包含斜杠或特殊符号'; return; }
-  if(!deleting && new TextEncoder().encode(target).length>238) { $('editorError').textContent='路径过长，请缩短名称'; return; }
+  if(!deleting && nameBytes(target)>relativePathLimit()) { $('editorError').textContent='路径过长，请缩短名称'; return; }
   lock(true);
   try {
     try { await info(); if(policy.is_flash) throw Error('TF 卡未就绪'); }
@@ -369,7 +418,7 @@ async function submitEditor() {
   } finally { lock(false); }
 }
 function createRecord(file,kind,destination) {
-  const record={file,name:file.name,size:file.size,kind,destination,status:'waiting',progress:0,loaded:0,samples:[],message:''};
+  const record={file,name:file.name,size:file.size,kind,destination,status:'waiting',progress:0,loaded:0,samples:[],message:'',nameTooLong:false};
   records.push(record); return record;
 }
 function beginTransfer(entry) {
@@ -440,7 +489,13 @@ function renderQueue() {
     if(entry.status==='uploading') { const bar=node('div','queue-progress'); fill.style.width=entry.progress+'%'; bar.append(fill); row.append(bar); }
     queueRows.set(entry,{row,label,bytes,fill});
     if(entry.message) row.append(node('p','queue-error',entry.message));
-    if(entry.status==='error' && entry.file) { const retry=button('重试 '+entry.name,'refresh-cw','text-button'); retry.append(node('span','','重试')); retry.onclick=()=>sendFiles([entry.file],entry.kind,entry.destination,entry); row.append(retry); }
+    if(entry.status==='error' && entry.file) {
+      const label=entry.nameTooLong?'修改保存名称':'重试';
+      const retry=button(label+' '+entry.name,entry.nameTooLong?'pencil':'refresh-cw','text-button');
+      retry.append(node('span','',label));
+      retry.onclick=()=>entry.nameTooLong?openUploadNameEditor(entry):sendFiles([entry.file],entry.kind,entry.destination,entry);
+      row.append(retry);
+    }
     $('queueList').append(row);
   }
   $('queueList').scrollTop=scrollTop;
@@ -467,29 +522,38 @@ function upload(file,url,onProgress) {
 async function sendFiles(files,kind=uploadKind(),destination=path,retry=null) {
   if(busy || !files.length) return;
   if(!retry) records=records.slice(-40);
+  if(kind!=='file') destination=fixedPaths[kind];
   const config=types[kind], batch=retry?[retry]:files.map(file=>createRecord(file,kind,destination));
   activeBatch=batch;
-  if(retry) { retry.status='waiting'; retry.message=''; }
+  if(retry) { retry.status='waiting'; retry.message=''; retry.nameTooLong=false; }
   lock(true); renderQueue();
   let saved=0,failed=0,skipped=0;
   try {
     try { await info(); if(policy.is_flash) throw Error('TF 卡未就绪'); }
     catch(error) { for(const entry of batch) { entry.status='error'; entry.message=error.message; } $('uploadResult').textContent=error.message; return; }
+    for(const entry of batch) {
+      if(!records.includes(entry)) records.push(entry);
+      if(uploadNameTooLong(entry.name,kind,destination)) {
+        entry.status='error'; entry.nameTooLong=true;
+        entry.message='文件名过长：'+uploadNameBudget(entry.name,kind,destination)+'，未发送';
+        ++failed;
+      }
+    }
+    renderQueue();
     // 目标和 File 在本批次内固定；刷新失败不改变已确认的上传结果。
     // Freeze each batch's target and File; refresh failures cannot undo acknowledged uploads.
     for(const entry of batch) {
-      if(!records.includes(entry)) records.push(entry);
+      if(entry.nameTooLong) continue;
       entry.status='uploading'; entry.message=''; beginTransfer(entry); renderQueue();
       const file=entry.file;
       try {
         if(!connected) throw Error('连接中断，文件尚未发送');
-        if(config.re && (!config.re.test(file.name)||file.name.startsWith('.'))) throw Error('文件格式不支持');
+        if(config.re && (!config.re.test(entry.name)||entry.name.startsWith('.'))) throw Error('文件格式不支持');
         if(kind!=='file' && !file.size) throw Error('文件为空');
         if((config.limit && file.size>config.limit)||(kind==='book' && policy.file_limit && file.size>policy.file_limit)) throw Error('文件超过上限');
         if(file.size>policy.free_bytes) throw Error('TF 卡剩余空间不足');
-        const target=join(destination,file.name);
-        if(kind==='file' && new TextEncoder().encode(target).length>238) throw Error('路径过长，请缩短名称');
-        const url=config.url+(kind==='file'?'?path='+encodeURIComponent(target):'?name='+encodeURIComponent(file.name));
+        const target=join(destination,entry.name);
+        const url=config.url+(kind==='file'?'?path='+encodeURIComponent(target):'?name='+encodeURIComponent(entry.name));
         const progress=(done,length)=>updateTransferProgress(entry,done,length);
         let response=await upload(file,url,progress);
         if(response.status===409) {
@@ -596,6 +660,7 @@ function route() {
   $('pageSubtitle').textContent={files:'书籍、字体与图片，都在你的 TF 卡里。',wallpaper:'把喜欢的画面，留在每一次合书之后。',signature:'在阅读的页眉，留下一句话。'}[view];
   window.scrollTo(0,0);
 }
+$('editorName').oninput=updateEditorNameBudget;
 $('editorForm').onsubmit=event=>{ event.preventDefault(); return submitEditor(); };
 $('editorClose').onclick=$('editorCancel').onclick=()=>{ if(!busy) $('editor').close(); };
 $('editor').oncancel=event=>{ if(busy) event.preventDefault(); };

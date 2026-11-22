@@ -38,7 +38,26 @@ enum {EPD_ROT_PORTRAIT=1,EPD_ROT_INVERTED_PORTRAIT=2,EPD_ROT_INVERTED_LANDSCAPE=
 #endif
 static unsigned budget=8u*1024u*1024u;
 static size_t heap_caps_get_free_size(unsigned flags){(void)flags;return budget;}
-static void *heap_caps_malloc(size_t n,unsigned flags){(void)flags;return budget>=n?malloc(n):NULL;}
+static unsigned stage_attempts,stage_frees,stage_writes;
+static size_t stage_write_bytes[4];
+static bool count_stage_writes,fail_stage_alloc,fail_stage_write;
+static void *stage_ptr;
+static void *heap_caps_malloc(size_t n,unsigned flags){
+ if(n!=32768)return budget>=n?malloc(n):NULL;
+ assert(flags==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT)&&!stage_ptr);++stage_attempts;
+ return stage_ptr=!fail_stage_alloc&&budget>=n?malloc(n):NULL;
+}
+static void fixture_free(void *p){
+ if(p&&p==stage_ptr){stage_ptr=NULL;++stage_frees;}
+ free(p);
+}
+static size_t fixture_fwrite(const void *p,size_t size,size_t n,FILE *f){
+ if(p==stage_ptr&&count_stage_writes){
+  assert(size==1&&stage_writes<4);stage_write_bytes[stage_writes++]=n;
+  if(fail_stage_write)return n-1;
+ }
+ return fwrite(p,size,n,f);
+}
 static int epd_get_rotation(void){return PANEL_ROT;}
 static int epd_width(void){return PANEL_W;}
 static int epd_height(void){return PANEL_H;}
@@ -57,7 +76,7 @@ typedef struct{unsigned x,y,width,height;}book_crop_t;
 '''
 for n in ('luminance','scale_axis'):u+=function(n,c)+'\n'
 u+='typedef struct{uint16_t at;uint8_t frac;}scale_step_t;\n'
-for n in ('scale_map','scale_next','bilinear4','book_cover_crop'):u+=function(n,c)+'\n'
+for n in ('scale_gap','scale_map','scale_next','bilinear4','book_cover_crop'):u+=function(n,c)+'\n'
 u+='typedef bool (*image_cancel_fn)(void *);\ntypedef struct{const uint8_t *data;size_t size,pos;FILE *file;image_cancel_fn cancelled;void *context;}png_input_t;\n'
 for n in ('png_read_mem','png_gray_input_cancel','png_gray_input','book_png_file_layer_cancel','book_png_file_layer'):u+=function(n,c)+'\n'
 u+=r'''
@@ -80,8 +99,35 @@ source=(r/'main/book/book_lock_bookmark.c').read_text()
 source=re.sub(r'^#include[^\n]*\n','',source,flags=re.M)
 source=source.replace('#define ROOT "/sdcard/.read-pico-cache"','#define ROOT CACHE_ROOT')
 u+=function("ui_image_dither_gray",r/"main/ui/ui_image_dither.c")+"\n"
-u+=source
+u+='#define free fixture_free\n#define fwrite fixture_fwrite\n'+source+'\n#undef free\n#undef fwrite\n'
 u+=r'''
+
+static void check_stage(void){
+ // 257 个 128 字节字面块：逐字节检查跨满块与尾块，随后注入短写。
+ // 257 literal runs of 128 bytes: verify the full and tail batches byte-for-byte, then inject a short write.
+ enum {INPUT=257*128,ENCODED=257*129};
+ uint8_t plain[INPUT],packed[ENCODED],expected[ENCODED];
+ uint32_t bytes=0,hash=0;
+ for(unsigned i=0;i<257;++i){
+  expected[i*129]=127;
+  for(unsigned j=0;j<128;++j)expected[i*129+1+j]=plain[i*128+j]=(uint8_t)(j&1);
+ }
+ unsigned attempts=stage_attempts,frees=stage_frees;
+ FILE *f=tmpfile();assert(f);
+ count_stage_writes=true;
+ assert(layer_encode(f,plain,sizeof(plain),&bytes,&hash));
+ assert(stage_attempts==attempts+1&&stage_frees==frees+1&&!stage_ptr);
+ assert(stage_writes==2&&stage_write_bytes[0]==LOCK_LAYER_STAGE&&stage_write_bytes[1]==ENCODED-LOCK_LAYER_STAGE);
+ assert(bytes==ENCODED&&hash==layer_hash(expected,sizeof(expected),2166136261u));
+ rewind(f);assert(fread(packed,1,sizeof(packed),f)==sizeof(packed)&&!memcmp(packed,expected,sizeof(packed)));
+ assert(fgetc(f)==EOF&&!fclose(f));
+ f=tmpfile();assert(f);
+ stage_writes=0;fail_stage_write=true;bytes=0;hash=0;
+ assert(!layer_encode(f,plain,sizeof(plain),&bytes,&hash));
+ assert(stage_attempts==attempts+2&&stage_frees==frees+2&&!stage_ptr);
+ assert(stage_writes==1&&bytes==0&&hash==0&&!fclose(f));
+ fail_stage_write=false;count_stage_writes=false;
+}
 
 static bool thumb_cancel(void *ctx){(void)ctx;return true;}
 static void check_white_regions(void){
@@ -120,6 +166,7 @@ static void check_corner_keying(void){
  assert(alpha[4*9]==255&&gray[4*9]==255);
 }
 int main(int argc,char **argv){
+ check_stage();
  assert(argc>=4);check_white_regions();check_corner_keying();
  uint8_t thumbnail[160*284+16];memset(thumbnail,0xaa,sizeof(thumbnail));
  assert(book_lock_bookmark_thumbnail(argv[2],160,284,thumbnail,NULL,NULL));
@@ -198,10 +245,21 @@ int main(int argc,char **argv){
  assert(book_lock_bookmark_draw(fb,argv[2])&&book_lock_bookmark_cached()&&!memcmp(fb,first,BYTES));
  // 别名路径同尺寸同mtime，仍必须重解而只读预览不回写，样本缓存保持有效。
  // The alias shares size and mtime but must still decode; the read-only preview stores nothing, so the sample cache stays valid.
+ unsigned attempts=stage_attempts,frees=stage_frees;
  memset(fb,0xaa,BYTES);
  assert(book_lock_bookmark_preview(fb,alias)&&!book_lock_bookmark_cached()&&!memcmp(fb,first,BYTES));
+ assert(stage_attempts==attempts&&!stage_ptr);
+ // 暂存分配失败不影响合成，不替换旧缓存，不留下临时文件。
+ // Stage allocation failure preserves compositing and the old cache, without leaving a temporary file.
+ fail_stage_alloc=true;
+ memset(fb,0xaa,BYTES);
+ assert(book_lock_bookmark_draw(fb,alias)&&!book_lock_bookmark_cached()&&!memcmp(fb,first,BYTES));
+ struct stat tmp;assert(stat(LOCK_LAYER_PATH ".tmp",&tmp)!=0&&errno==ENOENT);
+ assert(stage_attempts==attempts+1&&stage_frees==frees&&!stage_ptr);
  memset(fb,0xaa,BYTES);
  assert(book_lock_bookmark_draw(fb,argv[2])&&book_lock_bookmark_cached()&&!memcmp(fb,first,BYTES));
+ assert(stage_attempts==attempts+1&&stage_frees==frees&&!stage_ptr);
+ fail_stage_alloc=false;
  FILE *cache=fopen(LOCK_LAYER_ROOT "/locks/bookmark-layer.bin","r+b");assert(cache);
  assert(fseek(cache,-1,SEEK_END)==0);int ch=fgetc(cache);assert(ch!=EOF&&fseek(cache,-1,SEEK_END)==0);
  assert(fputc(ch^0xff,cache)!=EOF&&fclose(cache)==0);
@@ -211,7 +269,7 @@ int main(int argc,char **argv){
  assert(book_lock_bookmark_draw(fb,argv[2])&&book_lock_bookmark_cached()&&!memcmp(fb,first,BYTES));
  free(first);
  free(fb);free(original);
- puts("PASS: PNG alpha/premultiplication, corner-connected white/dark/colored flat-background keying, edge-touching white art preservation, opaque black, fit/crop framing and mode-keyed cache, all 16 current-page backgrounds, 400 flood/BFS comparisons, enclosed whites and original alpha preserved, path-keyed layer cache store/hit/corruption/alias, low-memory fallback and no internal-RAM allocation");
+ puts("PASS: PNG alpha/premultiplication, corner-connected white/dark/colored flat-background keying, edge-touching white art preservation, opaque black, fit/crop framing and mode-keyed cache, all 16 current-page backgrounds, 400 flood/BFS comparisons, enclosed whites and original alpha preserved, path-keyed layer cache store/hit/corruption/alias, PSRAM-only staging and release on full/tail writes, cache hits and failed allocation/write fallback");
 }
 '''
 def chunk(k,b):return struct.pack('>I',len(b))+k+b+struct.pack('>I',zlib.crc32(k+b))

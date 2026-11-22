@@ -212,7 +212,8 @@ static delete_retry_t* s_delete_retries;
 static char s_latest_path[288],test_last_path[288];
 static bool s_save_failed;
 static char s_requested_open[288];
-static bool s_requested_open_home,s_reader_return_home;
+static bool s_requested_open_home,s_requested_resume,s_reader_return_home;
+static int64_t s_resume_next_ms,s_resume_deadline_ms;
 static int test_open_calls;
 static char* s_text;
 enum { MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MARGIN_BOTTOM, MARGIN_COUNT };
@@ -441,7 +442,7 @@ void book_shelf_cache_close(book_shelf_cache_t *cache){(void)cache;}
 static void free_book(void){s_text=NULL;s_path[0]=0;}
 static void refresh_cached_progress(app_ctx_t* ctx);
 static void return_to_cached_shelf(app_ctx_t* ctx){(void)ctx;}
-static bool open_book(app_ctx_t* ctx,const char* path){(void)ctx;assert(path[0]);test_open_calls++;s_view=READING;return true;}
+static bool open_book_attempt(app_ctx_t* ctx,const char* path,bool *retry){*retry=false;(void)ctx;assert(path[0]);test_open_calls++;s_view=READING;return true;}
 static char test_wrapped[512];
 #define UI_PX_CAPTION 28
 #define UI_MARGIN 40
@@ -516,7 +517,7 @@ from book_shelf_test_code import shelf_hooks, service_hooks, service_unhooks, sh
 unit += shelf_hooks
 unit += "\nbool book_shelf_hidden_read(nvs_handle_t, const char *);\n"
 for name in ("inline_ink_gray", "reader_margin_level", "reader_margin_value", "slider_index", "reader_margin_input", "reader_footer_height", "reader_area", "body_rect_for_tracking", "body_rect", "progress_rect", "copy_text", "clean_filename", "reader_footer_strip_number", "favorite_key", "favorite_read_handle", "favorite_save", "shelf_hidden_key", "shelf_hidden_read_handle", "shelf_hidden_load", "shelf_hidden_save", "shelf_rows", "row_rect", "shelf_category_add", "shelf_category_init", "shelf_query", "shelf_category_remember", "shelf_category_restore", "shelf_categories_recount", "sort_shelf", "delete_retry_find", "shelf_scan_cancel", "shelf_scan_context", "shelf_backfill_read_books", "scan_shelf", "refresh_cached_progress",
-             "pending_find", "pending_reserve", "pending_restore", "pending_discard", "pending_mark_latest", "pending_drop_invalidated", "pending_flush", "reader_page_offset", "save_progress", "retry_progress", "layout_name", "manage_panel", "manage_rect", "batch_rect", "manage_back_rect", "bulk_filter_rect", "bulk_nav_rect", "bulk_nav_hit", "leaves", "selected_count", "clear_selection", "toggle_selection", "select_page", "bookmark_compact", "search_begin", "refresh_search_matches", "search_finish", "refresh_capacity", "shelf_management_context", "shelf_managed_removed", "manage_apply", "manage_action", "batch_apply", "batch_action", "bulk_turn_page", "bulk_finish", "bulk_action", "bulk_control_at", "menu_handle_enabled", "reader_manual_refresh", "apply_reader_option", "reader_return", "toggle_reader_tools_panel", "reader_key_action", "middle_short_press", "middle_pending_tick", "on_key", "on_key_long", "draw_wrapped_name", "open_requested_book", "on_enter", "book_on_exit"):
+             "pending_find", "pending_reserve", "pending_restore", "pending_discard", "pending_mark_latest", "pending_drop_invalidated", "pending_flush", "reader_page_offset", "save_progress", "retry_progress", "layout_name", "manage_panel", "manage_rect", "batch_rect", "manage_back_rect", "bulk_filter_rect", "bulk_nav_rect", "bulk_nav_hit", "leaves", "selected_count", "clear_selection", "toggle_selection", "select_page", "bookmark_compact", "search_begin", "refresh_search_matches", "search_finish", "refresh_capacity", "shelf_management_context", "shelf_managed_removed", "manage_apply", "manage_action", "batch_apply", "batch_action", "bulk_turn_page", "bulk_finish", "bulk_action", "bulk_control_at", "menu_handle_enabled", "reader_manual_refresh", "apply_reader_option", "reader_return", "toggle_reader_tools_panel", "reader_key_action", "middle_short_press", "middle_pending_tick", "cancel_auto_resume", "on_key", "on_key_long", "draw_wrapped_name", "open_requested_book", "on_enter", "book_on_exit"):
     unit += function(name) + "\n"
 for name in ("book_remote_direction", "shelf_turn_page", "shelf_page_arrow_rect", "reader_swipe_direction"):
     unit += function(name) + "\n"

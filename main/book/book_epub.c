@@ -1259,11 +1259,10 @@ static void chapter_breaks_prepare(book_epub_t *book, size_t chapter, html_text_
         if (block->linked || block->auxiliary || front_matter_title(title) || !body_follows(text, i)) continue;
         bool numbered = pagination_numbered_title(title, block->heading_level != 0);
         bool primary = main_level && block->heading_level == main_level;
-        bool authored = authored_body_title(book, chapter, title, first, last);
         // 介绍/目录后的普通编号列表不能仅靠文字脱离书前区；正式正文题头可开始新章。
-        // A numbered list after front matter cannot escape it by label alone; an exact authored
-        // navigation title is still a verified body heading even when the source uses <p>.
-        if (auxiliary_section && !block->heading_level && !authored) continue;
+        // A numbered list after front matter cannot escape it by label alone; a body heading can.
+        if (auxiliary_section && !block->heading_level) continue;
+        bool authored = !numbered && authored_body_title(book, chapter, title, first, last);
         // 章号和章名分成相邻两块时只在章号前分页，避免把题头拆成两页。
         // A chapter number followed by its title needs one break, not two title-only pages.
         if (!numbered && i && text->blocks[i - 1].chapter_start) continue;

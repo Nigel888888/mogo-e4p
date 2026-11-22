@@ -67,7 +67,7 @@ void display_request_full_refresh(void) {
 }
 bool app_font_activate_system(void) { event('F'); return true; }
 void app_time_service_cancel(void) { event('T'); }
-void pico_ota_auto_cancel(void) {}
+void pico_ota_auto_request_cancel(void) {}
 void app_present(app_ctx_t *context, const app_desc_t *app, app_redraw_t redraw) {
     assert(context == &ctx && app == current); event('P'); record(redraw);
     if (complete_refresh_pending) assert(redraw == APP_REDRAW_FULL);

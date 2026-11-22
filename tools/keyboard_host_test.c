@@ -7,11 +7,12 @@
 #include <time.h>
 #include "../main/ui/ui_ime_phrases.h"
 int html_test_fail_after = -1;
+static const char *case_label;
 static void draw_rect(EpdRect r) { assert(r.x >= 0 && r.y >= 0 && r.width > 0 && r.height > 0 && r.x + r.width <= 684 && r.y + r.height <= 1102); }
 void ui_fill_round_rect(uint8_t *fb,EpdRect r,int radius,uint8_t gray){(void)fb;(void)radius;(void)gray;draw_rect(r);}
 void ui_draw_round_rect(uint8_t *fb,EpdRect r,int radius,uint8_t gray){(void)fb;(void)radius;(void)gray;draw_rect(r);}
 void epd_draw_line(int a,int b,int c,int d,uint8_t gray,uint8_t *fb){(void)gray;(void)fb;assert(a>=0&&c>=0&&a<684&&c<684&&b>=0&&d>=0&&b<1102&&d<1102);}
-void ui_text_fixed_vc(uint8_t *fb,int x,int y,int px,const char *text,enum EpdFontFlags align,bool inverse){(void)fb;(void)align;(void)inverse;assert(x>=0&&x<=684&&y>=0&&y<1102&&px>0);assert(text);if(!s_panel&&y>=740&&y<964)assert(!strpbrk(text,"0123456789"));}
+void ui_text_fixed_vc(uint8_t *fb,int x,int y,int px,const char *text,enum EpdFontFlags align,bool inverse){(void)fb;(void)align;(void)inverse;assert(x>=0&&x<=684&&y>=0&&y<1102&&px>0);assert(text);if(x==64&&y==930)case_label=text;if(!s_panel&&y>=740&&y<964)assert(!strpbrk(text,"0123456789"));}
 int ui_text_fixed_width_px(int px,const char *text){int n=0;for(const unsigned char *p=(const unsigned char *)text;*p;++p)if((*p&192)!=128)n+=*p>=128?px:px/2;return n;}
 void ui_text_input_composition(uint8_t *fb,const char *text,EpdRect r,int px){(void)fb;(void)text;(void)px;draw_rect(r);}
 bool ui_rect_hit(EpdRect r,uint16_t x,uint16_t y){return x>=r.x&&y>=r.y&&x<r.x+r.width&&y<r.y+r.height;}
@@ -55,6 +56,11 @@ int main(void) {
     strcpy(s_raw,"999999999999999999999999999999999999999999999999");refresh();no_visible_digits();
     s_candidates->count=0;no_visible_digits();ui_keyboard_tap(590,900,560,0);assert(!text[0]&&!s_raw[0]);
     ui_keyboard_begin(&edit,true);ui_keyboard_tap(30,580,560,0);assert(!s_nine&&!s_chinese);
+    ui_keyboard_draw(NULL,560);assert(case_label&&!strcmp(case_label,"小写"));
+    ui_keyboard_tap(60,930,560,0);ui_keyboard_draw(NULL,560);assert(!strcmp(case_label,"大写"));
+    ui_keyboard_tap(26,742,560,0);assert(!strcmp(text,"Q"));
+    ui_keyboard_tap(60,930,560,0);ui_keyboard_draw(NULL,560);assert(!strcmp(case_label,"小写"));
+    ui_keyboard_tap(26,742,560,0);assert(!strcmp(text,"Qq"));
     // 长按先删未提交拼音，再按 UTF-8 字符删正文；延迟不补发，松手和中断即时停止。
     // Holds delete composition first, then UTF-8 characters; no backlog, and release/interruption stops immediately.
     strcpy(text,"你好世界");ui_text_edit_init(&edit,text,sizeof(text));ui_keyboard_begin(&edit,false);t9("64426");

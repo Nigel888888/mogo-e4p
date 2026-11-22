@@ -52,7 +52,7 @@ static void enter(app_ctx_t *ctx) {
     s_weather_settings=s_requested_city;
     s_city=false;if(s_requested_city)city_begin();s_requested_city=false;
 }
-static void before_lock(app_ctx_t *ctx) {(void)ctx;app_weather_cancel_join();ui_keyboard_hold_cancel();ui_keyboard_release();}
+static void before_lock(app_ctx_t *ctx) {(void)ctx;app_weather_cancel();ui_keyboard_hold_cancel();ui_keyboard_release();}
 static void leave(app_ctx_t *ctx) {
     before_lock(ctx);ui_keyboard_end();app_weather_clear_search();ui_weather_release();
 }
@@ -167,7 +167,7 @@ static app_redraw_t edited(app_ctx_t *ctx) {
     return old_results?APP_REDRAW_PAGE:keyboard_paint(ctx,true);
 }
 static void back(app_ctx_t *ctx) {
-    if(s_city){app_weather_cancel_join();ui_keyboard_end();app_weather_clear_search();s_city=false;s_notice[0]=0;}
+    if(s_city){app_weather_cancel();ui_keyboard_end();app_weather_clear_search();s_city=false;s_notice[0]=0;}
     else if(s_weather_settings){s_weather_settings=false;s_notice[0]=0;}
     else ctx->request_return=true;
 }
@@ -235,7 +235,7 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
                 int row=component_row(slot,choice);
                 if(y>=row-30&&y<row+30) {
                     if(!app_home_component_set(slot,s_choices[choice]))snprintf(s_notice,sizeof(s_notice),"设置保存失败，请稍后重试");
-                    else {s_notice[0]=0;if(!app_home_has_widget(APP_HOME_WIDGET_WEATHER))app_weather_cancel_join();}
+                    else {s_notice[0]=0;if(!app_home_has_widget(APP_HOME_WIDGET_WEATHER))app_weather_cancel();}
                     return APP_REDRAW_PAGE;
                 }
             }

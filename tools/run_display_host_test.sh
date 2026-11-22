@@ -9,6 +9,6 @@ link_gc=(-Wl,--gc-sections)
 if [[ "$(uname -s)" == "Darwin" ]]; then link_gc=(-Wl,-dead_strip); fi
 cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
     -ffunction-sections -fdata-sections "${link_gc[@]}" \
-    -Itools/display_host_stubs -Icomponents/e0470_page_turn/include -Imain -Imain/display -Imain/ota -Imain/settings -Imain/app \
-    tools/display_host_test.c main/display/display.c -o build/book-tests/display
+    -Itools/display_host_stubs -Icomponents/e0470_page_turn/include -Imain -Imain/display -Imain/ota -Imain/settings -Imain/app -Icomponents/epdiy/src \
+    tools/display_host_test.c main/display/display.c main/display/display_static_black.c components/epdiy/src/epd_output_offset.c -o build/book-tests/display
 build/book-tests/display

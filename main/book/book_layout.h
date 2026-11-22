@@ -117,8 +117,6 @@ void book_layout_draw_page(uint8_t* fb, size_t page, EpdRect rect, int px);
 size_t book_layout_page_for_offset(size_t off);
 /// 返回页首原文字节偏移；越界页返回文本长度。/ Return source byte offset at page start; invalid pages return text length.
 size_t book_layout_page_start_offset(size_t page);
-/// 返回从章首块开始的页面标题；普通页面返回 false。/ Return the title of a page that starts with a chapter block; false for ordinary pages.
-bool book_layout_page_chapter_title(size_t page, char *buf, size_t cap);
 
 /// 空闲预绘游标；不持有正文或字体指针，布局代次变化立即失效。
 /// Idle drawing cursor: borrows no text/font pointers and expires on layout generation changes.

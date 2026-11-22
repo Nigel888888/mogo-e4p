@@ -18,10 +18,9 @@ home_library_view_t home_library_view(void){return mini_view;}
 void home_library_select(unsigned i){assert(i<mini_view.count);mini_view.selected=i;}
 bool home_library_recent(bool recent){if(!mini_save_ok)return false;mini_view.recent=recent;mini_generation_needed=true;return true;}
 void home_library_shuffle(void){++mini_shuffles;mini_changed=true;}
-bool home_library_poll(bool (*cancel)(void *),void *ctx){(void)cancel;(void)ctx;++mini_polls;bool changed=mini_changed;mini_changed=false;return changed;}
+bool home_library_poll(void){++mini_polls;bool changed=mini_changed;mini_changed=false;return changed;}
 bool home_library_needs_generation(void){return mini_generation_needed;}
 void home_library_cover_generation(unsigned gen){assert(gen);++mini_generations;mini_generation_needed=false;}
-static bool app_poll_main_navigation_from(app_ctx_t *ctx,unsigned tab){(void)ctx;assert(tab==0);return false;}
 '''
 
 def ui_doubles():

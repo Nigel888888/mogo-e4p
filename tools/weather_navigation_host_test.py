@@ -76,7 +76,7 @@ bool app_weather_search(const char *query,unsigned page){assert(query==s_query);
 bool app_weather_set_enabled(bool enabled){view.enabled=enabled;return true;}
 bool app_weather_set_auto_refresh(bool enabled){if(save_ok)view.auto_refresh=enabled;return save_ok;}
 bool app_weather_select(const weather_location_t *city){++selections;if(save_ok)view.city=*city;return save_ok;}
-void app_weather_cancel_join(void){++cancels;}
+void app_weather_cancel(void){++cancels;}
 void app_weather_clear_search(void){view.result_count=view.result_total=view.result_page=0;view.notice[0]=0;}
 bool app_weather_poll(bool automatic){assert(automatic==(!s_city&&app_home_has_widget(APP_HOME_WIDGET_WEATHER)));return poll_changed;}
 bool weather_query_valid(const char *query){return strlen(query)>=2;}

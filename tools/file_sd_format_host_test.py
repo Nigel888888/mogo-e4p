@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 source=ROOT/'main/apps/app_files.c'
 s=source.read_text()
 a=s.index('    if (!long_press && sd_needs_format() && ui_rect_hit(storage_card_rect()')
-b=s.index('    for (int i = 0; !long_press && i < 3;',a)
+b=s.index('    for (int i = 0; !long_press && i < home_transfer_count();',a)
 unit=r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -21,9 +21,13 @@ typedef struct {int x0,y0;} ui_gesture_event_t;
 typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_ERR_NOT_FINISHED 3
-static bool cover_ok=true,avatar_ok=true;
+#define CONFIG_MOGO_CLOUDZAO_TRANSFER 1
+static bool cloud_ok=true,cover_ok=true,avatar_ok=true;
+static bool cloudzao_quiesce(unsigned ms){assert(ms==2000);return cloud_ok;}
 static int cover_calls,avatar_calls,remounts;
+static bool home_library_quiesce(unsigned ms){assert(ms==2000);return true;}
 static bool book_cover_jobs_quiesce(unsigned ms){assert(ms==2000);++cover_calls;return cover_ok;}
+bool shutdown_wallpaper_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 bool lock_images_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 static bool ui_avatar_quiesce(unsigned ms){assert(ms==2000);++avatar_calls;return avatar_ok;}
 #define APP_REDRAW_NONE 0
@@ -58,7 +62,12 @@ int main(void){
  tap(100,200,false);tap(100,200,false);assert(formats==2&&avatar_calls==before&&!s_scan_pending);
  s_sd=(board_sd_info_t){true,false,false};assert(!tap(100,200,false)&&remounts==2&&avatar_calls==before);
  cover_ok=true;avatar_ok=false;assert(!tap(100,200,false)&&remounts==2&&!s_scan_pending);
- avatar_ok=true;assert(tap(100,200,false)==1&&remounts==3&&s_scan_pending);
+ avatar_ok=true;cloud_ok=false;int before_cover=cover_calls;
+ assert(!tap(100,200,false)&&remounts==2&&!s_scan_pending&&cover_calls==before_cover);
+ s_sd.needs_format=true;tap(100,200,false);tap(100,200,false);
+ assert(formats==2&&!s_scan_pending&&!s_sd_format_confirm&&cover_calls==before_cover);
+ s_sd.needs_format=false;cloud_ok=true;
+ assert(tap(100,200,false)==1&&remounts==3&&s_scan_pending);
  assert(!tap(100,200,false)&&remounts==3);s_scan_pending=false;
  assert(!tap(100,200,true)&&remounts==3);
  puts("PASS: absent/contact/timeout cards cannot format; confirmation/cancel/hold guards, error and success rescan");

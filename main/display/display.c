@@ -21,6 +21,8 @@
  * User revision: ordinary shelf chrome and art share each scan phase, with soft outer text, calibrated covers/furniture and directional whitespace erasure; never reveal regions serially. Only the marker may change within frozen navigation; retain common fault recovery.
  * 用户2026-11-03修订：固定区缩到实际导航顶部，所有页面内容差分直接覆盖原先多保留的24行；仅全像素整理向内对齐，避免驱动固定导航。
  * User revision 2026-11-03: shrink the fixed region to the actual navigation top, including the formerly protected 24 rows in every page's content differences; only full-pixel cleanup aligns inward to avoid driving fixed navigation.
+ * 同帧保墨只给已显示的纯黑像素补黑，可以覆盖固定导航；导航内容仍不回写，白底与灰分隔线不驱动。
+ * Same-scan reinforcement can reach already-visible black navigation pixels; it does not publish navigation content or drive the white background and gray divider.
  * 用户修订：纯文字水波纹改回面板原厂GL16表，保留每种灰阶转换的前导擦除；文字表只用于普通纯文字翻页，8带/11090us、目标灰阶和故障恢复保持。
  * User revision: pure-text ripple returns to the vendor GL16 table with each transition's leading erase; the text table serves ordinary text turns only, retaining eight bands/11090us, target grays and recovery.
  * 用户修订：高压轨不再保留8秒，前后光场景统一在每次刷新后只保留100ms，空闲即断VCOM/VSH。
@@ -35,6 +37,7 @@
  */
 
 #include "display.h"
+#include "epd_output_offset.h"
 #include "display_memory.h"
 #include "board_hardware.h"
 #include "ota_online.h"
@@ -53,6 +56,7 @@
 #include "esp_heap_caps.h"
 #include "display_main_waveform.h"
 #include "display_reader_waveform.h"
+#include "display_static_black.h"
 #include "ui/ui_nav_layout.h"
 
 static const char* TAG = "read_pico";
@@ -95,9 +99,26 @@ static void use_scan_for(const EpdWaveform* waveform, enum EpdDrawMode mode) {
 // 自上次整屏 GC16 以来的整页差分次数。局部反馈不计数，否则菜单按压几次就会触发黑白全刷。
 // Whole-page differentials since the last full GC16. Local feedback is excluded so a few taps cannot trigger flashing.
 static int s_page_refreshes;
+static unsigned s_static_black_updates;
+
+static void retain_failed_frame(enum EpdDrawError result);
+
+typedef enum { STATIC_BLACK_OFF, STATIC_BLACK_PERIODIC, STATIC_BLACK_READER } static_black_policy_t;
 
 static const void* s_main_armed;
 static bool s_main_fault;
+void display_apply_screen_offset(int x, int y) {
+    if (x < -APP_SCREEN_OFFSET_LIMIT || x > APP_SCREEN_OFFSET_LIMIT ||
+        y < -APP_SCREEN_OFFSET_LIMIT || y > APP_SCREEN_OFFSET_LIMIT) return;
+    int old_x, old_y;
+    epd_get_output_offset(&old_x, &old_y);
+    if (old_x == y && old_y == -x) return;
+    epd_set_output_offset(y, -x);
+    // 平移改变了光学坐标，旧逻辑 back 不能作为新位置的差分基准。
+    // Translation changes optical coordinates; the logical back buffer cannot describe the new positions.
+    s_main_fault = true;
+    display_request_full_refresh();
+}
 static bool s_main_shelf_page;
 static EpdRect s_main_bands[3];
 static unsigned s_main_band_count;
@@ -286,6 +307,7 @@ static enum EpdDrawError main_recover(EpdiyHighlevelState* hl, enum EpdDrawError
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     enum EpdDrawError result = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
     s_main_fault = result != EPD_DRAW_SUCCESS;
+    if (result == EPD_DRAW_SUCCESS) s_static_black_updates = 0;
     s_page_refreshes = 0;
     ESP_LOGW(TAG, "main transition recovery error=%d result=%d", error, result);
     return result;
@@ -469,7 +491,7 @@ static bool main_before_update(EpdiyHighlevelState* hl, enum EpdDrawError* resul
 // table and does not count or promote.
 static enum EpdDrawError hl_update_padded(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, bool full,
-    const EpdRect* area, bool allow_gl16_diff, int pad_lines, int pad_col_bytes
+    const EpdRect* area, bool allow_gl16_diff, int pad_lines, int pad_col_bytes, static_black_policy_t static_black
 ) {
     // 局部差分到实际导航顶边；只有全像素更新向内对齐，再补余下内容差分。
     // Partial differences reach the actual navigation top; only full-pixel updates align inward and finish the remaining content with differences.
@@ -534,12 +556,28 @@ static enum EpdDrawError hl_update_padded(
     // Select scan timing once after comparison, without a FULL-to-FAST round trip before fast updates.
     use_scan_for(waveform, mode);
     enum EpdDrawError result;
-    if (skip_body) result = EPD_DRAW_SUCCESS;
+    EpdRect native;
+    const unsigned threshold = DISPLAY_STATIC_BLACK_EVERY;
+    const unsigned reader_pushes = DISPLAY_READER_CHROME_PUSHES;
+    const bool reader_ink = static_black == STATIC_BLACK_READER && area &&
+        !protected_area && area->x == 0 && area->width == epd_rotated_display_width();
+    const bool periodic_ink = static_black == STATIC_BLACK_PERIODIC;
+    const bool changed = (reader_ink || (periodic_ink && !full)) && area && !skip_body &&
+        mode == MODE_GL16 && display_static_black_changed(hl, *area, &native);
+    const bool due = changed && periodic_ink && s_static_black_updates + 1 >= threshold;
+    const unsigned pushes = reader_ink ? reader_pushes : DISPLAY_STATIC_BLACK_PUSHES;
+    if ((due || (reader_ink && changed)) && display_static_black_draw(hl, waveform, native, reader_ink, full, pushes, &result)) {
+        if (result != EPD_DRAW_SUCCESS && !protected_area) retain_failed_frame(result);
+    } else if (skip_body) result = EPD_DRAW_SUCCESS;
     else if (area != NULL) {
         result = full ? epd_hl_update_area_full(hl, mode, 25, *area)
                     : epd_hl_update_area_padded(hl, mode, 25, *area, pad_l, pad_c);
     } else result = full ? epd_hl_update_screen_full(hl, mode, 25)
                          : epd_hl_update_screen_padded(hl, mode, 25, pad_l, pad_c);
+    if (result == EPD_DRAW_SUCCESS) {
+        if (due || (!area && full && (mode & 0xF) == MODE_GC16)) s_static_black_updates = 0;
+        else if (changed && periodic_ink) ++s_static_black_updates;
+    }
     if (result == EPD_DRAW_SUCCESS && update_edge) {
         result = main_update_edge(hl);
         epd_hl_waveform(hl, waveform);
@@ -557,7 +595,7 @@ static enum EpdDrawError hl_update(
     // The default exit dilates GL16 differentials only; callers that clean thin-line ghosts use the padded API.
     const bool gl16 = (mode & 0xF) == MODE_GL16;
     return hl_update_padded(hl, waveform, mode, full, area, allow_gl16_diff,
-                            gl16 ? 1 : 0, gl16 ? 1 : 0);
+                            gl16 ? 1 : 0, gl16 ? 1 : 0, STATIC_BLACK_OFF);
 }
 
 static enum EpdDrawError update_display_mode_unlocked(
@@ -637,6 +675,7 @@ static enum EpdDrawError update_display_fast_page_unlocked(EpdiyHighlevelState* 
         epd_hl_waveform(hl, &E0470_WAVEFORM);
         enum EpdDrawError result = epd_hl_update_screen_full(hl, MODE_GC16, 25);
 
+        if (result == EPD_DRAW_SUCCESS) s_static_black_updates = 0;
         ESP_LOGI(TAG, "fast navigation cleanup after %d transitions", APP_UI_FAST_GC16_EVERY);
         return result;
     }
@@ -664,6 +703,7 @@ static enum EpdDrawError update_display_from_white_with_unlocked(
     if (!display_power_ready()) return DISPLAY_DRAW_POWER_NOT_READY;
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = epd_hl_update_screen_from_white(hl, mode, 25);
+    if (result == EPD_DRAW_SUCCESS && mode == MODE_GC16) s_static_black_updates = 0;
 
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     s_page_refreshes = 0;
@@ -691,15 +731,15 @@ bool display_take_white_exit(void) {
     return hold;
 }
 
-static enum EpdDrawError update_display_full_unlocked(EpdiyHighlevelState* hl) {
+static enum EpdDrawError update_display_full_impl_unlocked(EpdiyHighlevelState* hl, bool clear_first) {
     display_main_transition_cancel();
     if (!display_power_ready()) return DISPLAY_DRAW_POWER_NOT_READY;
     const EpdWaveform* waveform = s_complete_refresh_requested ? &E0470_FULL_WAVEFORM : &E0470_WAVEFORM;
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result;
-    if (s_power_fault || s_main_fault) {
-        // 供电或扫描失败后的物理画面未知，先清物理屏，再从真实白底提交当前目标。
-        // Power or scan failure leaves the optical frame unknown: clear the panel, then commit the current target from a real white baseline.
+    if (clear_first || s_power_fault || s_main_fault) {
+        // 显式清白或光学画面未知时，先清物理屏，再从真实白底提交当前目标。
+        // For an explicit clear or an unknown optical frame, clear the panel before drawing the target from white.
         use_scan_for(waveform, MODE_GC16);
         epd_clear();
         result = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
@@ -709,12 +749,19 @@ static enum EpdDrawError update_display_full_unlocked(EpdiyHighlevelState* hl) {
     } else result = hl_update(hl, waveform, MODE_GC16, true, NULL, false);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     // 失败保留完整转场请求，后续重试不能降回裁剪表。/ Retain the complete transition on failure so retries cannot fall back to the trimmed table.
-    if (result == EPD_DRAW_SUCCESS) s_full_refresh_requested = s_complete_refresh_requested = false;
+    if (result == EPD_DRAW_SUCCESS) {
+        s_full_refresh_requested = s_complete_refresh_requested = false;
+        s_static_black_updates = 0;
+    }
     else if (s_complete_refresh_requested) s_main_fault = true;
     return result;
 }
 
-static enum EpdDrawError update_display_area_diff_with_unlocked(EpdiyHighlevelState*, const EpdWaveform*, enum EpdDrawMode, EpdRect);
+static enum EpdDrawError update_display_full_unlocked(EpdiyHighlevelState* hl) {
+    return update_display_full_impl_unlocked(hl, false);
+}
+
+static enum EpdDrawError update_display_area_diff_with_unlocked(EpdiyHighlevelState*, const EpdWaveform*, enum EpdDrawMode, EpdRect, static_black_policy_t);
 static enum EpdDrawError update_display_area_full_with_unlocked(EpdiyHighlevelState*, const EpdWaveform*, enum EpdDrawMode, EpdRect);
 
 static enum EpdDrawError update_display_image_gray_unlocked(EpdiyHighlevelState* hl, int clear_cycles) {
@@ -731,6 +778,7 @@ static enum EpdDrawError update_display_image_gray_unlocked(EpdiyHighlevelState*
     display_power_recovered(result);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     s_page_refreshes = 0;
+    if (result == EPD_DRAW_SUCCESS) s_static_black_updates = 0;
     return result;
 }
 
@@ -759,7 +807,7 @@ static enum EpdDrawError update_display_area_with_unlocked(
 
 static enum EpdDrawError update_display_area_diff_with_unlocked(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
-    EpdRect area
+    EpdRect area, static_black_policy_t static_black
 ) {
     // 触摸笔迹的 8 帧跟随 DU 固定走 FAST 档（一行 10µs 对 16µs）；否则档位由上一轮
     // 推屏遗留，滑块等跟手区域时而 11ms/帧、时而 6.9ms/帧。其余波形不改档位。
@@ -770,7 +818,9 @@ static enum EpdDrawError update_display_area_diff_with_unlocked(
         use_scan_for(waveform, mode);
     if (!display_power_ready()) return DISPLAY_DRAW_POWER_NOT_READY;
     epd_hl_waveform(hl, waveform);
-    enum EpdDrawError result = hl_update(hl, waveform, mode, false, &area, true);
+    const bool gl16 = (mode & 0xF) == MODE_GL16;
+    enum EpdDrawError result = hl_update_padded(hl, waveform, mode, false, &area, true,
+                                                gl16 ? 1 : 0, gl16 ? 1 : 0, static_black);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     return result;
 }
@@ -782,7 +832,7 @@ static enum EpdDrawError update_display_area_diff_padded_unlocked(
     if (!display_power_ready()) return DISPLAY_DRAW_POWER_NOT_READY;
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = hl_update_padded(hl, waveform, mode, false, &area, true,
-                                                pad_lines, pad_col_bytes);
+                                                pad_lines, pad_col_bytes, STATIC_BLACK_OFF);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     return result;
 }
@@ -796,6 +846,23 @@ static enum EpdDrawError update_display_area_full_with_unlocked(
     enum EpdDrawError result = hl_update(hl, waveform, mode, true, &area, false);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     return result;
+}
+
+static enum EpdDrawError recover_water_turn(EpdiyHighlevelState* hl, enum EpdDrawError result) {
+    // 中断可能把物理屏留在半途。清屏后按目标 front 重建整屏基准。
+    // An interrupted scan may leave intermediate pixels. Rebuild the whole baseline from white.
+    if (result & EPD_DRAW_EMPTY_LINE_QUEUE) {
+        s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
+        board_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
+    }
+    use_scan_for(&E0470_WAVEFORM, MODE_GC16);
+    epd_clear();
+    enum EpdDrawError recovered = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
+
+    if (recovered == EPD_DRAW_SUCCESS) s_static_black_updates = 0;
+    s_page_refreshes = 0;
+    ESP_LOGW(TAG, "water turn failed (%d), recovery=%d", result, recovered);
+    return recovered;
 }
 
 static enum EpdDrawError update_display_water_turn_unlocked(EpdiyHighlevelState* hl, EpdRect area,
@@ -812,27 +879,14 @@ static enum EpdDrawError update_display_water_turn_unlocked(EpdiyHighlevelState*
     // Ripple uses the vendor GL16 table: every gray transition keeps its leading erase
     // and factory-calibrated gray pulses, pure white keeps the vendor's 18 erases, and
     // only to=0 regains the 18 black pushes the trim had cut.
-    enum EpdDrawError result = e0470_page_turn_with_waveform_compact(hl, area, dir,
-        display_reader_water_waveform(), E0470_TURN_FAST_BANDS);
+    enum EpdDrawError result = e0470_page_turn_reader(hl, area, dir, display_reader_water_waveform(), DISPLAY_READER_CHROME_PUSHES);
     use_scan_for(&E0470_WAVEFORM, MODE_GL16);
     if (result == EPD_DRAW_SUCCESS) return result;
     if (result == EPD_DRAW_NO_PHASES_AVAILABLE) {
         ESP_LOGW(TAG, "water turn phases unavailable; use regular GL16");
         return update_display_area_with(hl, &E0470_WAVEFORM, MODE_GL16, area);
     }
-    // 中断可能把物理屏留在半途。清屏后按目标 front 重建整屏基准。
-    // An interrupted scan may leave intermediate pixels. Rebuild the whole baseline from white.
-    if (result & EPD_DRAW_EMPTY_LINE_QUEUE) {
-        s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
-        board_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
-    }
-    use_scan_for(&E0470_WAVEFORM, MODE_GC16);
-    epd_clear();
-    enum EpdDrawError recovered = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
-
-    s_page_refreshes = 0;
-    ESP_LOGW(TAG, "water turn failed (%d), recovery=%d", result, recovered);
-    return recovered;
+    return recover_water_turn(hl, result);
 }
 
 // 供数不足时的兜底：把频率退回安全值，整屏白一次，让后面的差分刷有干净参考帧。
@@ -858,6 +912,7 @@ static void guard_draw_result_unlocked(EpdiyHighlevelState* hl, enum EpdDrawErro
     }
 
     s_main_fault = recovered != EPD_DRAW_SUCCESS;
+    if (recovered == EPD_DRAW_SUCCESS) s_static_black_updates = 0;
 
     if (recovered != EPD_DRAW_SUCCESS) ESP_LOGW(TAG, "underrun recovery failed (%d)", recovered);
     s_page_refreshes = 0;
@@ -879,6 +934,79 @@ void display_present_end(bool held) {
 // 连续相位全部完成后，back已是真实黑白画面；不因尚未补灰阶而多做一次整屏GC16。
 // Once continuous phases finish, back is the real binary frame; pending gray restoration alone does not require full GC16.
 static bool display_needs_full(void) { return s_full_refresh_requested || s_power_fault; }
+
+void display_get_screen_offset(int* x, int* y) {
+    int native_x, native_y;
+    epd_get_output_offset(&native_x, &native_y);
+    *x = -native_y;
+    *y = native_x;
+}
+
+static void retain_failed_frame(enum EpdDrawError result) {
+    s_main_fault = s_full_refresh_requested = true;
+    if (result & EPD_DRAW_EMPTY_LINE_QUEUE) {
+        s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
+        board_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
+    }
+}
+
+enum EpdDrawError update_display_screen_offset(EpdiyHighlevelState* hl, int x, int y) {
+    if (!hl || !hl->front_fb || !hl->back_fb || !hl->difference_fb ||
+        x < -APP_SCREEN_OFFSET_LIMIT || x > APP_SCREEN_OFFSET_LIMIT ||
+        y < -APP_SCREEN_OFFSET_LIMIT || y > APP_SCREEN_OFFSET_LIMIT) return EPD_DRAW_INVALID_CROP;
+    bool held = display_present_begin();
+    display_main_transition_cancel();
+    int old_x, old_y;
+    epd_get_output_offset(&old_x, &old_y);
+    enum EpdDrawError result;
+    if (display_needs_full() || s_main_fault) {
+        // 恢复扫描临时使用目标位置；失败则退回原坐标，保留重建义务。
+        // Temporarily scan recovery at the target; on failure restore the old coordinates and retain recovery.
+        display_apply_screen_offset(x, y);
+        result = update_display_full_unlocked(hl);
+    } else if (!display_power_ready()) {
+        result = DISPLAY_DRAW_POWER_NOT_READY;
+    } else {
+        const int width = epd_width(), height = epd_height();
+        bool changed = epd_output_offset_difference(hl->front_fb, hl->back_fb,
+            hl->difference_fb, width, height, old_x, old_y, y, -x);
+        result = EPD_DRAW_SUCCESS;
+        if (changed) {
+            // 差分已在物理坐标中，临时关闭扫描平移，包含新旧覆盖区和空出的白边。
+            // Differences already use physical coordinates; temporarily disable scan translation, including old/new coverage and exposed white strips.
+            const EpdWaveform *waveform = display_main_normal_waveform();
+            use_scan_for(waveform, MODE_GL16);
+            epd_set_output_offset(0, 0);
+            epd_clear_phase_luts();
+            epd_leading_skip_discard();
+            EpdRect full = epd_full_screen();
+            result = epd_draw_base(full, hl->difference_fb, full,
+                MODE_PACKING_1PPB_DIFFERENCE | MODE_GL16, 25, NULL, NULL, waveform);
+        }
+        if (result == EPD_DRAW_SUCCESS) {
+            memcpy(hl->back_fb, hl->front_fb, (size_t)width * height / 2);
+        }
+    }
+    if (result == EPD_DRAW_SUCCESS) {
+        epd_set_output_offset(y, -x);
+    } else {
+        epd_set_output_offset(old_x, old_y);
+        retain_failed_frame(result);
+    }
+    display_present_end(held);
+    return result;
+}
+
+enum EpdDrawError update_display_boot_frame(EpdiyHighlevelState* hl) {
+    bool held = display_present_begin();
+    // 启动没有可信白底；由恢复路径统一清白一次，不在调用方预清。
+    // Boot has no trusted white baseline; recovery clears once, without a caller-side erase.
+    s_main_fault = s_full_refresh_requested = true;
+    enum EpdDrawError result = update_display_full_unlocked(hl);
+    if (result != EPD_DRAW_SUCCESS) retain_failed_frame(result);
+    display_present_end(held);
+    return result;
+}
 
 enum EpdDrawError update_display_white_restore(EpdiyHighlevelState* hl, EpdRect area) {
     bool held = display_present_begin();
@@ -955,6 +1083,14 @@ enum EpdDrawError update_display_white(EpdiyHighlevelState* hl) {
 enum EpdDrawError update_display_full(EpdiyHighlevelState* hl) {
     bool held = display_present_begin();
     enum EpdDrawError result = update_display_full_unlocked(hl);
+    display_present_end(held);
+    return result;
+}
+
+enum EpdDrawError update_display_full_clean(EpdiyHighlevelState* hl) {
+    bool held = display_present_begin();
+    display_request_full_refresh();
+    enum EpdDrawError result = update_display_full_impl_unlocked(hl, true);
     display_present_end(held);
     return result;
 }
@@ -1058,13 +1194,41 @@ enum EpdDrawError update_display_area_with(
     return result;
 }
 
-enum EpdDrawError update_display_area_diff_with(
+static enum EpdDrawError update_area_differential(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
-    EpdRect area
+    EpdRect area, static_black_policy_t static_black
 ) {
     bool held = display_present_begin();
     enum EpdDrawError result = display_needs_full()
-        ? update_display_full_unlocked(hl) : update_display_area_diff_with_unlocked(hl, waveform, mode, area);
+        ? update_display_full_unlocked(hl) : update_display_area_diff_with_unlocked(hl, waveform, mode, area, static_black);
+    display_present_end(held);
+    return result;
+}
+
+enum EpdDrawError update_display_area_diff_with(
+    EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, EpdRect area
+) {
+    return update_area_differential(hl, waveform, mode, area, STATIC_BLACK_OFF);
+}
+
+enum EpdDrawError update_display_area_stable_diff(
+    EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, EpdRect area
+) {
+    return update_area_differential(hl, waveform, mode, area, STATIC_BLACK_PERIODIC);
+}
+
+enum EpdDrawError update_display_area_reader_turn(
+    EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, EpdRect area, bool full_body
+) {
+    bool held = display_present_begin();
+    enum EpdDrawError result;
+    if (display_needs_full()) result = update_display_full_unlocked(hl);
+    else if (!display_power_ready()) result = DISPLAY_DRAW_POWER_NOT_READY;
+    else {
+        epd_hl_waveform(hl, waveform);
+        result = hl_update_padded(hl, waveform, mode, full_body, &area, true, 1, 1, STATIC_BLACK_READER);
+        epd_hl_waveform(hl, &E0470_WAVEFORM);
+    }
     display_present_end(held);
     return result;
 }
@@ -1092,7 +1256,7 @@ enum EpdDrawError update_display_click_feedback(EpdiyHighlevelState* hl,EpdRect 
     bool full=display_needs_full(),restore=owner&&!s_main_fault&&!full;
     display_main_transition_disarm();
     enum EpdDrawError result=full?update_display_full_unlocked(hl):
-        update_display_area_diff_with_unlocked(hl,&E0470_FOLLOW_WAVEFORM,MODE_DU,area);
+        update_display_area_diff_with_unlocked(hl,&E0470_FOLLOW_WAVEFORM,MODE_DU,area,STATIC_BLACK_OFF);
     if(restore&&result==EPD_DRAW_SUCCESS&&!s_main_fault) {
         s_main_armed=owner;s_main_shelf_page=shelf;s_main_shelf_exit=exit;
         s_main_changing_page=changing;s_main_band_count=count;memcpy(s_main_bands,bands,sizeof(bands));
@@ -1110,6 +1274,47 @@ enum EpdDrawError update_display_area_full_with(
         ? update_display_full_unlocked(hl) : update_display_area_full_with_unlocked(hl, waveform, mode, area);
     display_present_end(held);
     return result;
+}
+
+bool update_display_reader_joined(EpdiyHighlevelState* hl, EpdRect body, EpdRect top, EpdRect footer,
+                                  bool ripple, e0470_turn_dir_t dir, enum EpdDrawError* result) {
+    EpdRect native, chrome[2] = {0};
+    if (!hl || !hl->front_fb || !hl->back_fb || !hl->difference_fb || !result || body.x ||
+        body.width != epd_rotated_display_width() || !display_static_black_native(body, &native) ||
+        (top.width && (!display_static_black_native(top, &chrome[0]) || top.y + top.height > body.y)) ||
+        (footer.width && (!display_static_black_native(footer, &chrome[1]) || footer.y < body.y + body.height)) ||
+        (!top.width && !footer.width)) return false;
+    bool held = display_present_begin();
+    bool handled = false;
+    // 保留原来的强刷、带宽恢复与主页保护出口；仅合并可直接扫的阅读帧。
+    // Leave requested full refresh, underrun recovery and main protection to their existing paths.
+    if (display_needs_full() || s_main_fault || s_main_armed) goto done;
+    if (!display_power_ready()) {
+        *result = DISPLAY_DRAW_POWER_NOT_READY;
+        handled = true;
+        goto done;
+    }
+    const unsigned pushes = DISPLAY_READER_CHROME_PUSHES;
+    if (ripple) {
+        if (!hl->dirty_lines || !hl->dirty_columns) goto done;
+        board_epd_use_scan(BOARD_EPD_SCAN_FAST);
+        epd_lcd_set_prefill_lines(s_bulk_io ? 127 : 64);
+        bool scanned;
+        *result = e0470_page_turn_reader_joined(hl, body, dir, display_reader_water_waveform(), pushes, chrome, &scanned);
+        use_scan_for(&E0470_WAVEFORM, MODE_GL16);
+        if (!scanned) goto done;
+        if (*result != EPD_DRAW_SUCCESS) *result = recover_water_turn(hl, *result);
+        handled = true;
+    } else {
+        const bool bg = app_settings_book_background_path()[0] != 0;
+        const EpdWaveform* wave = bg ? display_reader_bg_waveform() : display_reader_text_waveform();
+        use_scan_for(wave, MODE_GL16);
+        handled = display_static_black_join(hl, wave, native, chrome, bg, pushes, result);
+        if (handled && *result != EPD_DRAW_SUCCESS) retain_failed_frame(*result);
+    }
+done:
+    display_present_end(held);
+    return handled;
 }
 
 enum EpdDrawError update_display_water_turn(EpdiyHighlevelState* hl, EpdRect area,

@@ -144,6 +144,7 @@ static bool parse_credentials(const char *body, size_t length, transfer_credenti
 }
 
 typedef struct {
+    bool cancel_pending; ///< 等待断开确认 / Awaiting a disconnect acknowledgment
     bool online, pending, failed; ///< 在线、待连接与终止状态 / Online, pending and terminal states
     unsigned attempts; ///< 本轮尝试次数 / Attempts in this round
     int64_t deadline_ms, next_ms; ///< 总截止与下次尝试时刻 / Overall deadline and next attempt time

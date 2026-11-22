@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * 用户要求快刷封面稍微加深：白色混入从1/8降为1/16，仍输出黑白端点，不改变亚克力或刷新次数。
- * User requests slightly darker fast covers: reduce the white lift from 1/8 to 1/16, retaining binary output without changing acrylic or refresh counts.
+ * 图片灰阶和黑白有序抖动；封面快刷不再人为掺白，以免纯黑发灰。
+ * Ordered image dithering to gray or BW; fast covers no longer lift black with white dots.
  */
 #include "ui_image_dither.h"
 
@@ -27,13 +27,6 @@ uint8_t ui_image_dither_bw(uint8_t gray, int x, int y) {
     if (gray == 0) return 0;
     if (gray == 255) return 255;
     return gray > bayer4[(unsigned)y & 3u][(unsigned)x & 3u] * 16u + 8u ? 255 : 0;
-}
-
-uint8_t ui_image_dither_cover_bw(uint8_t gray, int x, int y) {
-    // 白色混入减半，纯黑区从14/16增至15/16黑点；坐标相位稳定，图标与文字不经过这里。
-    // Halve the white lift, raising solid-black density from 14/16 to 15/16 dots; keep phase stable and bypass icons and text.
-    const uint8_t lighter=(uint8_t)(gray + (255u-gray+8u)/16u);
-    return ui_image_dither_bw(lighter,x,y);
 }
 
 uint8_t ui_image_dither_acrylic_bw(uint8_t gray, int x, int y) {

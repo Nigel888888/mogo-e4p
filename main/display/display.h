@@ -56,6 +56,17 @@ void display_present_end(bool held);
 /// 解锁或阅读返回时，下一张完成绘制的画面使用完整48相GC16整屏全像素清理；成功才消费请求。
 /// Clean the next completed unlock/reader-return frame with complete 48-phase full-pixel GC16; consume only on success.
 void display_request_full_refresh(void);
+/// 应用正常竖屏的设备偏移；两次扫描之间调用，下一帧清屏重建真实基准。
+/// Apply device offsets in portrait coordinates between scans; rebuild the physical baseline on the next frame.
+void display_apply_screen_offset(int x, int y);
+/// 查询已应用的竖屏偏移；界面任务在扫描之间调用。/ Get applied portrait offsets; call from the UI task between scans.
+void display_get_screen_offset(int* x, int* y);
+/// 正常校正走物理差分；成功才切换坐标，失败保留重建要求。
+/// Calibrate by physical differences; publish coordinates only on success and retain recovery on failure.
+enum EpdDrawError update_display_screen_offset(EpdiyHighlevelState* hl, int x, int y);
+/// 启动：在供电守卫内建立白底并提交已绘好的开机画面。
+/// Boot: establish a white baseline under the power guard and present the prepared splash.
+enum EpdDrawError update_display_boot_frame(EpdiyHighlevelState* hl);
 enum EpdDrawError update_display_mode(EpdiyHighlevelState* hl, enum EpdDrawMode mode);
 /// 普通页面切换使用真实差分 GL16；未变化像素不进入 dirty map。
 /// True differential GL16 for ordinary page transitions; unchanged pixels stay clean.
@@ -93,6 +104,8 @@ enum EpdDrawError update_display_from_white_with(
 /// Paint the front buffer white and GC16 the panel back to white.
 enum EpdDrawError update_display_white(EpdiyHighlevelState* hl);
 enum EpdDrawError update_display_full(EpdiyHighlevelState* hl);
+/// 物理清白后，以完整48相GC16整屏提交现有前缓冲。/ Physically clear the panel, then present the existing front buffer with complete 48-phase GC16.
+enum EpdDrawError update_display_full_clean(EpdiyHighlevelState* hl);
 
 /// 面板修复：不看 framebuffer 的整屏盲刷，专治刷新中途断电留下的条纹。
 /// Panel repair: a blind full-screen drive that ignores the framebuffer, for the stripes a power
@@ -127,12 +140,25 @@ enum EpdDrawError update_display_area_diff_with(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
     EpdRect area
 );
+/// 稳定 GL16 局刷可同帧补偿区外已上屏纯黑，不提前提交区外目标。
+/// Stable GL16 differentials may reinforce presented outside black in the same scan without publishing pending outside targets.
+enum EpdDrawError update_display_area_stable_diff(
+    EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, EpdRect area
+);
 /// 差分刷新并把脏行/脏列向外扩，让差分跳过的邻像素重新走 LUT，用于擦除细线残影。
 /// Differential update with dilated dirty masks so skipped neighbours run the LUT again.
+/// 全宽正文翻页：同帧补正文带外新旧都为纯黑的顶底栏像素。/ Full-width body turn: reinforce chrome that stays pure black outside the body.
+enum EpdDrawError update_display_area_reader_turn(
+    EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode, EpdRect area, bool full_body
+);
 enum EpdDrawError update_display_area_diff_padded(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
     EpdRect area, int pad_lines, int pad_col_bytes
 );
+/// 正文与指定栏位一次呈现。false 表示未扫描，可走分步出口；结果有误不得回放局刷。
+/// Present body and requested bars together. False means no scan and allows legacy fallback; never replay a failed scan.
+bool update_display_reader_joined(EpdiyHighlevelState* hl, EpdRect body, EpdRect top, EpdRect footer,
+                                  bool ripple, e0470_turn_dir_t dir, enum EpdDrawError* result);
 /// 阅读页可选的真实错相 GL16 翻页，使用面板原厂灰阶表；缺相位时回退现有 GL16，扫描失败重建真实基准。
 /// Optional staggered GL16 reader turn using the vendor table; fall back on missing phases and rebuild the baseline after failure.
 enum EpdDrawError update_display_water_turn(EpdiyHighlevelState* hl, EpdRect area,

@@ -17,7 +17,7 @@ The local component is `device_power`, derived from `mindreset/read_pico_pmu`; r
 - `device_power_cmd()`：支持 RTC 读时与同步；未实现的旧命令返回 `ESP_ERR_NOT_SUPPORTED`。/ Supports RTC reads and sync; unimplemented legacy commands return `ESP_ERR_NOT_SUPPORTED`.
 - 电源键：TCA9555 P17 采样，去抖后提供短按、长按和唤醒消费接口。/ Samples TCA9555 P17 and exposes debounced short/long press and wake-consumption APIs.
 - 电源交接：`device_power_report_sleep()` 返回不支持，由应用按当前板路径转入关机；`device_power_power_off()` 发送关机脉冲，耗尽重试后进入 ESP 深睡。/ Soft sleep reports not supported so the application escalates along the current board's power-off path; power-off sends the pulse train and falls back to ESP deep sleep after its retry limit.
-- 面板 VCOM：启动读取已有标定值，写入接口仅供出厂流程使用。/ Reads existing calibration at boot; the write API is reserved for factory setup.
+- 面板 VCOM：S31 后端将标定值保存在 ESP NVS `panel/vcom`，启动时加载；`device_power_vcom_set()` 仅供出厂标定流程保存，产品页不提供修改入口。该值不在设置备份内，擦除 NVS 后须重新出厂标定；板级上电应用电压与持久化存储是不同步骤。/ The S31 backend stores calibration in ESP NVS `panel/vcom` and loads it at boot. `device_power_vcom_set()` is reserved for factory calibration; product pages provide no editing entry. Settings backups exclude it, so erasing NVS requires factory calibration again. Applying voltage during panel power-on is separate from persistence.
 
 ## 电量显示 / Battery display
 
@@ -27,31 +27,58 @@ Compensate voltage using signed BQ27220 current: subtract while charging and add
 普通区间每 60 秒最多变化 1%，充放电切换后重新计时；确认充满仍直接对齐 100%。放电目标不高于 14% 时保留每 10 秒最多下降 1%，空电目标允许清掉不足 1% 的尾数，不让死区长期显示 1%。这是显示平滑，不是延长实际续航。
 Normal levels move at most 1% every 60 seconds, rearming after charging transitions; confirmed full still aligns directly to 100%. Discharge targets at or below 14% retain 1% steps every ten seconds, and an empty target can clear a sub-1% remainder. Smoothing does not extend physical runtime.
 
-曲线使用负载补偿和 EMA 后的电压，不是静置实测 OCV。4.38 V 满电平台及 4.30/4.20/4.10 V 的 95.5/87.5/79% 保留；它们来自早期满电平台和回充对账。4.05/4.00/3.95 V 的 73.3/69.5/62.9% 保留 2026-11-05 连续清醒段的相对估算，以 4.10 V / 79% 和假定 2050 mAh 为基准，并非绝对电量实测。
-The curve uses load-compensated, EMA-filtered voltage, not measured rested OCV. Retain the 4.38 V full plateau and 95.5/87.5/79% at 4.30/4.20/4.10 V from earlier plateau/refill observations. The 73.3/69.5/62.9% targets at 4.05/4.00/3.95 V retain the 2026-11-05 relative awake-discharge estimate, anchored to 4.10 V / 79% and an assumed 2050 mAh capacity, not measured absolute SOC.
+曲线使用负载补偿和 EMA 后的电压，不是静置实测 OCV。4.38 V 满电平台及 4.30/4.20/4.10 V 的 95.5/87.5/79% 保留；它们来自早期满电平台和回充对账。4.10 V / 79% 是沿用的相对基准，并非本次实测的绝对电量。
+The curve uses load-compensated, EMA-filtered voltage, not measured rested OCV. Retain the 4.38 V full plateau and 95.5/87.5/79% at 4.30/4.20/4.10 V from earlier plateau/refill observations. The 4.10 V / 79% anchor remains a relative reference, not an absolute SOC measurement from this calibration.
 
-3.95–3.30 V 改用 2026-11-11 提供日志的连续放电形状，替代旧低段直线与偏高尾段。保持 3.95 V / 62.9% 和 3.30 V / 0% 两个边界，在两者之间按剩余采样放电量归一，不把日志末行当成真实断电点，也不重新估计额定容量。关键目标如下：
-The 3.95–3.30 V range follows the continuous discharge supplied on 2026-11-11, replacing the provisional line and overstated tail. Keep 3.95 V / 62.9% and 3.30 V / 0%, normalizing sampled remaining charge between them without treating the last row as the physical cutoff or estimating rated capacity.
+4.10–3.30 V 使用 2026-11-18 提供日志中的连续放电形状，替代上一轮中低段估算。保持 4.10 V / 79% 和 3.30 V / 0% 两个边界，在两者之间按剩余采样放电量归一；不重新估计额定容量。关键目标如下，最终显示仍经过死区和单向限速：
+The 4.10–3.30 V range follows the continuous discharge supplied on 2026-11-18, replacing the previous middle/lower-range estimate. Keep 4.10 V / 79% and 3.30 V / 0%, normalizing sampled remaining charge between them without estimating rated capacity. Key targets follow; visible levels still apply deadband and one-way rate limits.
 
 | 补偿/EMA 电压 / Filtered voltage | 显示目标 / Target |
 | --- | --- |
-| 3.90 / 3.85 / 3.80 V | 55.8 / 50.4 / 40.6% |
-| 3.775 / 3.75 / 3.725 V | 32.4 / 22.4 / 16.9% |
-| 3.70 / 3.675 / 3.65 V | 13.3 / 10.4 / 5.7% |
-| 3.625 / 3.60 / 3.50 V | 4.0 / 3.3 / 1.8% |
-| 3.40 / 3.30 V | 0.7 / 0% |
+| 4.05 / 4.00 / 3.95 V | 73.4 / 69.5 / 63.2% |
+| 3.90 / 3.85 / 3.825 V | 56.8 / 50.7 / 46.1% |
+| 3.80 / 3.775 / 3.75 V | 40.2 / 31.3 / 22.8% |
+| 3.725 / 3.70 / 3.675 V | 16.3 / 12.6 / 8.7% |
+| 3.65 / 3.625 / 3.60 V | 4.6 / 3.7 / 3.2% |
+| 3.50 / 3.40 / 3.30 V | 1.6 / 0.7 / 0% |
 
-可复核来源：输入日志 SHA-256 `a1a70c633afe1390ba858ea02b1df9fdb901fe189d3eb985066d62e11d5aca6f`，格式 2，`boot=75406354784d6057`、`session=1`、`seq=2..1181`；1,180 条连续清醒记录共 19.684 小时、约 1,660.266 mAh，区间内 `unknown_ms` 不增长，序号无缺失、无新增丢队列/写卡错误。`file_missed=1` 是首条前已发生的文件缺失，区间内保持不变。取第一次下降跨越目标电压的相邻记录，线性插值 `out_uah_est`：3.95 V 为 287037 µAh，3.30 V 为 1645474.917 µAh。每个锚点的千分比为 `round(629 × (1645474.917 − Q(V)) / 1358437.917)`；最终显示仍经过死区和单向限速。
-Reproducible source: log SHA-256 `a1a70c633afe1390ba858ea02b1df9fdb901fe189d3eb985066d62e11d5aca6f`, format 2, `boot=75406354784d6057`, `session=1`, `seq=2..1181`. Its 1,180 continuous awake records cover 19.684 hours and about 1660.266 mAh with no growth in unknown time, sequence gaps, queue drops or write errors. `file_missed=1` predates the first row and stays fixed. Linearly interpolate `out_uah_est` at each first descending voltage crossing: 287037 uAh at 3.95 V and 1645474.917 uAh at 3.30 V. Anchor permille is `round(629 × (1645474.917 − Q(V)) / 1358437.917)`; the visible percentage still applies deadband and one-way rate limits.
+可复核来源：输入日志 SHA-256 `69f1809d281c917e197a6e5f768f8f1a355ccb496b7468c762c0a5c6e3c03495`，格式 3，`boot=80b588bf83b795a1`、`session=1`、`seq=26..1183`，采集固件 1.1.2、`curve_hash=680cc0a5`。北京时间 2026-11-16 00:02:34–19:17:29 的 1,158 条连续清醒记录约 19.249 小时、采样放出 1,704.396 mAh；`unknown_ms`、`lock_ms` 和充电积分不增长，序号无缺失，最大采样间隔 3,769 ms，无队列丢弃、写卡或检查点错误。末行是原始电压 3.10 V 的欠压动作记录（`event=2048`），没有有效滤波电压，不参与拟合；此前 1,157 条均有效。
+Reproducible source: log SHA-256 `69f1809d281c917e197a6e5f768f8f1a355ccb496b7468c762c0a5c6e3c03495`, format 3, `boot=80b588bf83b795a1`, `session=1`, `seq=26..1183`, firmware 1.1.2 and `curve_hash=680cc0a5`. The 1,158 continuous awake records span 2026-11-16 00:02:34–19:17:29 Beijing time, about 19.249 hours and 1704.396 mAh sampled discharge. Unknown time, lock time and charge input stay fixed; there are no sequence gaps, queue drops, card/checkpoint errors, and the largest sample interval is 3769 ms. The final row records undervoltage action at raw 3.10 V (`event=2048`) without valid filtered voltage and is excluded from fitting; the preceding 1157 rows are valid.
 
-3.30 V 以下到末行仍记录约 14.8 mAh，保留为显示余量。较早日志有长时间锁屏缺测，后续充电跨重启且未记录确认充满；这些段、校时时钟跳变和芯片 SOC 均不参与本次曲线拟合。单台设备、单次连续放电只能校正该段形状；容量老化、温度、其他负载、充电阶段及新曲线设备体验仍须验证，不能据此宣称绝对电量准确度或续航已提高。
-About 14.8 mAh remains recorded below 3.30 V through the last row, retained as display reserve. Earlier logs have long sleep gaps; later charging spans restarts without confirmed full. Those segments, wall-clock jumps and gauge SOC do not enter this fit. One device and one continuous discharge support this segment's shape only; aging, temperature, other loads, charging and the new display still require validation, with no claim of absolute SOC accuracy or improved runtime.
+对每个目标电压，取首对满足 `Va ≥ V > Vb` 的相邻有效记录，线性插值 `out_uah_est`。4.10 V 为 45538 µAh（`seq=41..42`），3.30 V 为 1715490.231 µAh（`seq=1172..1173`）；每个锚点的千分比为 `round(790 × (1715490.231 − Q(V)) / 1669952.231)`。原日志的芯片 SOC、显示百分比和后续充电/锁屏/重启段不参与拟合。回归保留上一轮独立放电样本，并新增本轮非锚点观测，核对曲线与跨版本恢复。
+For each target voltage, linearly interpolate `out_uah_est` in the first adjacent valid pair satisfying `Va ≥ V > Vb`. Counters are 45538 uAh at 4.10 V (`seq=41..42`) and 1715490.231 uAh at 3.30 V (`seq=1172..1173`). Anchor permille is `round(790 × (1715490.231 − Q(V)) / 1669952.231)`. Gauge SOC, displayed percentages and later charging/sleep/restart segments do not enter the fit. Regressions retain independent samples from the previous discharge and add non-anchor observations from this cycle, checking the curve and revision restoration.
+
+3.30 V 以下到欠压记录仍采到约 13.165 mAh，保留为显示余量；欠压命令不代表已观察到物理断电。最新这一轮只校正连续清醒、约 76–173 mA 放电条件下的曲线形状；容量老化、温度、其他负载、充电阶段及新曲线设备体验仍须验证，不能据此宣称绝对电量准确度或续航已提高。
+About 13.165 mAh is recorded below 3.30 V through the undervoltage row, retained as display reserve; the command is not proof of observed physical power loss. This cycle refines the curve shape under continuous awake discharge at roughly 76–173 mA only. Aging, temperature, other loads, charging and the new display still require validation, with no claim of absolute SOC accuracy or improved runtime.
 
 高压近零电流判满需要连续有效采样；超过 5 秒的采样空白、读数失败或明显放电会重新确认，保留硬件 top-off 和原电压门槛。显示算法不修改充电电流、截止电压、终止策略或欠压保护。
 High-voltage near-zero-current full confirmation requires continuous valid sampling. Gaps longer than five seconds, read failures or material discharge restart confirmation, retaining hardware top-off and existing voltage gates. Display logic does not change charge current, regulation voltage, termination policy or undervoltage protection.
 
-NVS 百分比带 `soc_ver` 算法版本，当前为 2；旧的无版本、版本 1 和其他不兼容记录不恢复，首次按新曲线估算，不清空其他设置。以后在五分钟周期、充电状态变化、累计变化至少 2%（至少隔一分钟）及正常重启/关机前保存有效值，相同值不重复写。保存失败不记作成功；意外断电仍可能丢失最近变化，启动时仍按电压容差决定是否恢复。
-NVS percentages carry algorithm revision 2 in `soc_ver`. Unversioned, revision-1 and other incompatible records are ignored so the first start estimates from the new curve without erasing other settings. Save valid values every five minutes, on charger changes, after at least 2% movement (at least one minute apart), and before normal restart/shutdown; duplicate values skip writes. Failed saves are not cached as successes. Unexpected power loss may still lose recent movement, and boot restoration remains subject to voltage tolerance.
+NVS 电量算法版本当前为3；无版本、版本1/2和不兼容记录不恢复，首次按当前曲线估算，不清空其他设置。五分钟周期、充电状态变化、累计变化至少2%（至少隔一分钟）及正常重启/关机前保存有效值；值和模型身份都相同时不重复写。保存失败不记作成功，意外断电可能丢失最近变化；启动仍检查电压容差。当前原子记录与旧键兼容边界见下文。
+The NVS SOC algorithm revision is 3. Ignore unversioned, revision-1/2 and incompatible records, estimating from the active curve without erasing other settings. Save valid values every five minutes, on charger changes, after at least 2% movement (at least one minute apart) and before normal restart/shutdown. Skip writes only when both value and model identity match. Failed saves are not cached as successes; unexpected power loss may lose recent movement. Boot restoration still checks voltage tolerance. The atomic record and legacy-key compatibility are defined below.
+
+## 自动电量校准 / Automatic battery calibration
+
+入口为「设置 → 电源管理 → 自动电量校准(beta)」，新安装及升级默认关闭；开启后在日常清醒使用中学习本机放电曲线。关闭仅停止学习，已有曲线继续生效；「重置校准」需再次点按确认，恢复系统曲线并清除样本，开关保留。不要求专门放电，也不保证几天完成；碎片使用可能长期无法覆盖完整区间。
+Open Settings → Power management → Automatic battery calibration (beta). New installations and upgrades default off; enabling learns the local discharge curve during ordinary awake use. Disabling stops learning while retaining the curve. Reset requires a second tap, restores the baseline and clears samples while retaining the switch. Dedicated discharge is unnecessary; there is no completion deadline, and fragmented use may leave intervals unobserved indefinitely.
+
+学习器 `battery_calibration.c` 直接接收同轮有效电压、有符号电流和充电状态，不读取显示百分比、芯片SOC或 `batt.log`。沿用22个补偿/EMA电压节点，对21个区间的完整下降过程以实际采样间隔做梯形电流积分，在节点穿越处插值积分。有效区间相邻采样不超过5秒，积分为0.5–20000mAh；非放电电流、无效采样、锁屏、充电、重启或长空白均打断当前片段，已完成样本保留。启动、插拔供电及解锁后先稳定60秒，锁屏期间（包括唤醒后的PIN验证）不学习、不额外保存或唤醒。
+The learner in `battery_calibration.c` consumes valid same-poll voltage, signed current and charger state without using displayed SOC, gauge SOC or `batt.log`. Keep the 22 compensated/EMA voltage nodes and integrate each complete descending traversal across the 21 intervals using trapezoidal current samples and interpolated boundary integrals. Eligible samples are at most five seconds apart and traversals contain 0.5–20000mAh. Nondischarge current, invalid samples, locking, charging, restarting or long gaps break the active traversal while retaining complete samples. Startup, supply transitions and unlock settle for 60 seconds. The locked session, including PIN entry after wake, neither learns nor adds persistence or wakes.
+
+同一轮放电每区间最多计一次，观察到外部供电且充电电流大于20mA后才允许下一轮；已完成掩码随样本保存。区间内从最低电压回弹超过10mV即放弃当前片段，避免重复积分。每区间保留最近5次经过，至少3次且所有已存结果极差不超过中位数20%才可信；不挑选有利子集，不一致时继续收集，直至异常样本自然退出窗口。
+Each interval contributes once per discharge; another pass requires observed external power and charging above 20mA. Persist the completed mask with samples. A rebound greater than 10mV from the traversal minimum discards that traversal to avoid repeated integration. Retain five recent samples per interval. Trust requires at least three, with the range of all stored samples no greater than 20% of their median. Never cherry-pick a favorable subset; conflicting observations age out through later passes.
+
+只有连续至少两个可信区间且覆盖至少100mV，才按各区间积分中位数的相对占比重分配内部节点；两端沿用当前百分比，未覆盖区域不动。每批新样本使用同一凸组合系数，最多靠近候选25%，每节点最多变化20‰，保持单调。没有新增有效样本时不重复应用同一批校准。显示继续使用既有单向限速与判满；重置/学习不会强制跳变。固定4380/3300mV端点、180mΩ补偿、充电及欠压保护保持不变，不推断容量、健康度、剩余小时或绝对SOC准确度。
+Only a contiguous group of at least two trusted intervals spanning at least 100mV may redistribute interior nodes using relative median discharge integrals. Retain the group's current endpoint percentages and all unobserved ranges. A common convex blend moves at most 25% toward the candidate and at most 20 permille per node per new batch, preserving monotonicity; never reapply a batch without new complete observations. Existing display rate/direction limits and full confirmation remain. Learning/reset does not snap the display. Keep the 4380/3300mV endpoints, 180-milliohm compensation, charger control and undervoltage protection. Do not infer capacity, health, remaining hours or absolute SOC accuracy.
+
+本机NVS `battcal/slot0`、`slot1` 交替保存包含开关、节点、样本、掩码、基线指纹、序号和CRC32的完整快照。启动选择较新的有效槽，损坏或基线不兼容则尝试另一槽，均不可用回落默认关闭的系统基线；不擦除其他设置。脏数据每五分钟尝试保存，正常重启/关机前强制尝试，开关及重置立即保存；失败保留脏状态和错误标记，不记为成功。重置先提交 `battcal/reset` 意图并保留开关，再把两槽刷新为基线，完成后清除意图。中断后以基线启动并继续补写，即使已重置的槽损坏也不会恢复旧曲线；未完成补写时暂停学习。意外断电可能丢失最近样本。
+Local NVS `battcal/slot0` and `slot1` alternate complete snapshots containing the switch, nodes, samples, completed mask, baseline fingerprint, sequence and CRC32. Load the newer valid slot, falling back to the other on corruption/incompatibility, then to the disabled baseline without erasing other settings. Dirty records retry every five minutes and before normal restart/shutdown; switch/reset persist immediately. Failure retains dirty state and an error rather than recording success. Reset journals intent and the switch in `battcal/reset`, refreshes both slots to the baseline, then clears the intent. An interruption resumes from the baseline without reviving the old curve, even if the first rewritten slot is damaged. Learning pauses while repair is pending. Unexpected power loss may lose recent samples.
+
+电量检查点改为原子NVS blob `pmu/soc_state`，同存算法版本、显示值生成时的曲线身份、显示千分比和CRC32；只有身份匹配且通过原容差才恢复。仅该blob不存在、且当前确为基线时才兼容旧 `pmu/soc` + `soc_ver=3`；新记录损坏或读取失败不回退陈旧的旧键。校准开关、样本、曲线及电量检查点全部排除普通配置备份，换机不迁移。
+SOC checkpoints use one atomic NVS blob, `pmu/soc_state`, containing algorithm revision, the curve identity captured when the displayed value was produced, displayed permille and CRC32. Restore requires matching identity and the existing voltage tolerance. Legacy `pmu/soc` with `soc_ver=3` is eligible only when the blob is absent and the active curve is the baseline. A corrupt or unreadable new record never falls back to stale legacy keys. Ordinary configuration backups exclude the learning switch, samples, curve and SOC checkpoints; none migrate between devices.
+
+纯查询接口为 `device_power_get_batt_calibration()`；主循环通过 `device_power_set_batt_calibration()`、`device_power_reset_batt_calibration()` 修改并保存，`device_power_batt_calibration_lock()` 交接锁屏。绘制不采样或落盘。宿主入口为 `battery_calibration`、`battery_calibration_ui`、`battery`、`battery_filter`，锁屏交接由 `metalio_drivers` 和 `lock_style` 覆盖。真实精度、额外功耗、温度/跨负载和其他设备仍需真机验证；首版不使用BQ累计电量跨锁屏或关机补账。
+Use `device_power_get_batt_calibration()` for pure queries; the main loop changes/persists through `device_power_set_batt_calibration()` and `device_power_reset_batt_calibration()`, handing lock state through `device_power_batt_calibration_lock()`. Painting neither samples nor persists. Host entries are `battery_calibration`, `battery_calibration_ui`, `battery` and `battery_filter`; `metalio_drivers` and `lock_style` cover lock handoff. Actual accuracy, overhead, temperature/load variation and other devices require hardware validation. This revision does not bridge locked/off periods through gauge charge counters.
 
 ## 电源键采样 / Power-key sampling
 
@@ -96,8 +123,8 @@ With only a USB cable, first capture short-term connected behavior, then disconn
 
 ## 充电与 RTC / Charging and RTC
 
-CX25601N 请求 1 A，经原厂 80 mA 档位量化为 960 mA，输入限流跟随量化值；VREG 为 4.4 V。轮询按有效电压切换终止，输入存在且空闲/近零电流时补充充电，无输入且有效电压 ≤3.1 V 时按原厂关 BATFET。配置不完整时报告失败，并尽力恢复硬件终止与停充。
-CX25601N quantizes the 1 A request to 960 mA using vendor 80 mA steps; the input limit follows that value and VREG is 4.4 V. Polling controls termination from valid voltage, kicks recharge on input-present idle/near-zero-current status and shuts BATFET on valid no-input voltage at or below 3.1 V. Incomplete configuration reports failure and attempts to restore hardware termination and disable charging.
+「设置 → 电源管理 → 充电档位」提供标称 1 A（默认）与 1.5 A。CX25601N 按原厂 80 mA 步进向下量化为 960/1440 mA，输入限流同步；这不是实测电池电流。档位在主循环即时写入，成功后保存在本机 NVS `charger/current_ma`，开机加载，仅接受两档，无有效记录回落 1 A。失败尝试恢复原档，恢复失败则报告充电芯片不可用并尽力停充、恢复硬件终止。VREG 保持 4.4 V；轮询按有效电压切换终止，输入存在且空闲/近零电流时补充充电，无输入且有效电压 ≤3.1 V 时按原厂关 BATFET。
+The Charge profile setting offers nominal 1 A (default) and 1.5 A. CX25601N rounds down in vendor 80 mA steps to 960/1440 mA and follows with the input limit; this is not measured battery current. The loop applies the setting immediately and persists it under local NVS `charger/current_ma`; boot accepts only the two profiles and defaults to 1 A without a valid record. On failure, attempt rollback; if rollback fails, report the charger unavailable and attempt to disable charging and restore hardware termination. VREG stays at 4.4 V. Polling still controls termination from valid voltage, kicks recharge on input-present idle/near-zero-current status and shuts BATFET on valid no-input voltage at or below 3.1 V.
 
 维护使用现有轮询上的非阻塞状态机，恢复充电最早在 200 ms 后的下一次轮询执行，失败继续重试；不更改电量曲线、补偿与滤波。PCF8563 启动清 STOP 和 AF/TF，寄存器存 UTC，非法 BCD、日期和电压失效标志不用于系统校时。
 Maintenance uses a nonblocking state machine on existing polling, resuming recharge on the next poll at least 200 ms later and retrying failed restoration. Battery curves, compensation and filtering remain unchanged. PCF8563 startup clears STOP and AF/TF, stores UTC and rejects invalid BCD/calendar dates or voltage-loss flags for system clock updates.

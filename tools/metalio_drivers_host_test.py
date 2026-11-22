@@ -414,6 +414,31 @@ def power_source():
     code += r"""
 static bool s_ready=true;
 static pmu_snapshot_t s_snap;
+static device_power_charge_current_t s_charge_current;
+typedef int nvs_handle_t;
+enum { NVS_READONLY, NVS_READWRITE };
+static uint16_t nvs_current, nvs_pending;
+static bool nvs_present, nvs_open_fail, nvs_set_fail, nvs_commit_fail;
+static esp_err_t nvs_open(const char *ns,int mode,nvs_handle_t *h) {
+    assert(!strcmp(ns,"charger"));
+    if (nvs_open_fail || (mode == NVS_READONLY && !nvs_present)) return ESP_FAIL;
+    *h=mode;return ESP_OK;
+}
+static esp_err_t nvs_get_u16(nvs_handle_t h,const char *key,uint16_t *value) {
+    assert(h==NVS_READONLY && !strcmp(key,"current_ma"));*value=nvs_current;return ESP_OK;
+}
+static esp_err_t nvs_set_u16(nvs_handle_t h,const char *key,uint16_t value) {
+    assert(h==NVS_READWRITE && !strcmp(key,"current_ma"));
+    if (nvs_set_fail) return ESP_FAIL;
+    nvs_pending=value;return ESP_OK;
+}
+static esp_err_t nvs_commit(nvs_handle_t h) {
+    assert(h==NVS_READWRITE);
+    if (nvs_commit_fail) return ESP_FAIL;
+    nvs_current=nvs_pending;nvs_present=true;return ESP_OK;
+}
+static void nvs_close(nvs_handle_t h) {(void)h;}
+
 static unsigned clock_sets, uv_log_events;
 static void batt_log_undervoltage(int64_t now,uint16_t mv,bool have_i,int16_t ma,uint8_t status) {
     (void)now;(void)ma;assert(mv<=3100 && have_i && !(status&7));++uv_log_events;
@@ -423,15 +448,56 @@ static int test_settimeofday(const struct timeval *tv,const void *tz){assert(!tz
 #define settimeofday test_settimeofday
 """
     for name in ['bcd_to_dec','dec_to_bcd','dev_read','dev_write','cx_update_bits','cx_set_vreg_mv',
-                 'cx_set_ichg_ma','cx_unlock_private','cx_charger_setup','cx_charger_park','cx_charger_poll','rtc_init','rtc_read','rtc_write','rtc_unix_utc','device_power_read_rtc','device_power_cmd']:
+                 'cx_set_ichg_ma','cx_unlock_private','cx_charger_setup','charge_current_valid','charge_current_load',
+                 'device_power_charge_current','device_power_set_charge_current','cx_charger_park','cx_charger_poll','rtc_init','rtc_read','rtc_write','rtc_unix_utc','device_power_read_rtc','device_power_cmd']:
         code += function(name, path) + '\n'
     return code
 
 POWER_TEST = r'''
 static void reset_power(void){model_reset();s_cx=&devices[0x6b];s_rtc=&devices[0x51];s_charger_configured=true;s_charger_uv_shutdown=false;s_charger_resume_us=s_charger_next_us=0;}
+static void assert_profile(unsigned expected){
+    const uint8_t *r=s_cx->regs;
+    assert((((r[2]>>6)&3)|((r[3]&15)<<2))*80u==expected);
+    assert((((r[6]>>4)&15)|((r[7]&15)<<4))*20u==expected);
+}
+static void charge_profiles(void){
+    reset_power();
+    assert(charge_current_load()==DEVICE_POWER_CHARGE_1A);
+    nvs_present=true;nvs_current=500;
+    assert(charge_current_load()==DEVICE_POWER_CHARGE_1A);
+    s_charge_current=charge_current_load();
+    assert(cx_charger_setup(s_charge_current)==ESP_OK);
+    assert_profile(960);
+    assert(device_power_set_charge_current(500)==ESP_ERR_INVALID_ARG);
+    assert(device_power_set_charge_current(DEVICE_POWER_CHARGE_1_5A)==ESP_OK);
+    assert(device_power_charge_current()==1500 && charge_current_load()==1500);
+    assert_profile(1440);
+    const unsigned writes=tx_count;
+    assert(device_power_set_charge_current(DEVICE_POWER_CHARGE_1_5A)==ESP_OK && tx_count==writes);
+    reset_power();
+    s_charge_current=charge_current_load();
+    assert(cx_charger_setup(s_charge_current)==ESP_OK);
+    assert_profile(1440);
+    for (unsigned fault=0;fault<4;++fault){
+        nvs_open_fail=fault==0;nvs_set_fail=fault==1;nvs_commit_fail=fault==2;
+        if(fault==3){fail_reg=0x03;fail_writes=1;fail_after_write=true;}
+        assert(device_power_set_charge_current(DEVICE_POWER_CHARGE_1A)!=ESP_OK);
+        assert(device_power_charge_current()==1500 && nvs_current==1500);
+        assert_profile(1440);
+    }
+    assert(device_power_set_charge_current(DEVICE_POWER_CHARGE_1A)==ESP_OK);
+    assert(device_power_charge_current()==1000 && charge_current_load()==1000);
+    assert_profile(960);
+    fail_reg=0x03;fail_writes=2;fail_after_write=true;
+    assert(device_power_set_charge_current(DEVICE_POWER_CHARGE_1_5A)!=ESP_OK);
+    assert(device_power_charge_current()==0 && (s_cx->regs[0x14]&4) && !(s_cx->regs[0x16]&0x20));
+    assert(device_power_set_charge_current(DEVICE_POWER_CHARGE_1A)==ESP_ERR_INVALID_STATE);
+    puts("PASS: charge profiles, restart restore, quantization, error rollback and fail-safe disable");
+}
 static void charge(int64_t now,int mv,int ma,bool status_ok,int status){cx_charger_poll(now,true,mv,true,ma,status_ok,status);}
 int main(void){
-    reset_power();assert(cx_charger_setup()==ESP_OK);
+    charge_profiles();
+    reset_power();assert(cx_charger_setup(DEVICE_POWER_CHARGE_1A)==ESP_OK);
     uint8_t *r=devices[0x6b].regs;
     assert(((((r[2]>>6)&3)|((r[3]&15)<<2))*80)==960);
     assert(((((r[6]>>4)&15)|((r[7]&15)<<4))*20)==960);
@@ -448,11 +514,11 @@ int main(void){
     reset_power();charge(0,3000,0,true,1);assert(!s_charger_uv_shutdown);
     reset_power();charge(0,3000,0,false,0);assert(!s_charger_uv_shutdown && !s_charger_resume_us);
     reset_power();cx_charger_poll(0,false,0,true,0,true,0);assert(!tx_count && !s_charger_uv_shutdown);
-    reset_power();fail_reg=0x86;fail_writes=1;assert(cx_charger_setup()==ESP_FAIL && !(devices[0x6b].regs[0x16]&0x20));
+    reset_power();fail_reg=0x86;fail_writes=1;assert(cx_charger_setup(DEVICE_POWER_CHARGE_1A)==ESP_FAIL && !(devices[0x6b].regs[0x16]&0x20));
     const uint8_t failed_regs[]={0x02,0x03,0x04,0x05,0x06,0x07,0x14,0x15,0x16,0x18,0x1a,0x23,0x24,0x70,0x86,0x3a,0x46};
     for(unsigned i=0;i<sizeof(failed_regs);++i){reset_power();r=devices[0x6b].regs;r[0x16]=0x20;
         fail_reg=failed_regs[i];fail_writes=1;fail_after_write=true;
-        assert(cx_charger_setup()!=ESP_OK && !(r[0x16]&0x20) && (r[0x14]&4));}
+        assert(cx_charger_setup(DEVICE_POWER_CHARGE_1A)!=ESP_OK && !(r[0x16]&0x20) && (r[0x14]&4));}
     reset_power();r=devices[0x6b].regs;s_charger_resume_us=200000;
     assert(cx_charger_park()==ESP_OK && !s_charger_resume_us && (r[0x16]&0x20) && (r[0x14]&4));
     reset_power();s_charger_resume_us=200000;fail_reg=0x16;fail_writes=1;
@@ -490,6 +556,7 @@ def wake_poll_source():
     path = ROOT / 'components/device_power/device_power_metalio.c'
     text = path.read_text()
     code = power_source() + '#include "' + str(ROOT / 'components/device_power/battery_log.h') + '"\n#include "fca9555.h"\n'
+    code += '#include "battery_calibration.h"\nstatic batt_cal_t s_batt_cal;\nstatic const batt_cal_storage_t s_batt_cal_storage={0};\n'
     code += '\n'.join(line for line in text.splitlines()
                       if re.match(r'#define (?:BATT_|BQ_REG_|KEY_)', line)) + '\n'
     code += re.search(r'static const int32_t s_soc_curve\[.*?\};', text, re.S)[0] + '\n'
@@ -520,6 +587,7 @@ static bool batt_log_enabled(void){return logging;}
 static int64_t batt_log_wall(void){return 0;}
 static void batt_log_notify(void){}
 static int32_t s_batt_persisted_permille=-1;
+static uint32_t s_batt_display_model;
 static uint8_t s_batt_restore;
 static void batt_save(int32_t value){(void)value;}
 void batt_log_observe(batt_log_state_t *state,const batt_log_sample_t *sample){
@@ -527,7 +595,7 @@ void batt_log_observe(batt_log_state_t *state,const batt_log_sample_t *sample){
 }
 '''
     for name in ('bq_read_voltage', 'bq_read_current', 'bq_read_soc',
-                 'batt_compensated_mv', 'batt_curve_soc', 'batt_filter_step', 'batt_full_now',
+                 'batt_compensated_mv', 'batt_curve_soc', 'batt_effective_soc', 'batt_filter_step', 'batt_full_now',
                  'poll_key', 'poll_battery', 'wake_battery_snapshot_reusable',
                  'device_power_poll', 'device_power_take_key_wakeup'):
         code += function(name, path) + '\n'
@@ -540,6 +608,7 @@ static void reset_wake_poll(void){
     s_bq=&devices[0x55];s_cx=&devices[0x6b];s_charger_configured=true;
     s_charger_resume_us=0;s_charger_next_us=10000000;s_charger_uv_shutdown=false;
     memset(&s_snap,0,sizeof(s_snap));memset(&s_batt_filter,0,sizeof(s_batt_filter));
+    batt_cal_init(&s_batt_cal,s_soc_curve,now_us);
     s_batt_poll_reusable=false;s_batt_poll_us=0;s_batt_saved_permille=-1;
     s_batt_full_since_us=-1;s_batt_last_save_us=now_us;s_batt_charging_last=false;
     s_key_down=s_key_long_fired=s_key_short_pending=s_key_long_pending=false;
@@ -618,8 +687,7 @@ typedef enum {APP_WAKE_NONE,APP_WAKE_KEY,APP_WAKE_PICKUP,APP_WAKE_TIMEOUT} app_w
 typedef struct {bool jobs_ready,ble_stopped;} app_lifecycle_light_t;
 static bool jobs_ready=true, ble_stopped=true, pickup_setting=true, key_pending;
 static unsigned cellular_service_resumes, wifi_transfer_resumes;
-static void cellular_service_resume_after_sleep(void){++cellular_service_resumes;}
-static void wifi_transfer_resume_after_sleep(void){++wifi_transfer_resumes;}
+static void network_service_resume_after_sleep(void){++cellular_service_resumes;++wifi_transfer_resumes;}
 static unsigned suspend_count,resume_count,sleep_count,key_polls,cache_restores,last_wake;
 static int scenario;
 static uint32_t wake_causes;
@@ -669,7 +737,9 @@ static void sleep_test_log(const char *tag,const char *fmt,...){
 #define ESP_LOGI(...) sleep_test_log(__VA_ARGS__)
 enum { DEVICE_POWER_BATT_LOG_LOCK=128, DEVICE_POWER_BATT_LOG_WAKE=256 };
 static unsigned log_locks, log_wakes;
-static void device_power_batt_log_event(int event){if(event==128)++log_locks;else {assert(event==256);++log_wakes;}}
+static bool calibration_locked;
+static void device_power_batt_calibration_lock(bool locked){assert(calibration_locked!=locked);calibration_locked=locked;}
+static void device_power_batt_log_event(int event){if(event==128){assert(calibration_locked);++log_locks;}else {assert(event==256&&calibration_locked);++log_wakes;}}
 typedef struct {int unused;} EpdiyHighlevelState;
 #define APP_LOCK_STYLE_CLOCK 5
 static bool clock_style;
@@ -739,13 +809,20 @@ static uint32_t esp_sleep_get_wakeup_causes(void){return wake_causes;}
     return code
 
 SLEEP_TEST = r"""
+static app_wake_source_t sleep_wait_as_locked(sc7a20h_handle_t acc,int64_t deadline,EpdiyHighlevelState *hl){
+    device_power_batt_calibration_lock(true);
+    const app_wake_source_t wake=light_sleep_wait_until(acc,deadline,hl);
+    assert(calibration_locked);
+    device_power_batt_calibration_lock(false);
+    return wake;
+}
 static void reset_sleep(int next){
     model_reset();now_us=1000;shared_irq=true;scenario=next;
     jobs_ready=ble_stopped=pickup_setting=true;key_pending=false;
     key_sampling=true;clock_style=false;clock_ticks=clock_refreshes=0;
     wake_causes=0;parked=no_ioe=false;
     suspend_count=resume_count=sleep_count=key_polls=cache_restores=last_wake=0;
-    log_locks=log_wakes=0;timer_us=0;
+    assert(!calibration_locked);log_locks=log_wakes=0;timer_us=0;
     nvs_fault=0;saved_size=pending_size=0;
     nvs_reads=nvs_writes=nvs_commits=nvs_closes=live_logs=saved_logs=0;
     summary[0]=0;devices[0x20].regs[1]=0xff;
@@ -871,7 +948,7 @@ int main(void){
     for(unsigned minutes=10;minutes<=60;minutes=minutes==10?30:minutes+30){
         reset_sleep(20);pickup_setting=false;
         int64_t deadline=now_us+(int64_t)minutes*60*1000000;
-        assert(light_sleep_wait_until(acc,deadline,NULL)==APP_WAKE_TIMEOUT);
+        assert(sleep_wait_as_locked(acc,deadline,NULL)==APP_WAKE_TIMEOUT);
         assert(now_us==deadline+30000+(CONFIG_APP_SLEEP_DIAGNOSTICS?70000:0));
         assert(sleep_count==minutes*30&&cache_restores==sleep_count&&last_wake==APP_WAKE_NONE);
         assert(key_sampling&&resume_count==1);
@@ -883,22 +960,22 @@ int main(void){
 #endif
     }
     reset_sleep(20);pickup_setting=false;
-    assert(light_sleep_wait_until(acc,1501000,NULL)==APP_WAKE_TIMEOUT&&timer_us==1500000);
+    assert(sleep_wait_as_locked(acc,1501000,NULL)==APP_WAKE_TIMEOUT&&timer_us==1500000);
     assert(now_us==1501000+30000+(CONFIG_APP_SLEEP_DIAGNOSTICS?70000:0));
     check_trace(1,1,0,SLEEP_TRACE_TIMEOUT);
     reset_sleep(21);pickup_setting=false;
-    assert(light_sleep_wait_until(acc,now_us+600000000,NULL)==APP_WAKE_KEY&&sleep_count==1);
+    assert(sleep_wait_as_locked(acc,now_us+600000000,NULL)==APP_WAKE_KEY&&sleep_count==1);
     check_trace(1,1,0,SLEEP_TRACE_KEY);
     // 截止同一轮真实按键/拿起优先，保留按键锁存与诊断退出类型。
     // Key/pickup events at expiry win, preserving key capture and diagnostic exit types.
     reset_sleep(21);pickup_setting=false;
-    assert(light_sleep_wait_until(acc,now_us+2000000,NULL)==APP_WAKE_KEY);
+    assert(sleep_wait_as_locked(acc,now_us+2000000,NULL)==APP_WAKE_KEY);
     check_trace(1,1,0,SLEEP_TRACE_KEY);
     reset_sleep(22);
-    assert(light_sleep_wait_until(acc,now_us+2000000,NULL)==APP_WAKE_PICKUP);
+    assert(sleep_wait_as_locked(acc,now_us+2000000,NULL)==APP_WAKE_PICKUP);
     check_trace(1,1,0,SLEEP_TRACE_PICKUP);
     reset_sleep(14);pickup_setting=false;
-    assert(light_sleep_wait_until(acc,now_us+100000,NULL)==APP_WAKE_KEY&&sleep_count==1);
+    assert(sleep_wait_as_locked(acc,now_us+100000,NULL)==APP_WAKE_KEY&&sleep_count==1);
     check_trace(1,1,0,SLEEP_TRACE_KEY);
 #if CONFIG_APP_SLEEP_DIAGNOSTICS
     assert(saved_trace().key_latched==1);
@@ -906,13 +983,13 @@ int main(void){
     puts("PASS: actual sleep/SC shared IRQ key and pickup, prelatched motion before IOE checks, short-sleep filtering, arm/config failures, bounded stuck line, BLE/jobs fallback and sleep errors");
     EpdiyHighlevelState hl={0};
     reset_sleep(23);clock_style=true;pickup_setting=false;
-    assert(light_sleep_wait_until(acc,now_us+600000000,&hl)==APP_WAKE_KEY);
+    assert(sleep_wait_as_locked(acc,now_us+600000000,&hl)==APP_WAKE_KEY);
     assert(clock_refreshes==1&&!sleep_count&&resume_count==1&&key_sampling);
     reset_sleep(24);clock_style=true;
-    assert(light_sleep_wait_until(acc,now_us+600000000,&hl)==APP_WAKE_PICKUP&&clock_refreshes==1&&!sleep_count);
+    assert(sleep_wait_as_locked(acc,now_us+600000000,&hl)==APP_WAKE_PICKUP&&clock_refreshes==1&&!sleep_count);
     reset_sleep(25);clock_style=true;pickup_setting=false;
     int64_t original_deadline=now_us+600000000;
-    assert(light_sleep_wait_until(acc,original_deadline,&hl)==APP_WAKE_TIMEOUT);
+    assert(sleep_wait_as_locked(acc,original_deadline,&hl)==APP_WAKE_TIMEOUT);
     assert(clock_refreshes==1200&&!sleep_count&&resume_count==1);
     puts("PASS: GPIO P17 capture before release, motion-only/unknown/read-error/stale wake causes, diagnostic on/off, summary accounting and NVS/replay failure boundaries");
 }
@@ -938,7 +1015,7 @@ def main():
             path = work / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
-        includes = ['-I'+str(work)] + ['-I'+str(ROOT/'components'/component/'include') for component in ['board_i2c','fca9555','cst836u','sc7a20h','device_power']]
+        includes = ['-I'+str(work),'-I'+str(ROOT/'components/device_power')] + ['-I'+str(ROOT/'components'/component/'include') for component in ['board_i2c','fca9555','cst836u','sc7a20h','device_power']]
         bus = '#include "' + str(ROOT/'components/board_i2c/board_i2c.c') + '"\n'
         cases = [('bus', '', BUS_TEST),
                  ('tca', '#include "'+str(ROOT/'components/fca9555/fca9555.c')+'"\n', IO_TEST),
@@ -957,7 +1034,7 @@ def main():
             c, binary = work/(name+'.c'), work/name
             c.write_text(MODEL + bus + source + test)
             subprocess.run(compiler + ['-std=gnu11','-Wall','-Wextra','-Wno-unused-function',
-                                       '-Wno-unused-variable','-fsanitize=address,undefined','-pthread'] + includes + [str(c),'-o',str(binary)], env=env, check=True)
+                                       '-Wno-unused-variable','-fsanitize=address,undefined','-pthread'] + includes + [str(c),str(ROOT/'components/device_power/battery_calibration.c'),'-o',str(binary)], env=env, check=True)
             subprocess.run([str(binary)], env=env, check=True)
 
 if __name__ == '__main__':

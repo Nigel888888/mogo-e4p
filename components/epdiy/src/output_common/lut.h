@@ -23,6 +23,7 @@ typedef void (*lut_build_func_t)(uint8_t* lut, const EpdWaveformPhases* phases, 
 typedef struct {
     lut_build_func_t build_func;
     lut_func_t lookup_func;
+    bool msb_first;
 } LutFunctionPair;
 
 /**

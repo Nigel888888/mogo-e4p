@@ -122,9 +122,9 @@ void *mm_alloc(mm_owner_t owner, mm_pool_t pool, size_t bytes, size_t alignment,
 /// 仅接受账本内的 mm_alloc 指针；调用方仍须保证唯一所有权，释放后不再使用。
 /// Accept only ledger-owned mm_alloc pointers; callers must still maintain unique ownership and never use freed pointers.
 bool mm_free(void *ptr);
-/// 统一检查总空闲和连续块；失败只请求安全边界清理，不在调用任务中释放缓存。
-/// Check total free space and contiguous capacity; failures only request safe-boundary cleanup, never evict on the caller's task.
-bool mm_check_capacity(mm_pool_t pool, size_t minimum_free, size_t largest_block);
+/// 区分总空闲与连续块不足；失败只请求安全边界清理，不在调用任务中释放缓存。
+/// Distinguish total and contiguous capacity failures; request safe-boundary cleanup, never evict in the caller.
+mm_failure_t mm_check_capacity(mm_pool_t pool, size_t minimum_free, size_t largest_block);
 
 #ifdef __cplusplus
 }

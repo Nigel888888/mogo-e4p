@@ -24,7 +24,44 @@
   "process_root": "docs/local/tidy",
   "history_visibility": "local",
   "catalog": {
-    "asset_mode": "grouped"
+    "asset_mode": "grouped",
+    "categories": [
+      {
+        "title": "现行契约",
+        "patterns": [
+          "docs/development/designs/DISPLAY_REFRESH.md",
+          "docs/development/designs/MEMORY_MANAGEMENT.md"
+        ]
+      },
+      {
+        "title": "使用与开发指南",
+        "patterns": [
+          "docs/development/guides/*.md",
+          "docs/ONBOARDING.md",
+          "docs/HANDOFF.md",
+          "tools/README.md"
+        ]
+      },
+      {
+        "title": "工具输入",
+        "patterns": [
+          "docs/user-manual*.json",
+          "docs/ota-release-notes/*.txt"
+        ]
+      },
+      {
+        "title": "历史资料",
+        "patterns": [
+          "docs/development/history/*"
+        ]
+      },
+      {
+        "title": "模块说明",
+        "patterns": [
+          "components/*"
+        ]
+      }
+    ]
   },
   "legacy_docs": {
     "strategy": "migrate",
@@ -33,15 +70,113 @@
     "backup_ref": "git:tidy/doc-backups/20261104-e4p-docs"
   },
   "gitnexus": {
-    "required": true,
-    "mode": "index-only"
+    "enabled": false
   },
   "governance": {
-    "revision": 3,
-    "fingerprint": "a932f0eb5019b15fc92dba2b4f32eaee296db5d98441d0eea98657d458130f78",
+    "revision": 5,
+    "fingerprint": "528e481f57f68e1d4148a75f5a3d4e94b3ec80ee522da50d3b19ac3e909cffd2",
     "managed_hashes": {
-      "AGENTS.md": "318a884851b2204599c687e309e7756c9e57d481300ef5dafcdef54d14765767"
+      "AGENTS.md": "af17c03d0ddc2d7663be81ecc8a9a22bd5676acfe2884f2f0f3cdc1bfef79a72"
     },
     "scope": "managed-blocks-only"
+  },
+  "document_checks": {
+    "markdown": [
+      "README*.md",
+      "AGENTS.md",
+      "CONTRIBUTING.md",
+      "docs/*.md",
+      "tools/README.md",
+      "components/board_support/README.md",
+      "components/board_i2c/README.md",
+      "components/book_search/README.md",
+      "components/webp_decoder/README.md",
+      "components/device_power/README.md",
+      "components/cst836u/README.md",
+      "components/fca9555/README.md",
+      "components/sc7a20h/README.md",
+      "components/e0470_epaper_waveform/README.md"
+    ],
+    "exclude": [
+      "docs/development/history/*",
+      "docs/local/*",
+      "docs/HANDOFF.local.md",
+      "docs/plans/*",
+      "docs/CHANGELOG.md"
+    ],
+    "json": [
+      "docs/user-manual.zh-CN.json",
+      "docs/user-manual-detailed.zh-CN.json"
+    ],
+    "references": [
+      {
+        "document": "docs/ONBOARDING.md",
+        "target": "sdkconfig.defaults"
+      },
+      {
+        "document": "docs/ONBOARDING.md",
+        "target": "sdkconfig.ci"
+      },
+      {
+        "document": "docs/ONBOARDING.md",
+        "target": "tools/run_reader_baseline.py"
+      },
+      {
+        "document": "docs/ARCHITECTURE.md",
+        "target": "main/app/app_registry.c"
+      },
+      {
+        "document": "docs/ARCHITECTURE.md",
+        "target": "main/CMakeLists.txt"
+      },
+      {
+        "document": "docs/HANDOFF.md",
+        "target": "tools/flash_fast.py"
+      },
+      {
+        "document": "docs/development/FEATURES.md",
+        "target": "tools/run_reader_baseline.py"
+      },
+      {
+        "document": "docs/development/guides/PERSISTENCE.md",
+        "target": "partitions_16M.csv"
+      },
+      {
+        "document": "docs/development/guides/PERSISTENCE.md",
+        "target": "main/book/book_history_backup.c"
+      },
+      {
+        "document": "docs/development/guides/PERSISTENCE.md",
+        "target": "main/settings/settings.c"
+      },
+      {
+        "document": "docs/development/guides/MANUAL.md",
+        "target": "tools/build_user_manual.py"
+      },
+      {
+        "document": "docs/development/guides/MANUAL.md",
+        "target": "tools/build_detailed_manual.py"
+      },
+      {
+        "document": "docs/development/guides/MANUAL.md",
+        "target": "docs/user-manual.zh-CN.json"
+      },
+      {
+        "document": "docs/development/guides/MANUAL.md",
+        "target": "docs/user-manual-detailed.zh-CN.json"
+      },
+      {
+        "document": "docs/development/guides/READER_DICTIONARY.md",
+        "target": "main/book/book_dictionary.c"
+      },
+      {
+        "document": "docs/development/guides/RELEASE.md",
+        "target": ".github/workflows/ota-submit.yml"
+      },
+      {
+        "document": "docs/development/guides/RELEASE.md",
+        "target": "tools/release_assets.py"
+      }
+    ]
   }
 }

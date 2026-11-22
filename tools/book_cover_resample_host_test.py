@@ -23,23 +23,40 @@ unit=r'''
 #include <string.h>
 #include "png.h"
 static int fail_after=-1,live;
+static unsigned luma_calls;
 static void *cover_alloc(size_t n){if(fail_after==0)return NULL;if(fail_after>0)--fail_after;void *p=malloc(n);if(p)++live;return p;}
 static void tracked_free(void *p){if(p)--live;free(p);}
 #define free tracked_free
 static void decode_yield(unsigned at){(void)at;}
-typedef struct {unsigned x,y,width,height;} book_crop_t;
+
 '''
-for name in ('luminance','scale_axis'):unit+=fn(name)+'\n'
+unit += '#include "' + str(root/'main/image/image_decode.h') + '"\n'
+unit+=fn('luminance').replace('return', '++luma_calls; return')+'\n'
+for name in ('scale_gap','scale_axis'):unit+=fn(name)+'\n'
 unit+='typedef struct {uint16_t at;uint8_t frac;} scale_step_t;\n'
 for name in ('scale_map','scale_next','bilinear4','book_cover_crop'):unit+=fn(name)+'\n'
+unit+='enum {JPEG_IMAGE_SCALE_0=0, JPEG_IMAGE_SCALE_1_8=3};\n'+fn('jpeg_target_scale')+'\n'
 unit+='typedef bool (*image_cancel_fn)(void *);\ntypedef struct {const uint8_t *data;size_t size,pos;FILE *file;image_cancel_fn cancelled;void *context;} png_input_t;\n'
 for name in ('png_read_mem','png_gray_input_cancel','png_gray_input'):unit+=fn(name)+'\n'
 unit+=r'''
 #undef free
 int main(int argc,char **argv){
- assert(argc==3);
+ assert(argc==4);
+ assert(jpeg_target_scale(684,1216,684,1216)==0);
+ assert(jpeg_target_scale(700,600,176,240)==0);
+ assert(jpeg_target_scale(5000,960,176,240)==1);
+ assert(jpeg_target_scale(1920,1920,176,240)==2);
+ assert(jpeg_target_scale(2816,3840,176,240)==3);
+ const uint8_t grid[]={0, 64, 128, 255};
+ image_gray_axis_t axis=image_gray_axis(2,3);
+ assert(image_gray_sample(image_gray_row(grid,2,axis,0),axis,0)==0);
+ assert(image_gray_sample(image_gray_row(grid,2,axis,1),axis,1)==111);
+ assert(image_gray_sample(image_gray_row(grid,2,axis,2),axis,2)==255);
+ axis=image_gray_axis(2,2);
+ assert(image_gray_sample(image_gray_row(grid,2,axis,0),axis,1)==64);
+ assert(image_gray_sample(image_gray_row(grid,2,axis,1),axis,0)==128);
  for(unsigned src=1;src<90;src++)for(unsigned dst=1;dst<130;dst++)for(unsigned i=0;i<dst;i++){
-  int at,f;scale_axis(i,dst,src,&at,&f);assert(at>=0&&(unsigned)at<src&&f>=0&&f<256);
+  int at,f;scale_axis(i,dst,src,scale_gap(dst,src),&at,&f);assert(at>=0&&(unsigned)at<src&&f>=0&&f<256);
  }
  FILE *f=fopen(argv[1],"rb");assert(f);fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);
  uint8_t *data=malloc(size);assert(fread(data,1,size,f)==(size_t)size);fclose(f);
@@ -68,7 +85,17 @@ int main(int argc,char **argv){
   assert(native[y*684+x]==gray);
  }
  for(unsigned i=684u*1216u;i<684u*1216u+16;++i)assert(native[i]==0xaa);
- free(native);puts("book_cover_resample: PASS (up/down/degenerate scaling, streamed PNG, bounds, truncation, OOM and native 684x1216 one-pixel detail)");
+ free(native);
+ f=fopen(argv[3],"rb");assert(f);fseek(f,0,SEEK_END);size=ftell(f);rewind(f);
+ data=malloc(size);assert(data&&fread(data,1,size,f)==(size_t)size);rewind(f);
+ assert(png_gray_input(NULL,size,f,4,4,pixels,NULL));fclose(f);assert(!live);
+ for(int i=0;i<16;++i)assert(pixels[i]==255);
+ memset(pixels,0xaa,sizeof(pixels));
+ luma_calls=0;
+ assert(png_gray_input(data,size,NULL,4,4,pixels,NULL));free(data);assert(!live&&luma_calls==16u*8u);
+ for(int i=0;i<16;++i)assert(pixels[i]==64);
+ for(int i=16;i<80;++i)assert(pixels[i]==0xaa);
+ puts("book_cover_resample: PASS (up/down/degenerate scaling, streamed PNG, bounds, truncation, OOM, native 684x1216 detail, thin-line reduction with half the row conversions and target JPEG scale)");
 }
 '''
 def chunk(kind,data):return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data))
@@ -79,10 +106,12 @@ with tempfile.TemporaryDirectory() as tmp:
     native_raw=b''.join(b'\0'+b''.join(bytes([220 if (x+y)&1 else 255]*3+[255]) if y<608 else bytes([x%256]*3+[255]) for x in range(684)) for y in range(1216))
     native_png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',684,1216,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(native_raw))+chunk(b'IEND',b'')
     (tmp/'native.png').write_bytes(native_png)
+    lines=b''.join(b'\0'+b''.join(bytes([0 if x%4==3 or y%4==3 else 255]*3) for x in range(16)) for y in range(16))
+    (tmp/'lines.png').write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',16,16,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(lines))+chunk(b'IEND',b''))
     vendor=root/'managed_components/espressif__libpng/libpng'
     if not vendor.exists():vendor=Path('/private/tmp/kiikoread-rc90-lock-build-20261011/managed_components/espressif__libpng/libpng')
     assert vendor.exists(),'Build IDF once to resolve libpng'
     (tmp/'pnglibconf.h').write_bytes((vendor/'scripts/pnglibconf.h.prebuilt').read_bytes())
     names='png pngerror pngget pngmem pngpread pngread pngrio pngrtran pngrutil pngset pngtrans pngwrite pngwio pngwtran pngwutil'.split()
     subprocess.run(['cc','-std=gnu11','-O2','-w','-fsanitize=address,undefined','-DPNG_ARM_NEON_OPT=0','-DPNG_INTEL_SSE_OPT=0','-I'+str(tmp),'-I'+str(vendor),str(tmp/'test.c')]+[str(vendor/(n+'.c')) for n in names]+['-lz','-lm','-o',str(tmp/'test')],check=True)
-    subprocess.run([str(tmp/'test'),str(tmp/'fixture.png'),str(tmp/'native.png')],check=True)
+    subprocess.run([str(tmp/'test'),str(tmp/'fixture.png'),str(tmp/'native.png'),str(tmp/'lines.png')],check=True)

@@ -48,7 +48,7 @@ async function setup(options={}) {
       return all.filter(el=>el.tagName==='button'||el.tagName==='input');
     }
   };
-  const state={gets:[],mutations:[],sent:[],signature:'慢慢阅读',signatures:[],infoReads:0,clock:0,tick:null};
+  const state={gets:[],mutations:[],sent:[],signature:'慢慢阅读',signatures:[],prompts:[],infoReads:0,clock:0,tick:null};
   const json=(body,status=200)=>({status,json:async()=>body});
   const fetch=async(url,request={})=>{
     if(url==='/signature'){
@@ -59,7 +59,8 @@ async function setup(options={}) {
     if(url==='/info'){
       ++state.infoReads;
       if(options.infoError||(options.infoErrorAfter&&state.infoReads>=options.infoErrorAfter))throw Error('offline');
-      return json({mode:options.mode||'ap',is_flash:!!options.isFlash,free_bytes:options.freeBytes??100000000,file_limit:options.fileLimit||0});
+      return json({mode:options.mode||'ap',is_flash:!!options.isFlash,free_bytes:options.freeBytes??100000000,file_limit:options.fileLimit||0,
+        ...(options.legacyInfo?{}:{book_name_limit:options.isFlash?120:232,media_name_limit:120,relative_path_limit:238})});
     }
     if(url.startsWith('/files?')){
       state.gets.push(url);const query=new URL('http://pico'+url).searchParams,path=query.get('path')||'',page=Number(query.get('page'));
@@ -88,7 +89,7 @@ async function setup(options={}) {
   const context=vm.createContext({document,fetch,XMLHttpRequest:XHR,TextEncoder,AbortController,setTimeout,clearTimeout,
     performance:{now:()=>state.clock},setInterval:callback=>{state.tick=callback;return 1;},clearInterval:()=>{state.tick=null;},
     location:{host:'192.168.4.1',hash:''},innerWidth:1440,innerHeight:900,window:{addEventListener(){},scrollTo(){}},Image:ImageMock,
-    confirm:()=>confirmations.length?confirmations.shift():true,URL:{createObjectURL:()=> 'blob:test',revokeObjectURL(){}},console});
+    confirm:message=>{state.prompts.push(message);return confirmations.length?confirmations.shift():true;},URL:{createObjectURL:()=> 'blob:test',revokeObjectURL(){}},console});
   // 查询参数使用标准 URL；页面内仅需要对象 URL 接口。/ Parse queries with standard URL; the page needs only object URLs.
   vm.runInContext(source,context);await flush();await flush();
   return {state,context,get:id=>nodes.get(id),run:code=>vm.runInContext(code,context)};
@@ -138,6 +139,51 @@ async function edit(t,action,name){
   const longMobi='字'.repeat(70)+'Book.mobi';
   await t.context.sendFiles([file(longMobi)],'file','books');
   assert.equal(new URL('http://mogo'+t.state.sent.at(-1).url).searchParams.get('path'),'books/'+longMobi);
+  const cjkStem='书'.repeat(75);
+  const fits=file(cjkStem+'%a.epub',1), oversized=file(cjkStem+'%ab.epub',1);
+  for(const mode of ['ap','sta']) {
+    t=await setup({mode,responses:[{status:200,body:{ok:true}},{status:200,body:{ok:true}},{status:409,body:{error:'重名'}},{network:true},{status:200,body:{ok:true}}]});
+    await t.context.navigate('books');
+    assert.match(t.get('uploadLimit').textContent,/232 个 UTF-8 字节/);
+    await t.context.sendFiles([oversized,fits,file('正常.txt',1)],'book','books');
+    assert.equal(t.state.sent.length,2);assert.equal(t.run('records[0].status'),'error');
+    assert.equal(t.run('records.slice(1).every(entry=>entry.status==="complete")'),true);
+    assert.equal(new URL('http://mogo'+t.state.sent[0].url).searchParams.get('name'),fits.name);
+    const failed=t.get('queueList').children[0];
+    assert.match(failed.textContent,/233 \/ 232.*未发送/);
+    await failed.children.at(-1).click();
+    assert.equal(t.get('editor').open,true);assert.match(t.get('editorLabel').textContent,/\.epub 不变/);
+    assert.match(t.get('editorNameBudget').textContent,/233 \/ 232/);
+    await t.context.submitEditor();
+    assert.equal(t.state.sent.length,2);assert.equal(t.get('editor').open,true);
+    t.get('editorName').value='修改后的名字 %';t.get('editorName').oninput();
+    assert.match(t.get('editorNameBudget').textContent,/25 \/ 232/);
+    await t.context.submitEditor();
+    assert.equal(t.get('editor').open,false);assert.equal(t.state.sent.length,4);
+    assert.equal(t.state.prompts.at(-1).split('\n').at(-1),'books/修改后的名字 %.epub');
+    assert.equal(new URL('http://mogo'+t.state.sent[3].url).searchParams.get('overwrite'),'1');
+    await t.context.navigate('pictures');
+    await t.get('queueList').children[0].children.at(-1).click();
+    assert.equal(t.state.sent[4].url,t.state.sent[2].url);assert.equal(t.run('records[0].status'),'complete');
+    assert.equal(t.state.sent[4].file,oversized);assert.equal(oversized.name,cjkStem+'%ab.epub');
+    assert.equal(t.state.mutations.length,0);
+  }
+  t=await setup();
+  for(const [kind,ext] of [['font','.ttf'],['picture','.jpg']]){
+    const limit='字'.repeat(38)+'aa'+ext;
+    await t.context.sendFiles([file(limit,1),file('a'+limit,1)],kind);
+    assert.match(t.get('queueList').children.at(-1).textContent,/121 \/ 120.*未发送/);
+  }
+  assert.equal(t.state.sent.length,2);
+  const folder='books/书';
+  const full='a'.repeat(228);
+  await t.context.sendFiles([file(full+'a',1),file(full,1)],'file',folder);
+  assert.equal(t.state.sent.length,3);
+  assert.match(t.get('queueList').children.at(-2).textContent,/229 \/ 228.*未发送/);
+  assert.equal(new URL('http://mogo'+t.state.sent[2].url).searchParams.get('path'),folder+'/'+full);
+  t=await setup({legacyInfo:true});
+  await t.context.sendFiles([fits],'book','books');assert.equal(t.state.sent.length,0);
+  assert.match(t.get('queueList').textContent,/232 \/ 120/);
   for(const mode of ['ap','sta']){
     t=await setup({mode});assert.equal(t.get('signatureText').value,'慢慢阅读');
     for(const value of ['我的 Pico','']){

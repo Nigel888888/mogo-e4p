@@ -108,7 +108,7 @@ void book_shelf_scan_dir(const book_shelf_scan_t *scan, const char *root, bool i
         struct stat st;
         if (stat(path, &st) != 0) { *unreadable = true; continue; }
         if (S_ISDIR(st.st_mode)) {
-            if (!is_flash && depth == 0 && !strcmp(root, app_settings_books_dir())) scan->category_add(path);
+            if (scan->category_add && !is_flash && depth == 0 && !strcmp(root, app_settings_books_dir())) scan->category_add(path);
             if (depth == BOOK_SCAN_DEPTH_LIMIT) { *skipped = true; continue; }
             DIR *child = opendir(path);
             if (!child) { *unreadable = true; continue; }

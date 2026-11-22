@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
     assert(strlen(book.entries[0].title) == strlen("第1章 ") + 39 * 3);
     assert(!strcmp(book.entries[1].title, "第2章 结束")); close_book(&book);
     f = fopen(path, "r+b"); assert(f);
-    assert(fread(&header, sizeof(header), 1, f) == 1 && header.version == 3);
+    assert(fread(&header, sizeof(header), 1, f) == 1 && header.version == 2);
     assert(!fseek(f, (long)sizeof(header) + 16, SEEK_SET));
     book_entry_t entry = {.title="cached heading"};
     assert(fwrite(&entry, sizeof(entry), 1, f) == 1); assert(!fclose(f));

@@ -4,6 +4,7 @@
  * Frozen: Main-loop calls only; manifest checks only, silent failures, no wake during sleep. */
 #include "ota_auto.h"
 #include "ota_online.h"
+#include "memory_peak.h"
 #include "settings.h"
 #include "device_power.h"
 #ifdef ESP_PLATFORM
@@ -15,11 +16,12 @@
 #include "nvs.h"
 #include <time.h>
 
+#define AUTO_DEFER_US (60LL * 1000000)
 #define AUTO_INTERVAL_S (12ULL * 60 * 60)
 #define AUTO_INTERVAL_US ((int64_t)AUTO_INTERVAL_S * 1000000)
 #define AUTO_CLOCK_MIN 1704067200ULL
 #define AUTO_CLOCK_MAX 4102444799ULL
-static bool s_loaded, s_checking, s_pending, s_attempted;
+static bool s_loaded, s_checking, s_pending, s_attempted, s_cancelling;
 static uint64_t s_last_attempt;
 static int64_t s_next_us = 15000000, s_attempt_us;
 
@@ -39,13 +41,20 @@ static void collect_result(void) {
     pico_update_status_t status;
     pico_online_get_status(&status);
     s_checking = false;
-    s_pending = status.state == PICO_UPDATE_AVAILABLE && app_settings_auto_ota();
+    s_pending = !s_cancelling && status.state == PICO_UPDATE_AVAILABLE && app_settings_auto_ota();
+    s_cancelling = false;
+}
+void pico_ota_auto_request_cancel(void) {
+    collect_result();
+    if (!s_checking || s_cancelling) return;
+    s_cancelling = true;
+    pico_online_request_cancel();
 }
 void pico_ota_auto_cancel(void) {
     collect_result();
     if (!s_checking) return;
     pico_online_cancel_join();
-    s_checking = false;
+    s_checking = s_cancelling = false;
 }
 bool pico_ota_auto_pending(void) {
     if (!s_pending || !app_settings_auto_ota()) return false;
@@ -59,7 +68,7 @@ void pico_ota_auto_acknowledge(void) { s_pending = false; }
 void pico_ota_auto_poll(bool idle) {
     collect_result();
     if (!app_settings_auto_ota()) {
-        pico_ota_auto_cancel();
+        pico_ota_auto_request_cancel();
         s_pending = false;
         return;
     }
@@ -100,11 +109,16 @@ void pico_ota_auto_poll(bool idle) {
     const pmu_snapshot_t *pmu = device_power_get();
     int percent = pmu_battery_percent(pmu);
     if (percent >= 0 && percent < 10 && !pmu_battery_charging(pmu)) return;
-    // 启动失败也消耗本轮，不能每个 poll 重试；UTC 记录跨重启，单调时钟兜底本次开机。
-    // A failed start consumes this cycle too; persist UTC across boots and bound this boot monotonically.
+    const esp_err_t started = pico_online_check_auto();
+    if (memory_peak_is_busy(started) || memory_peak_is_memory_error(started)) {
+        s_next_us = monotonic + AUTO_DEFER_US;
+        return;
+    }
+    // 临时准入失败不消耗周期；实际尝试仍使用原来的跨重启节奏。
+    // Temporary admission failures do not consume the interval; actual attempts keep the existing cadence across reboot.
     s_next_us = monotonic + AUTO_INTERVAL_US;
     s_attempted = true;
     s_attempt_us = monotonic;
     if (clock_valid(now)) save_attempt((uint64_t)now);
-    s_checking = pico_online_check() == ESP_OK;
+    s_checking = started == ESP_OK;
 }

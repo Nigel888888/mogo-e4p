@@ -70,6 +70,7 @@
 #include "boot_state.h"
 #include "ble_page_turner.h"
 #include "device_power.h"
+#include "frontlight.h"
 #include "pmu_protocol.h"
 #include "wifi_transfer.h"
 #include "esp_log.h"
@@ -98,6 +99,7 @@
 #include "display.h"
 #include "display_refresh.h"
 #include "pmu_selftest.h"
+#include "cloudzao_service.h"
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 #include "soc/rtc_cntl_reg.h"
 #endif
@@ -105,6 +107,7 @@
 #include "network_service.h"
 #include "cellular_service.h"
 #include "memory_manager.h"
+#include "memory_peak.h"
 #include "memory_inventory.h"
 
 static void fit_value(char *value, int width);
@@ -123,11 +126,11 @@ typedef enum { SETTINGS_MAIN, SETTINGS_WIFI, SETTINGS_NETWORK, SETTINGS_TIME,
                SETTINGS_READING_BG, SETTINGS_READING_BG_PREVIEW,
                SETTINGS_CONFIG, SETTINGS_UPGRADE, SETTINGS_BOOT,
                SETTINGS_POWER_SLEEP, SETTINGS_AUTO_LOCK, SETTINGS_HAPTIC,
-               SETTINGS_POWER_LOG,
+               SETTINGS_POWER_LOG, SETTINGS_BATT_CALIBRATION, SETTINGS_CHARGE_CURRENT,
                SETTINGS_PROFILE, SETTINGS_AVATAR,
                SETTINGS_BLUETOOTH,
                SETTINGS_MEMORY,
-               SETTINGS_QUICK_BAR,
+               SETTINGS_QUICK_BAR, SETTINGS_SCREEN_OFFSET,
                SETTINGS_LOCK_PIN, SETTINGS_PIN_ENTRY, SETTINGS_TEXT_EDIT } settings_page_t;
 static settings_page_t s_page;
 static char s_quick_notice[96];
@@ -148,6 +151,7 @@ static bool s_network_shortcut_back;
 static bool s_enter_memory_from_quick;
 static bool s_memory_shortcut_back;
 static network_status_t s_network_snapshot;
+static const char *s_network_notice;
 static mm_snapshot_t s_memory_snapshot;
 static mm_clean_report_t s_memory_report;
 static int64_t s_memory_next_sample_ms;
@@ -228,13 +232,16 @@ static app_redraw_t pin_setup_tick(app_ctx_t *ctx) {
     }
     return pin_paint(ctx, (EpdRect){122, 218, 440, 247});
 }
-static int s_style_scroll, s_main_scroll;
+static int s_main_scroll;
 static bool s_scroll_drag_consumed, s_scroll_present_pending;
 static int s_font_page, s_wallpaper_page;
-static bool s_sync_pending;
+static bool s_sync_pending, s_sync_waiting;
 static bool s_font_sync_confirm;
 static char s_font_sync_path[TTF_FONT_PATH_MAX];
 static bool s_config_confirm;
+static bool s_batt_calibration_confirm;
+static device_power_batt_calibration_status_t s_batt_calibration_status;
+static int64_t s_batt_calibration_next_ms;
 // 屏幕修复：点一下就开始。整屏盲刷要几秒，活儿交给 tick——不能在触摸回调里做。
 // Panel repair: one tap starts it. The blind full-screen drive takes seconds, so the work goes to the
 // tick rather than a touch callback.
@@ -332,7 +339,9 @@ static app_redraw_t upgrade_start_pending(void) {
     s_update.busy = false;
     if (s_update.state != PICO_UPDATE_FAILED) s_update.message[0] = 0;
     s_update.state = PICO_UPDATE_FAILED;
-    if (!s_update.message[0]) snprintf(s_update.message, sizeof(s_update.message), "无法开始升级，请退出传书后重试");
+    if (!s_update.message[0]) snprintf(s_update.message, sizeof(s_update.message), "%s",
+        error == ESP_ERR_NO_MEM ? "内存不足，无法启动更新任务" :
+        downloading ? "无法开始下载，请稍后重试" : "无法检查更新，请稍后重试");
     snprintf(s_upgrade_notice, sizeof(s_upgrade_notice), "%s", s_update.message);
     return APP_REDRAW_PAGE;
 }
@@ -390,6 +399,10 @@ static void upgrade_open(void) {
     s_upgrade_notice[0] = 0;
     s_page = SETTINGS_UPGRADE;
 }
+bool app_device_settings_navigation_busy(void) {
+    return s_boot_pending || s_local_pending || s_upgrade_restart;
+}
+
 bool app_device_settings_offer_update(bool already_in_settings) {
     if (already_in_settings) {
         if ((s_page != SETTINGS_MAIN && s_page != SETTINGS_UPGRADE) || s_upgrade_confirm) return false;
@@ -411,7 +424,7 @@ static int settings_main_row_height(void) {
     return 82;
 }
 #define SETTINGS_ROW_H settings_main_row_height()
-#define SETTINGS_DISPLAY_ROWS 6
+#define SETTINGS_DISPLAY_ROWS 7
 #define SETTINGS_PERSONAL_ROWS 8
 // BOOT 刷机入口已按用户要求从设置列表撤下；页面代码保留，恢复入口只需加回一行。
 // The BOOT flashing entry is hidden per the user's request; the page stays, re-adding one row restores it.
@@ -425,9 +438,8 @@ static int settings_wireless_rows(void) {
 #define SETTINGS_DISPLAY_Y (SETTINGS_WIRELESS_Y + settings_wireless_rows() * SETTINGS_ROW_H + 78)
 #define SETTINGS_PERSONAL_Y (SETTINGS_DISPLAY_Y + SETTINGS_DISPLAY_ROWS * SETTINGS_ROW_H + 78)
 #define SETTINGS_MAINTENANCE_Y (SETTINGS_PERSONAL_Y + SETTINGS_PERSONAL_ROWS * SETTINGS_ROW_H + 78)
-// 电源管理排在最后，放调试类开关，不挤占常规设置。
-// Power management sits last for debug switches without crowding ordinary settings.
-#define SETTINGS_POWER_ROWS 1
+// 电源管理集中充电档位、本机电量学习及日志。/ Power management groups charge profiles, local battery learning and logging.
+#define SETTINGS_POWER_ROWS 3
 #define SETTINGS_POWER_Y (SETTINGS_MAINTENANCE_Y + SETTINGS_MAINTENANCE_ROWS * SETTINGS_ROW_H + 78)
 // 设置行图标：32 像素盒，在行高 68 里垂直居中；墨色统一，避免一行一个灰度。
 // Setting row icons: a 32 px box centred in the 68 px row with one shared ink level.
@@ -807,18 +819,29 @@ static void setting_group(uint8_t *fb, int title_y, const char *title,
     }
 }
 
-static void setting_toggle(uint8_t *fb, int y, const char *title, const char *detail, bool active) {
-    settings_card(fb, (EpdRect){36, y, 612, 126}, 22, UI_GRAY_WHITE, 0x70);
-    ui_text(fb, 59, y + 24, 27, title, EPD_DRAW_ALIGN_LEFT, false);
-    ui_text(fb, 59, y + 75, 19, detail, EPD_DRAW_ALIGN_LEFT, false);
-    EpdRect track = {555, y + 43, 69, 39};
+static void setting_toggle_track(uint8_t *fb, EpdRect track, bool active) {
     ui_fill_round_rect(fb, track, 19, active ? 0x58 : 0xc4);
     int cx = active ? track.x + 49 : track.x + 20;
     epd_fill_circle(cx, track.y + 19, 16, UI_GRAY_WHITE, fb);
     epd_draw_circle(cx, track.y + 19, 16, UI_GRAY_BLACK, fb);
 }
 
-static void draw_style_thumbnail(uint8_t *fb, int style, int top) {
+static void setting_toggle(uint8_t *fb, int y, const char *title, const char *detail, bool active) {
+    settings_card(fb, (EpdRect){36, y, 612, 126}, 22, UI_GRAY_WHITE, 0x70);
+    ui_text(fb, 59, y + 24, 27, title, EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 59, y + 75, 19, detail, EPD_DRAW_ALIGN_LEFT, false);
+    setting_toggle_track(fb, (EpdRect){555, y + 43, 69, 39}, active);
+}
+
+static EpdRect shelf_style_card(int index) {
+    return (EpdRect){36, 263 + index * 300, 612, index == 2 ? 230 : 277};
+}
+static EpdRect shelf_style_titles_row(EpdRect card) {
+    return (EpdRect){card.x, card.y + 228, card.width, card.height - 228};
+}
+static uint8_t shelf_style_id(int index) { return index == 2 ? 5 : (uint8_t)(index + 1); }
+
+static void draw_style_thumbnail(uint8_t *fb, int style, int top, bool titles) {
     if (top < 242 || top + 170 >= UI_NAV_TOP) return;
     if (style == 5) {
         ui_fill_round_rect(fb, (EpdRect){68,top,548,170}, 12, UI_GRAY_WHITE);
@@ -850,6 +873,8 @@ static void draw_style_thumbnail(uint8_t *fb, int style, int top) {
         ui_draw_acrylic_guard(fb, (EpdRect){left, top + 129, 486, 35});
 
     }
+    if (titles) for (int i = 0; i < 3; ++i)
+        ui_fill_rect_fast((EpdRect){left + 43 + i * 155, top + 172, 70, 3}, UI_GRAY_BLACK, fb);
 }
 
 // 仅 82x82 灰阶头像，不缓存整屏或第二份字库；文件变更/拔卡会使缓存失效。
@@ -1045,9 +1070,270 @@ static app_redraw_t quick_settings_gesture(app_ctx_t *ctx, const ui_gesture_even
     return APP_REDRAW_PAGE;
 }
 
+// 校正页坐标固定为正常竖屏；按下局部反馈，完整轻点才移动一次。
+// Calibration uses normal portrait coordinates; presses give local feedback and only completed taps move once.
+static int s_screen_offset_pressed = -1;
+static unsigned s_screen_offset_retries;
+static int64_t s_screen_offset_retry_ms;
+
+enum { SCREEN_OFFSET_RETRIES = 2, SCREEN_OFFSET_RETRY_MS = 1000 };
+static EpdRect screen_offset_button(int index) {
+    const EpdRect buttons[] = {{242, 430, 200, 86}, {62, 550, 200, 86},
+        {422, 550, 200, 86}, {242, 670, 200, 86}, {142, 890, 400, 78}};
+    return buttons[index];
+}
+static void screen_offset_guides(uint8_t *fb) {
+    // 黑块从真实屏边向内延伸1–32px，数字就是厚度；格间留1px白缝。
+    // Blocks extend 1–32px inward from the actual panel edge, labeled by thickness with 1px gaps.
+    for (int n = 1; n <= APP_SCREEN_OFFSET_LIMIT; ++n) {
+        int x = 70 + (n - 1) * 17, y = 210 + (n - 1) * 24;
+        epd_fill_rect((EpdRect){x, 0, 16, n}, UI_GRAY_BLACK, fb);
+        epd_fill_rect((EpdRect){x, 1216 - n, 16, n}, UI_GRAY_BLACK, fb);
+        epd_fill_rect((EpdRect){0, y, n, 23}, UI_GRAY_BLACK, fb);
+        epd_fill_rect((EpdRect){684 - n, y, n, 23}, UI_GRAY_BLACK, fb);
+        char label[4]; snprintf(label, sizeof(label), "%d", n);
+        ui_text_fixed_vc(fb, x + 8, 52, 13, label, EPD_DRAW_ALIGN_CENTER, false);
+        ui_text_fixed_vc(fb, x + 8, 1164, 13, label, EPD_DRAW_ALIGN_CENTER, false);
+        ui_text_fixed_vc(fb, 46, y + 11, 16, label, EPD_DRAW_ALIGN_CENTER, false);
+        ui_text_fixed_vc(fb, 638, y + 11, 16, label, EPD_DRAW_ALIGN_CENTER, false);
+    }
+}
+static void screen_offset_draw_button(uint8_t *fb, int index) {
+    const char *labels[] = {"上移 1px", "左移 1px", "右移 1px", "下移 1px", "恢复居中"};
+    EpdRect box = screen_offset_button(index);
+    bool pressed = index == s_screen_offset_pressed;
+    epd_fill_rect(box, UI_GRAY_WHITE, fb);
+    ui_fill_round_rect(fb, box, 16, pressed ? UI_GRAY_BLACK : UI_GRAY_WHITE);
+    ui_draw_control_frame(fb, box, 16, UI_GRAY_BLACK);
+    ui_text_fixed_vc(fb, box.x + box.width / 2, box.y + box.height / 2,
+                     24, labels[index], EPD_DRAW_ALIGN_CENTER, pressed);
+}
+static app_redraw_t screen_offset_feedback(app_ctx_t *ctx, int previous) {
+    int index = s_screen_offset_pressed >= 0 ? s_screen_offset_pressed : previous;
+    if (index < 0) return APP_REDRAW_NONE;
+    screen_offset_draw_button(ctx->fb, index);
+    guard_draw_result(ctx->hl, display_refresh_area(ctx->hl, DISPLAY_REFRESH_FEEDBACK,
+        screen_offset_button(index), DISPLAY_REFRESH_DEFAULT));
+    return APP_REDRAW_DONE;
+}
+static void screen_offset_render(uint8_t *fb, bool presenting_target) {
+    int x, y, target_x, target_y;
+    app_settings_screen_offset(&target_x, &target_y);
+    if (presenting_target) {
+        x = target_x;
+        y = target_y;
+    } else {
+        display_get_screen_offset(&x, &y);
+    }
+    const bool pending = x != target_x || y != target_y;
+    ui_clear_page(fb);
+    back_header(fb, "屏幕偏移修正");
+    char value[80];
+    snprintf(value, sizeof(value), "水平 %+d px    竖直 %+d px", x, y);
+    ui_text_fixed_vc(fb, 342, 282, 27, value, EPD_DRAW_ALIGN_CENTER, false);
+    ui_text_fixed_vc(fb, 342, 340, 20, "每次移动 1px · 对照四周黑块刻度调整", EPD_DRAW_ALIGN_CENTER, false);
+    for (int i = 0; i < 5; ++i) screen_offset_draw_button(fb, i);
+    epd_draw_hline(298, 593, 88, UI_GRAY_BLACK, fb);
+    epd_draw_vline(342, 549, 88, UI_GRAY_BLACK, fb);
+    ui_text_fixed_vc(fb, 342, 818, 21, "右移 / 下移为正 · 范围 ±32px", EPD_DRAW_ALIGN_CENTER, false);
+    const char *notice = s_notice[0] ? s_notice : pending ? "偏移已保存，尚未生效" : "即时生效并保存到本机";
+    ui_text_fixed_vc(fb, 342, 1012, 20, notice, EPD_DRAW_ALIGN_CENTER, false);
+    ui_text_fixed_vc(fb, 342, 1054, 19, "仅修正位置偏移，边缘外的内容不可见", EPD_DRAW_ALIGN_CENTER, false);
+    ui_text_fixed_vc(fb, 342, 1100, 19, "刻度数字 = 黑块向内延伸的像素", EPD_DRAW_ALIGN_CENTER, false);
+    screen_offset_guides(fb);
+}
+
+static void screen_offset_present(app_ctx_t *ctx) {
+    int x, y, old_x, old_y;
+    app_settings_screen_offset(&x, &y);
+    display_get_screen_offset(&old_x, &old_y);
+    screen_offset_render(ctx->fb, true);
+    const enum EpdDrawError result = update_display_screen_offset(ctx->hl, x, y);
+    if (result == EPD_DRAW_SUCCESS) {
+        if (x != old_x || y != old_y) ctx->screen_touch_cutoff_ms = esp_timer_get_time() / 1000;
+        s_screen_offset_retries = 0;
+        return;
+    }
+    // 失败后恢复帧只描述仍生效的坐标；后台尝试不重复落盘。
+    // After failure, keep the recovery frame consistent with applied coordinates; retries do not write NVS.
+    screen_offset_render(ctx->fb, false);
+    s_screen_offset_retry_ms = esp_timer_get_time() / 1000 + SCREEN_OFFSET_RETRY_MS;
+    ESP_LOGW(TAG, "screen offset (%d,%d) not presented: %d (%u retries left)",
+             x, y, result, s_screen_offset_retries);
+}
+
+static bool screen_offset_retry_if_due(app_ctx_t *ctx) {
+    if (s_page != SETTINGS_SCREEN_OFFSET || !s_screen_offset_retries ||
+        ctx->now_ms < s_screen_offset_retry_ms || ctx->physical_touch_active || s_screen_offset_pressed >= 0) return false;
+    --s_screen_offset_retries;
+    screen_offset_present(ctx);
+    return true;
+}
+
+static bool settings_gesture_contact_allowed(const app_ctx_t *ctx) {
+    return s_page != SETTINGS_SCREEN_OFFSET || s_screen_offset_pressed < 0 ||
+        ui_rect_hit(screen_offset_button(s_screen_offset_pressed), ctx->touch->x, ctx->touch->y);
+}
+static app_redraw_t screen_offset_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
+    int previous = s_screen_offset_pressed;
+    if (ev->type == UI_GESTURE_PRESS) {
+        s_screen_offset_pressed = -1;
+        for (int i = 0; i < 5; ++i)
+            if (ui_rect_hit(screen_offset_button(i), ev->x0, ev->y0)) s_screen_offset_pressed = i;
+        return screen_offset_feedback(ctx, previous);
+    }
+    if (ev->type == UI_GESTURE_LONG_PRESS) return APP_REDRAW_NONE;
+    s_screen_offset_pressed = -1;
+    if (ev->type != UI_GESTURE_TAP) return screen_offset_feedback(ctx, previous);
+    if (ui_rect_hit((EpdRect){28,80,68,64}, ev->x0, ev->y0)) { s_page = SETTINGS_MAIN; settings_prepare_profile(); return APP_REDRAW_PAGE; }
+    int x, y; app_settings_screen_offset(&x, &y);
+    const int dx[] = {0, -1, 1, 0}, dy[] = {-1, 0, 0, 1};
+    for (int i = 0; i < 5; ++i) {
+        if (i != previous || !ui_rect_hit(screen_offset_button(i), ev->x, ev->y)) continue;
+        if (i == 4) x = y = 0;
+        else { x += dx[i]; y += dy[i]; }
+        if (x < -APP_SCREEN_OFFSET_LIMIT || x > APP_SCREEN_OFFSET_LIMIT ||
+            y < -APP_SCREEN_OFFSET_LIMIT || y > APP_SCREEN_OFFSET_LIMIT) {
+            snprintf(s_notice, sizeof(s_notice), "已到调整边界");
+        } else if (!app_settings_set_screen_offset(x, y)) {
+            snprintf(s_notice, sizeof(s_notice), "保存失败，请重试");
+        } else {
+            s_notice[0] = 0;
+        }
+        return APP_REDRAW_PAGE;
+    }
+    return screen_offset_feedback(ctx, previous);
+}
+
+static const struct {
+    device_power_charge_current_t current;
+    const char *name;
+    const char *rating;
+} s_charge_choices[] = {
+    {DEVICE_POWER_CHARGE_1A, "日常充电", "1 A · 默认"},
+    {DEVICE_POWER_CHARGE_1_5A, "快速充电", "1.5 A"},
+};
+
+static EpdRect charge_choice_rect(unsigned index) {
+    return (EpdRect){36, 394 + (int)index * 158, 612, 136};
+}
+
+static const char *charge_current_label(unsigned current) {
+    for (unsigned i = 0; i < sizeof(s_charge_choices) / sizeof(s_charge_choices[0]); ++i) {
+        if (current == s_charge_choices[i].current) return s_charge_choices[i].name;
+    }
+    return "暂不可用";
+}
+
+static void charge_current_render(uint8_t *fb) {
+    back_header(fb, "充电档位");
+    const unsigned current = device_power_charge_current();
+
+    // 状态区只标档位，不模拟电量或充电进度。/ The status block shows the profile, not charge progress.
+    ui_fill_round_rect(fb, (EpdRect){36, 212, 612, 154}, 20, UI_GRAY_BLACK);
+    ui_text_box(fb, (EpdRect){64, 231, 440, 38}, 23, "当前档位", EPD_DRAW_ALIGN_LEFT, true);
+    ui_text_box(fb, (EpdRect){64, 268, 440, 83}, 48, charge_current_label(current), EPD_DRAW_ALIGN_LEFT, true);
+    epd_draw_circle(574, 289, 38, UI_GRAY_WHITE, fb);
+    ui_draw_icon(fb, 574, 289, 43, UI_ICON_ZAP, UI_GRAY_WHITE);
+
+    for (unsigned i = 0; i < sizeof(s_charge_choices) / sizeof(s_charge_choices[0]); ++i) {
+        const EpdRect box = charge_choice_rect(i);
+        const bool active = current == s_charge_choices[i].current;
+        settings_card(fb, box, 20, UI_GRAY_WHITE, UI_GRAY_BLACK);
+        ui_text_box(fb, (EpdRect){64, box.y + 16, 475, 52}, 34, s_charge_choices[i].name,
+                    EPD_DRAW_ALIGN_LEFT, false);
+        ui_text_box(fb, (EpdRect){64, box.y + 76, 552, 42}, 22, s_charge_choices[i].rating,
+                    EPD_DRAW_ALIGN_LEFT, false);
+        if (active) {
+            epd_fill_circle(600, box.y + 43, 19, UI_GRAY_BLACK, fb);
+            ui_draw_icon(fb, 600, box.y + 43, 24, UI_ICON_CHECK, UI_GRAY_WHITE);
+        } else {
+            epd_draw_circle(600, box.y + 43, 18, current ? UI_GRAY_BLACK : UI_GRAY_LIGHT, fb);
+        }
+    }
+
+    settings_divider(fb, 737, 36, 612);
+    const char *notice = !current ? "重启设备后再试" :
+        s_notice[0] ? s_notice : "点按卡片切换，重启后保留";
+    ui_text_box(fb, (EpdRect){36, 759, 612, 53}, 27, notice, EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){36, 829, 612, 49}, 23, "实际速度受充电器、线材和电量影响。",
+                EPD_DRAW_ALIGN_LEFT, false);
+    ui_nav_draw(fb, 3);
+}
+
+static app_redraw_t charge_current_touch(int x, int y) {
+    const unsigned current = device_power_charge_current();
+    if (!current) return APP_REDRAW_NONE;
+    for (unsigned i = 0; i < sizeof(s_charge_choices) / sizeof(s_charge_choices[0]); ++i) {
+        if (!ui_rect_hit(charge_choice_rect(i), x, y)) continue;
+        if (current == s_charge_choices[i].current) return APP_REDRAW_NONE;
+        const esp_err_t err = device_power_set_charge_current(s_charge_choices[i].current);
+        snprintf(s_notice, sizeof(s_notice), "%s", err == ESP_OK ? "" : "未能切换，请重试");
+        return APP_REDRAW_PAGE;
+    }
+    return APP_REDRAW_NONE;
+}
+
+static void batt_calibration_render(uint8_t *fb) {
+    device_power_batt_calibration_status_t status;
+    device_power_get_batt_calibration(&status);
+    back_header(fb, "自动电量校准(beta)");
+    setting_toggle(fb, 272, "自动电量校准(beta)", "按本机放电学习", status.enabled);
+    section(fb, 438, "学习状态");
+    ui_text_box(fb, (EpdRect){48, 482, 588, 42}, 28, status.applied ? "已应用部分校准" :
+            !status.enabled ? "学习已停止" : status.sampled_bins ? "正在学习" : "等待有效样本", EPD_DRAW_ALIGN_LEFT, false);
+    char coverage[96];
+    snprintf(coverage, sizeof(coverage), "已有样本 %u / %u 个区间，可信 %u 个",
+             (unsigned)status.sampled_bins, (unsigned)status.total_bins, (unsigned)status.trusted_bins);
+    ui_text_box(fb, (EpdRect){48, 530, 588, 40}, 23, coverage, EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){48, 578, 588, 40}, 23, "正常使用即可，学习需要多次有效放电", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){48, 620, 588, 40}, 23, "未覆盖区间继续使用系统估算", EPD_DRAW_ALIGN_LEFT, false);
+    if (!status.enabled)
+        ui_text_box(fb, (EpdRect){48, 662, 588, 40}, 23, "停止学习，已有校准继续生效", EPD_DRAW_ALIGN_LEFT, false);
+    ui_draw_button(fb, (EpdRect){36, 706, 612, 78}, s_batt_calibration_confirm ?
+                   "确认重置校准" : "重置校准", false);
+    if (s_notice[0] || status.save_error)
+        ui_text_box(fb, (EpdRect){48, 836, 588, 52}, 22, status.save_error ? "校准保存失败，请重试" : s_notice,
+                EPD_DRAW_ALIGN_LEFT, false);
+    ui_nav_draw(fb, 3);
+    return;
+}
+
+static app_redraw_t batt_calibration_touch(int x, int y) {
+    if (ui_rect_hit((EpdRect){36, 272, 612, 126}, x, y)) {
+        device_power_batt_calibration_status_t status;
+        device_power_get_batt_calibration(&status);
+        const esp_err_t err = device_power_set_batt_calibration(!status.enabled);
+        s_batt_calibration_confirm = false;
+        snprintf(s_notice, sizeof(s_notice), "%s", err == ESP_OK ?
+                 (status.enabled ? "停止学习，已有校准继续生效" : "已开启，等待有效放电样本") : "开关保存失败，请重试");
+        device_power_get_batt_calibration(&s_batt_calibration_status);
+        return APP_REDRAW_PAGE;
+    }
+    if (ui_rect_hit((EpdRect){36, 706, 612, 78}, x, y)) {
+        if (!s_batt_calibration_confirm) {
+            s_batt_calibration_confirm = true;
+            s_notice[0] = 0;
+        } else {
+            const esp_err_t err = device_power_reset_batt_calibration();
+            s_batt_calibration_confirm = false;
+            snprintf(s_notice, sizeof(s_notice), "%s", err == ESP_OK ?
+                     "已恢复系统曲线，学习开关保持不变" : "重置未完整保存，请重试");
+            device_power_get_batt_calibration(&s_batt_calibration_status);
+        }
+        return APP_REDRAW_PAGE;
+    }
+    if (s_batt_calibration_confirm) {
+        s_batt_calibration_confirm = false;
+        return APP_REDRAW_PAGE;
+    }
+    return APP_REDRAW_NONE;
+}
+
 static void render(app_ctx_t *ctx, uint8_t *fb) {
     (void)ctx;
     if (s_page == SETTINGS_PIN_ENTRY) { ui_pinpad_paint(fb, &s_pinpad, ui_pinpad_full()); return; }
+    if (s_page == SETTINGS_SCREEN_OFFSET) { screen_offset_render(fb, false); return; }
     ui_clear_page(fb);
 
     // 保留 ui_clear_page 的白底，灰阶只由头像、卡片与字形生成。
@@ -1119,20 +1405,29 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         ui_text(fb, 36, 207, 23, "选择书架外观与排列方式", EPD_DRAW_ALIGN_LEFT, false);
         static const char *const styles[] = {"深色书轨", "亚克力书架", "列表书架"};
         static const char *const descriptions[] = {"每页 9 本", "每页 9 本", "作者与进度 · 每页 4 本"};
+        if (s_notice[0]) ui_text_vc(fb, 36, 169, 21, s_notice, EPD_DRAW_ALIGN_LEFT, false);
         for (int i = 0; i < 3; ++i) {
-            int y = 263 + i * 253 - s_style_scroll;
-            if (y + 230 < 242 || y > 1095) continue;
-            EpdRect card = {36, y, 612, 230};
-            int style = i == 2 ? 5 : i + 1;
-            bool active = app_settings_shelf_style() == style;
-            settings_card(fb, card, 24, active ? 0xd0 : UI_GRAY_WHITE,
-                          active ? 0x58 : 0x70);
-            draw_style_thumbnail(fb, style, y + 11);
-            if (y + 190 < 1096) ui_text(fb, 68, y + 188, 23, styles[i], EPD_DRAW_ALIGN_LEFT, false);
-            if (y + 195 < 1096) ui_text(fb, 310, y + 192, 17, descriptions[i], EPD_DRAW_ALIGN_LEFT, false);
-            if (y + 220 < 1096) {
-                epd_draw_circle(609, y + 207, 13, UI_GRAY_BLACK, fb);
-                if (active) epd_fill_circle(609, y + 207, 6, UI_GRAY_BLACK, fb);
+            EpdRect card = shelf_style_card(i);
+            const uint8_t style = shelf_style_id(i);
+            const bool active = app_settings_shelf_style() == style;
+            const bool titles = app_settings_shelf_show_titles(style);
+            const int y = card.y;
+            settings_card(fb, card, 24, active ? 0xd0 : UI_GRAY_WHITE, active ? 0x58 : 0x70);
+            draw_style_thumbnail(fb, style, y + 11, titles);
+            int title_px = ui_text_effective_px(23), detail_px = ui_text_effective_px(17);
+            if (title_px > 30) title_px = 30;
+            if (detail_px > 22) detail_px = 22;
+            ui_text_fixed_vc(fb, 68, y + 207, title_px, styles[i], EPD_DRAW_ALIGN_LEFT, false);
+            ui_text_fixed_vc(fb, 310, y + 207, detail_px, descriptions[i], EPD_DRAW_ALIGN_LEFT, false);
+            epd_draw_circle(609, y + 207, 13, UI_GRAY_BLACK, fb);
+            if (active) epd_fill_circle(609, y + 207, 6, UI_GRAY_BLACK, fb);
+            if (style != 5) {
+                EpdRect row = shelf_style_titles_row(card);
+                settings_divider(fb, row.y, 68, 548);
+                int switch_px = ui_text_effective_px(22);
+                if (switch_px > 32) switch_px = 32;
+                ui_text_fixed_vc(fb, 68, row.y + row.height / 2, switch_px, "显示书名", EPD_DRAW_ALIGN_LEFT, false);
+                setting_toggle_track(fb, (EpdRect){546, row.y + 5, 69, 39}, titles);
             }
         }
         ui_nav_draw(fb, 3);
@@ -1186,7 +1481,8 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             else snprintf(signal, sizeof(signal), "%d/31", network.cellular_signal);
             snprintf(detail, sizeof(detail), "4G：%s · 信号 %s", settings_cellular_status(&network), signal);
             ui_text(fb, 48, 602, 21, detail, EPD_DRAW_ALIGN_LEFT, false);
-            ui_text(fb, 48, 648, 21, "移动网络使用内置 SIM 卡；联网方式单独选择。", EPD_DRAW_ALIGN_LEFT, false);
+            ui_text(fb, 48, 648, 21, s_network_notice ? s_network_notice :
+                    "移动网络使用内置 SIM 卡；联网方式单独选择。", EPD_DRAW_ALIGN_LEFT, false);
         } else {
             ui_text(fb, 48, 340, 21, network.cellular_capability_known
                     ? "当前硬件未检测到移动网络模块。"
@@ -1375,7 +1671,9 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         time_auto_hint(line, sizeof(line));
         ui_text(fb, 54, TIME_HINT_LINE_Y, 21, line, EPD_DRAW_ALIGN_LEFT, false);
         ui_text(fb, 54, TIME_ADVICE_LINE_Y, 21, "长时间离线可能产生误差，建议定期重新对时。", EPD_DRAW_ALIGN_LEFT, false);
-        if (s_notice[0]) ui_text(fb, 54, TIME_NOTICE_LINE_Y, 22, s_notice, EPD_DRAW_ALIGN_LEFT, false);
+        if (s_sync_pending || s_sync_waiting || s_notice[0])
+            ui_text(fb, 54, TIME_NOTICE_LINE_Y, 22, s_sync_pending || s_sync_waiting ? "正在获取网络时间…" : s_notice,
+                    EPD_DRAW_ALIGN_LEFT, false);
         ui_nav_draw(fb, 3);
         return;
     }
@@ -1416,6 +1714,8 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         ui_nav_draw(fb, 3);
         return;
     }
+    if (s_page == SETTINGS_BATT_CALIBRATION) { batt_calibration_render(fb); return; }
+    if (s_page == SETTINGS_CHARGE_CURRENT) { charge_current_render(fb); return; }
     if (s_page == SETTINGS_POWER_LOG) {
         back_header(fb, "日志调试");
         section(fb, 228, "电量校准日志");
@@ -1512,9 +1812,9 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         ui_draw_button(fb, (EpdRect){36, 681, 612, 83},
                        s_config_confirm ? "再次点按，确认恢复配置" : "从 TF 卡恢复配置", false);
         if (s_notice[0]) ui_text(fb, 48, 819, 21, s_notice, EPD_DRAW_ALIGN_LEFT, false);
-        ui_text(fb, 48, 899, 19, "包含阅读记录、设备资料和已存 WiFi。", EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, 48, 899, 19, "包含阅读记录、用户偏好和全部已存 WiFi。", EPD_DRAW_ALIGN_LEFT, false);
         ui_text(fb, 48, 939, 19, "书籍、字体和图片仍需留在 TF 卡。", EPD_DRAW_ALIGN_LEFT, false);
-        ui_text(fb, 48, 979, 19, "备份含 WiFi 密码，请妥善保管 TF 卡。", EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, 48, 979, 19, "备份含明文 WiFi 密码，请妥善保管。", EPD_DRAW_ALIGN_LEFT, false);
         ui_nav_draw(fb, 3);
         return;
     }
@@ -1570,16 +1870,16 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
     unsigned shutdown_minutes=app_settings_shutdown_minutes();
     if(shutdown_minutes)snprintf(standby,sizeof(standby),"浅睡 %u 分钟后关机",shutdown_minutes);
     else snprintf(standby,sizeof(standby),"%s",app_settings_shutdown_style()==APP_SHUTDOWN_LIGHT?"仅浅睡":"彻底关机");
-    const char *display_labels[]={"系统字体","系统对比度","主页刷新模式","首页强刷","自动休眠锁屏","待机方式"};
+    const char *display_labels[]={"系统字体","系统对比度","主页刷新模式","首页强刷","自动休眠锁屏","待机方式","屏幕偏移修正"};
     const char *display_values[]={font_name,contrast,
         app_settings_main_refresh_mode()==APP_MAIN_REFRESH_WATER?"水波纹":"普通",
         app_settings_home_full_refresh()?"开启":"关闭",idle,
-        standby};
-    const int display_icons[]={2,7,15,11,14,9};
+        standby,"1px 微调"};
+    const int display_icons[]={2,7,15,11,14,9,17};
     setting_group(fb,SETTINGS_DISPLAY_Y-49,"显示",SETTINGS_DISPLAY_Y,
                   display_icons,display_labels,display_values,SETTINGS_DISPLAY_ROWS);
     snprintf(signature,sizeof(signature),"%s",app_settings_status_signature()[0]?app_settings_status_signature():"未设置");
-    const char *personal_labels[]={"书架样式","锁屏样式","锁屏密码","状态栏签名","触摸震动","阅读背景","组件库","快捷栏管理"};
+    const char *personal_labels[]={"书架样式","壁纸","锁屏密码","状态栏签名","触摸震动","阅读背景","组件库","快捷栏管理"};
     char haptic_value[24];
     if(!haptics_available())snprintf(haptic_value,sizeof(haptic_value),"不支持");
     else if(!app_settings_touch_haptics())snprintf(haptic_value,sizeof(haptic_value),"关闭");
@@ -1604,9 +1904,12 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
                   maintenance_icons,maintenance_labels,maintenance_values,SETTINGS_MAINTENANCE_ROWS);
     char batt_log_value[16];
     snprintf(batt_log_value,sizeof(batt_log_value),"%s",app_settings_batt_log()?"开启":"关闭");
-    const char *power_labels[]={"日志调试"};
-    const char *power_values[]={batt_log_value};
-    const int power_icons[]={20};
+    device_power_batt_calibration_status_t calibration;
+    device_power_get_batt_calibration(&calibration);
+    const char *power_labels[]={"自动电量校准(beta)", "日志调试", "充电档位"};
+    const char *power_values[]={calibration.enabled ? "学习中" : calibration.applied ? "已保留校准" : "关闭", batt_log_value,
+        charge_current_label(device_power_charge_current())};
+    const int power_icons[]={20,20,20};
     setting_group(fb,SETTINGS_POWER_Y-49,"电源管理",SETTINGS_POWER_Y,
                   power_icons,power_labels,power_values,SETTINGS_POWER_ROWS);
     const int version_half = (ui_text_effective_px(20) + 1) / 2;
@@ -1662,18 +1965,22 @@ void app_device_settings_request_memory(bool return_to_origin) {
     s_enter_network_from_quick = false;
 }
 static void on_enter(app_ctx_t *ctx) {
+    s_screen_offset_pressed = -1;
+    s_screen_offset_retries = 0;
     ui_lock_style_close();
     (void)ctx;
     pin_setup_close();
     s_notice[0] = 0;
     s_page = SETTINGS_MAIN;
-    s_style_scroll = s_main_scroll = s_font_page = s_wallpaper_page = 0;
+    s_main_scroll = s_font_page = s_wallpaper_page = 0;
     s_scroll_drag_consumed = s_scroll_present_pending = false;
     s_wallpaper_selected = -1;
 
     s_sync_pending = false;
     s_font_sync_confirm = false; s_font_sync_path[0] = 0;
     s_config_confirm = false;
+    s_batt_calibration_confirm = false;
+    s_batt_calibration_next_ms = 0;
     s_panel_repair_pending = false;
     s_boot_pending = s_local_pending = s_upgrade_restart = false;
     s_upgrade_offer_pending = s_upgrade_confirm = false;
@@ -1709,6 +2016,7 @@ static void on_enter(app_ctx_t *ctx) {
     }
     if (s_enter_page == SETTINGS_NETWORK) {
         s_page = SETTINGS_NETWORK;
+        s_network_notice = NULL;
         s_network_shortcut_back = s_enter_network_from_quick;
     }
     if (s_enter_page == SETTINGS_MEMORY) {
@@ -1733,6 +2041,18 @@ static void on_enter(app_ctx_t *ctx) {
 
 static app_redraw_t profile_editor_paint(app_ctx_t *ctx, bool field);
 static app_redraw_t on_tick(app_ctx_t *ctx) {
+    if (screen_offset_retry_if_due(ctx)) return APP_REDRAW_NONE;
+    if (s_page == SETTINGS_BATT_CALIBRATION && ctx->now_ms >= s_batt_calibration_next_ms) {
+        device_power_batt_calibration_status_t next;
+        device_power_get_batt_calibration(&next);
+        s_batt_calibration_next_ms = ctx->now_ms + 1000;
+        const bool changed = next.enabled != s_batt_calibration_status.enabled ||
+            next.applied != s_batt_calibration_status.applied || next.save_error != s_batt_calibration_status.save_error ||
+            next.sampled_bins != s_batt_calibration_status.sampled_bins ||
+            next.trusted_bins != s_batt_calibration_status.trusted_bins;
+        s_batt_calibration_status = next;
+        if (changed) return APP_REDRAW_PAGE;
+    }
     if (s_page == SETTINGS_MEMORY) {
         if (ctx->now_ms >= s_memory_next_sample_ms) {
             mm_snapshot_t next;
@@ -1817,6 +2137,11 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
         !(ctx->touch && ctx->touch->touched) && settings_network_poll()) return APP_REDRAW_PAGE;
 
     (void)ctx;
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+    // 等待已离页的接收任务完成 TF 交还；不阻塞设置页轮询。
+    // Defer restart until an exiting receiver returns TF handles without blocking settings ticks.
+    if ((s_boot_pending || s_upgrade_restart) && !cloudzao_quiesce(0)) return APP_REDRAW_NONE;
+#endif
     if (s_boot_pending) {
         s_boot_pending = false;
         pmu_selftest_prepare_powerdown();
@@ -1841,6 +2166,9 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
         }
         pico_online_get_status(&s_update);
         if (s_update.state == PICO_UPDATE_READY && !s_update.busy) {
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+            if (!cloudzao_quiesce(0)) return APP_REDRAW_NONE;
+#endif
             if (pico_online_commit() == ESP_OK) { esp_restart(); return APP_REDRAW_NONE; }
             pico_online_get_status(&s_update);
         }
@@ -1849,14 +2177,30 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
         if (redraw == APP_REDRAW_AREA) draw_upgrade_progress_delta(ctx->fb);
         return redraw;
     }
-    if (!s_sync_pending) return APP_REDRAW_NONE;
-    s_sync_pending = false;
-    app_time_sync_result_t result = app_time_service_sync_manual();
+    if (s_page != SETTINGS_TIME) {
+        s_sync_pending = false;
+        return APP_REDRAW_NONE;
+    }
+    app_time_sync_result_t result = {0};
+    if (s_sync_pending) {
+        s_sync_pending = false;
+        result.error = pico_online_busy() ? MEMORY_PEAK_BUSY : app_time_service_start_manual();
+        if (result.error == ESP_OK) {
+            s_sync_waiting = true;
+            return APP_REDRAW_NONE;
+        }
+    } else if (!s_sync_waiting || !app_time_service_take_manual_result(&result)) {
+        return APP_REDRAW_NONE;
+    }
+    s_sync_waiting = false;
     esp_err_t err = result.error;
     bool network_time_received = result.network_time_received;
+    const char *hint = memory_peak_hint(err);
     const char *notice = err == ESP_OK ? "网络对时完成，内部时钟已接管" :
         network_time_received ? "已获取网络时间，内部时钟写入失败" :
-        err == ESP_ERR_NOT_FOUND ? "请先启用可用的网络方式" :
+        hint ? hint :
+        err == ESP_ERR_NO_MEM ? "内存不足，请稍后重试" :
+        err == ESP_ERR_NOT_FOUND ? "所选网络不可用，请检查网络设置" :
         err == ESP_ERR_INVALID_STATE ? "网络尚未连接，请稍后再试" :
         err == ESP_ERR_TIMEOUT ? "网络对时超时，请检查网络后重试" :
         "网络对时失败，请检查网络后重试";
@@ -1945,6 +2289,7 @@ static app_redraw_t scroll_gesture(const ui_gesture_event_t *ev, int *offset, in
 }
 
 static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
+    if (s_page == SETTINGS_SCREEN_OFFSET) return screen_offset_gesture(ctx, ev);
     if (s_page == SETTINGS_QUICK_BAR) return quick_settings_gesture(ctx, ev);
     if (s_page == SETTINGS_LOCK_STYLE) {
         if (ev->type==UI_GESTURE_TAP) {
@@ -2211,13 +2556,20 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         return APP_REDRAW_NONE;
     }
     if (s_page == SETTINGS_SHELF_STYLE) {
-        if (y < 190) { s_page = SETTINGS_MAIN; (void)wifi_transfer_get_saved_wifi(s_main_wifi,&s_main_wifi_saved); settings_prepare_profile(); return APP_REDRAW_PAGE; }
+        if (y < 190) { s_page = SETTINGS_MAIN; s_notice[0] = 0; (void)wifi_transfer_get_saved_wifi(s_main_wifi,&s_main_wifi_saved); settings_prepare_profile(); return APP_REDRAW_PAGE; }
         for (int i = 0; i < 3; ++i) {
-            if (y >= 263 + i * 253 - s_style_scroll && y < 493 + i * 253 - s_style_scroll && y < 1096) {
-                app_settings_set_shelf_style((uint8_t)(i == 2 ? 5 : i + 1));
-                s_page = SETTINGS_MAIN;
+            EpdRect card = shelf_style_card(i);
+            if (!ui_rect_hit(card, ev->x0, y)) continue;
+            const uint8_t style = shelf_style_id(i);
+            if (style != 5 && ui_rect_hit(shelf_style_titles_row(card), ev->x0, y)) {
+                const bool saved = app_settings_set_shelf_show_titles(style, !app_settings_shelf_show_titles(style));
+                snprintf(s_notice, sizeof(s_notice), "%s", saved ? "" : "保存失败，请重试");
                 return APP_REDRAW_PAGE;
             }
+            app_settings_set_shelf_style(style);
+            s_notice[0] = 0;
+            s_page = SETTINGS_MAIN;
+            return APP_REDRAW_PAGE;
         }
         return APP_REDRAW_NONE;
     }
@@ -2269,7 +2621,12 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         network_service_get_status(&network);
         if (network.cellular_capable && y >= NETWORK_TOGGLE_Y &&
             y < NETWORK_TOGGLE_Y + NETWORK_TOGGLE_H) {
-            (void)network_service_set_enabled(NETWORK_BEARER_CELLULAR, !network.cellular_enabled);
+            const esp_err_t err = network_service_set_enabled(NETWORK_BEARER_CELLULAR, !network.cellular_enabled);
+            s_network_notice = memory_peak_hint(err);
+            if (err != ESP_OK && !s_network_notice) {
+                s_network_notice = network.cellular_enabled ? "4G 未能关闭，请稍后重试" :
+                    err == ESP_ERR_NO_MEM ? "内存不足，无法启动 4G" : "4G 未能启动，请稍后重试";
+            }
             return APP_REDRAW_PAGE;
         }
         if (network.cellular_capable && y >= NETWORK_ROUTE_ROW_Y &&
@@ -2282,6 +2639,8 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         }
         return APP_REDRAW_NONE;
     }
+    if (s_page == SETTINGS_BATT_CALIBRATION) return batt_calibration_touch(ev->x0, y);
+    if (s_page == SETTINGS_CHARGE_CURRENT) return charge_current_touch(ev->x0, y);
     if (s_page == SETTINGS_POWER_LOG) {
         if (ui_rect_hit((EpdRect){36, 272, 612, 126}, ev->x0, y)) {
             app_settings_set_batt_log(!app_settings_batt_log());
@@ -2360,11 +2719,14 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             return APP_REDRAW_PAGE;
         }
         if (y >= TIME_ROW_WIFI_Y && y < TIME_ROW_WIFI_Y + TIME_ROW_HIT_H) {
+            if (s_sync_pending || s_sync_waiting) return APP_REDRAW_NONE;
             s_notice[0] = 0; s_sync_pending = true;
-            snprintf(s_notice, sizeof(s_notice), "正在获取网络时间…");
             return APP_REDRAW_PAGE;
         }
-        if (y >= TIME_ROW_MANUAL_Y && y < TIME_ROW_MANUAL_Y + TIME_ROW_HIT_H) { time_open(); return APP_REDRAW_PAGE; }
+        if (y >= TIME_ROW_MANUAL_Y && y < TIME_ROW_MANUAL_Y + TIME_ROW_HIT_H) {
+            if (s_sync_pending || s_sync_waiting) return APP_REDRAW_NONE;
+            time_open(); return APP_REDRAW_PAGE;
+        }
         return APP_REDRAW_NONE;
     }
     if (s_page == SETTINGS_POWER_SLEEP) {
@@ -2400,7 +2762,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         if (y >= 681 && y < 764) {
             if (!s_config_confirm) {
                 s_config_confirm = true;
-                snprintf(s_notice, sizeof(s_notice), "恢复将覆盖当前设置，请再点按一次确认");
+                snprintf(s_notice, sizeof(s_notice), "恢复将覆盖设置、合并 WiFi，请再次确认");
                 return APP_REDRAW_PAGE;
             }
             s_config_confirm = false;
@@ -2409,6 +2771,9 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
                 ttf_font_scan();
                 app_font_activate_system();
                 ui_text_set_system_scale(true);
+                if (frontlight_ready())
+                    (void)frontlight_apply(app_settings_frontlight_on(), app_settings_frontlight_brightness(),
+                                           app_settings_frontlight_cct());
                 // 阅读记录恢复后令首页和书架重新取进度、时长与排序。
                 // Rebuild home and shelf caches after restoring reading records.
                 book_store_notify_changed();
@@ -2423,6 +2788,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
                      err == ESP_ERR_INVALID_STATE ? "未识别到 TF 卡，请插卡后重试" :
                      err == ESP_ERR_NOT_FOUND ? "未找到配置备份文件" :
                      err == ESP_ERR_INVALID_RESPONSE ? "配置文件损坏或版本不兼容" :
+                     err == ESP_ERR_INVALID_SIZE ? "WiFi 合并超过 8 组，请先遗忘部分网络" :
                      "恢复未完成，请重试");
             return APP_REDRAW_PAGE;
         }
@@ -2441,7 +2807,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         network_status_t network;
         network_service_get_status(&network);
         if(network.cellular_capable && row==1) {
-            s_page=SETTINGS_NETWORK;return APP_REDRAW_PAGE;
+            s_page=SETTINGS_NETWORK;s_network_notice=NULL;return APP_REDRAW_PAGE;
         }
         const int bluetooth_row = network.cellular_capable ? 2 : 1;
         if(row==bluetooth_row) {
@@ -2456,12 +2822,13 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         else if(row==2)s_page=SETTINGS_MAIN_REFRESH;
         else if(row==3)app_settings_set_home_full_refresh(!app_settings_home_full_refresh());
         else if(row==4)s_page=SETTINGS_AUTO_LOCK;
-        else s_page=SETTINGS_POWER_SLEEP;
+        else if(row==5)s_page=SETTINGS_POWER_SLEEP;
+        else {s_page=SETTINGS_SCREEN_OFFSET;s_notice[0]=0;}
         return APP_REDRAW_PAGE;
     }
     if(y>=SETTINGS_PERSONAL_Y && y<SETTINGS_PERSONAL_Y+SETTINGS_PERSONAL_ROWS*SETTINGS_ROW_H) {
         row=(y-SETTINGS_PERSONAL_Y)/SETTINGS_ROW_H;
-        if(row==0) {s_page=SETTINGS_SHELF_STYLE;s_style_scroll=0;}
+        if(row==0) {s_page=SETTINGS_SHELF_STYLE;s_notice[0]=0;}
         else if(row==1){ui_lock_style_open(ctx->fb);s_page=SETTINGS_LOCK_STYLE;}
         else if(row==2){s_page=SETTINGS_LOCK_PIN;s_notice[0]=0;}
         else if(row==3)profile_editor_open(true);
@@ -2497,13 +2864,23 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
     }
     if(y>=SETTINGS_POWER_Y && y<SETTINGS_POWER_Y+SETTINGS_POWER_ROWS*SETTINGS_ROW_H) {
         row=(y-SETTINGS_POWER_Y)/SETTINGS_ROW_H;
-        if(row==0) s_page=SETTINGS_POWER_LOG;
+        if(row==0) {
+            s_page=SETTINGS_BATT_CALIBRATION;
+            s_batt_calibration_confirm=false;
+            s_notice[0]=0;
+            device_power_get_batt_calibration(&s_batt_calibration_status);
+            s_batt_calibration_next_ms=ctx->now_ms+1000;
+        }
+        else if(row==1) s_page=SETTINGS_POWER_LOG;
+        else if(row==2) { s_page=SETTINGS_CHARGE_CURRENT; s_notice[0]=0; }
         return APP_REDRAW_PAGE;
     }
     return APP_REDRAW_NONE;
 }
 
 static app_redraw_t on_key(app_ctx_t *ctx, int key) {
+    s_batt_calibration_confirm = false;
+    s_screen_offset_pressed = -1;
     if (s_ble_shortcut_back && s_page == SETTINGS_MAIN) s_ble_shortcut_back = false;
     if (s_haptics_shortcut_back && s_page == SETTINGS_MAIN) s_haptics_shortcut_back = false;
     if(s_font_sync_confirm) {
@@ -2557,11 +2934,13 @@ static app_redraw_t on_key(app_ctx_t *ctx, int key) {
     return APP_REDRAW_NONE;
 }
 static void settings_exit(app_ctx_t *ctx) {
+    s_batt_calibration_confirm = false;
+    s_screen_offset_pressed = -1;
+    s_screen_offset_retries = 0;
     ui_lock_style_close();
 
-    // 阅读背景预览缓存只在设置页存活；阅读器打开时会按当前路径重新解码。
-    // The reading-background preview cache lives only while settings is open; the reader
-    // re-decodes from the stored path when it opens.
+    // 释放预览内存；阅读器按当前路径读取TF成品，缓存失效时才重新解码。
+    // Release preview RAM; the reader loads prepared SD art and decodes only stale/missing caches.
     ui_reader_background_release();
     s_reading_bg_confirm=s_reading_bg_ready=s_reading_bg_pending=false;s_reading_bg_notice[0]=0;
     s_font_sync_confirm=false;s_font_sync_path[0]=0;
@@ -2570,6 +2949,9 @@ static void settings_exit(app_ctx_t *ctx) {
     (void)ctx; ui_keyboard_end(); pico_online_cancel_join(); settings_bluetooth_close();
 }
 static void on_before_lock(app_ctx_t *ctx) {
+    s_batt_calibration_confirm = false;
+    s_screen_offset_pressed = -1;
+    s_screen_offset_retries = 0;
     if(s_page==SETTINGS_LOCK_STYLE){ui_lock_style_close();s_page=SETTINGS_MAIN;}
     s_font_sync_confirm=false;s_font_sync_path[0]=0;
     // 锁屏唤醒后 tick 不会再补解码，预览页会停在白框：锁屏前退回主列表并释放缓存。
@@ -2601,6 +2983,11 @@ static void settings_media_lost(app_ctx_t *ctx) {
 static void settings_media_ready(app_ctx_t *ctx) { (void)ctx; ui_lock_style_media_ready(); settings_prepare_profile(); }
 static bool main_page_visible(app_ctx_t *ctx) { (void)ctx; return s_page == SETTINGS_MAIN; }
 static bool settings_present(app_ctx_t *ctx, app_redraw_t redraw) {
+    if (s_page == SETTINGS_SCREEN_OFFSET && redraw == APP_REDRAW_PAGE) {
+        s_screen_offset_retries = SCREEN_OFFSET_RETRIES;
+        screen_offset_present(ctx);
+        return true;
+    }
     if (s_page == SETTINGS_PIN_ENTRY && (redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL)) {
         display_main_transition_cancel(); render(ctx, ctx->fb);
         guard_draw_result(ctx->hl, display_refresh_area(ctx->hl, DISPLAY_REFRESH_DETAIL, ui_pinpad_full(), DISPLAY_REFRESH_DEFAULT));
@@ -2658,6 +3045,7 @@ const app_desc_t app_device_settings = {
     .owns_keys = true, .menu_handle_enabled = no_menu_handle,
     .main_page_visible = main_page_visible,
     .on_enter = on_enter, .on_exit = settings_exit, .on_before_lock = on_before_lock, .render = render, .on_tick = on_tick, .on_gesture = on_gesture, .on_key = on_key,
+    .gesture_contact_allowed = settings_gesture_contact_allowed,
     .present = settings_present,
     .on_media_lost=settings_media_lost, .on_media_ready=settings_media_ready,
 };

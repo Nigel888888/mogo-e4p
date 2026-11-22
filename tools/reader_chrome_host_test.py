@@ -450,6 +450,6 @@ with tempfile.TemporaryDirectory(dir=ROOT / 'build') as folder:
     subprocess.run(['cc', '-std=c11', '-D_DEFAULT_SOURCE', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                     '-Itools/book_layout_stubs', '-Itools/book_source_host_stubs', '-Imain/book', '-Imain',
-                    str(path/'pagination.c'), 'main/book/book_layout.c', 'main/book/html_text.c',
+                    str(path/'pagination.c'), 'main/book/book_layout.c', 'main/book/book_hyphen_en.c', 'main/book/html_text.c',
                     '-o', str(path/'pagination')], cwd=ROOT, check=True)
     subprocess.run([str(path/'pagination')], check=True)

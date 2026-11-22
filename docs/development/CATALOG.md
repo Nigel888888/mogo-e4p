@@ -3,46 +3,36 @@
 由 tidy.py sync 重建；人工说明放 INDEX.md 或原文档。
 目录分类不代表文档状态；计划、实现与验证结论以原文证据为准。
 
-## 规范、架构与其他资料
+## 现行契约
 
-- [components/board_i2c/README.md](../../components/board_i2c/README.md)
-- [components/board_support/README.md](../../components/board_support/README.md)
-- [components/book_search/README.md](../../components/book_search/README.md)
-- [components/cst836u/README.md](../../components/cst836u/README.md)
-- [components/device_power/README.md](../../components/device_power/README.md)
-- [components/device_power/docs/llms-full_en.md](../../components/device_power/docs/llms-full_en.md)
-- [components/device_power/docs/llms-full_zh_cn.md](../../components/device_power/docs/llms-full_zh_cn.md)
-- [components/device_power/docs/pmu_registers_en.json](../../components/device_power/docs/pmu_registers_en.json)
-- [components/device_power/docs/pmu_registers_zh_cn.json](../../components/device_power/docs/pmu_registers_zh_cn.json)
-- [components/e0470_epaper_waveform/README.md](../../components/e0470_epaper_waveform/README.md)
-- [components/fca9555/README.md](../../components/fca9555/README.md)
-- [components/sc7a20h/README.md](../../components/sc7a20h/README.md)
-- [components/webp_decoder/README.md](../../components/webp_decoder/README.md)
-- [docs/ARCHITECTURE.md](../ARCHITECTURE.md)
-- [docs/CHANGELOG.md](../CHANGELOG.md)
-- [docs/COMMIT_CONVENTION.md](../COMMIT_CONVENTION.md)
+- [docs/development/designs/DISPLAY_REFRESH.md](designs/DISPLAY_REFRESH.md)
+- [docs/development/designs/MEMORY_MANAGEMENT.md](designs/MEMORY_MANAGEMENT.md)
+
+## 使用与开发指南
+
 - [docs/HANDOFF.md](../HANDOFF.md)
 - [docs/ONBOARDING.md](../ONBOARDING.md)
-- [docs/README.md](../README.md)
-- [docs/development/FEATURES.md](FEATURES.md)
-- [docs/development/INDEX.md](INDEX.md)
 - [docs/development/guides/BLUETOOTH.md](guides/BLUETOOTH.md)
 - [docs/development/guides/CALENDAR.md](guides/CALENDAR.md)
+- [docs/development/guides/CLOUDZAO_TRANSFER.md](guides/CLOUDZAO_TRANSFER.md)
 - [docs/development/guides/LOCK_CLOCK.md](guides/LOCK_CLOCK.md)
 - [docs/development/guides/LOCK_STYLE_PICKER.md](guides/LOCK_STYLE_PICKER.md)
+- [docs/development/guides/MANUAL.md](guides/MANUAL.md)
 - [docs/development/guides/MINI_LIBRARY.md](guides/MINI_LIBRARY.md)
 - [docs/development/guides/MOBI.md](guides/MOBI.md)
 - [docs/development/guides/NETWORK.md](guides/NETWORK.md)
+- [docs/development/guides/PERSISTENCE.md](guides/PERSISTENCE.md)
 - [docs/development/guides/PLATFORM_OTA.md](guides/PLATFORM_OTA.md)
 - [docs/development/guides/READER_DICTIONARY.md](guides/READER_DICTIONARY.md)
 - [docs/development/guides/READER_ORIENTATION.md](guides/READER_ORIENTATION.md)
 - [docs/development/guides/READER_PERFORMANCE.md](guides/READER_PERFORMANCE.md)
 - [docs/development/guides/READING_JOURNAL.md](guides/READING_JOURNAL.md)
+- [docs/development/guides/RELEASE.md](guides/RELEASE.md)
 - [docs/development/guides/WEATHER.md](guides/WEATHER.md)
-- [docs/development/history/WEBSITE-MANUAL.md](history/WEBSITE-MANUAL.md)
-- [docs/development/history/porting/移植适配方案.md](history/porting/%E7%A7%BB%E6%A4%8D%E9%80%82%E9%85%8D%E6%96%B9%E6%A1%88.md)
-- [docs/development/history/releases/RELEASE_NOTES_0.3.3-rc68.md](history/releases/RELEASE_NOTES_0.3.3-rc68.md)
-- [docs/development/history/releases/RELEASE_NOTES_0.3.3-rc69.md](history/releases/RELEASE_NOTES_0.3.3-rc69.md)
+- [tools/README.md](../../tools/README.md)
+
+## 工具输入
+
 - [docs/ota-release-notes/1.0.1.txt](../ota-release-notes/1.0.1.txt)
 - [docs/ota-release-notes/1.0.2.txt](../ota-release-notes/1.0.2.txt)
 - [docs/ota-release-notes/1.0.3.txt](../ota-release-notes/1.0.3.txt)
@@ -56,22 +46,47 @@
 - [docs/ota-release-notes/1.1.1.txt](../ota-release-notes/1.1.1.txt)
 - [docs/ota-release-notes/1.1.2.txt](../ota-release-notes/1.1.2.txt)
 - [docs/ota-release-notes/1.1.3.txt](../ota-release-notes/1.1.3.txt)
-- [docs/ota-release-notes/README.md](../ota-release-notes/README.md)
+- [docs/ota-release-notes/1.1.4.txt](../ota-release-notes/1.1.4.txt)
+- [docs/ota-release-notes/1.1.5.txt](../ota-release-notes/1.1.5.txt)
+- [docs/ota-release-notes/1.1.6.txt](../ota-release-notes/1.1.6.txt)
+- [docs/ota-release-notes/1.1.7.txt](../ota-release-notes/1.1.7.txt)
+- [docs/ota-release-notes/1.1.8.txt](../ota-release-notes/1.1.8.txt)
 - [docs/user-manual-detailed.zh-CN.json](../user-manual-detailed.zh-CN.json)
 - [docs/user-manual.zh-CN.json](../user-manual.zh-CN.json)
-- [tools/README.md](../../tools/README.md)
 
-## 计划与探索
+## 历史资料
 
-- [docs/plans/2026-11-12-gitnexus-plan-4g-network-bearer.md](../plans/2026-11-12-gitnexus-plan-4g-network-bearer.md)
+- [docs/development/history/WEBSITE-MANUAL.md](history/WEBSITE-MANUAL.md)
+- [docs/development/history/porting/移植适配方案.md](history/porting/%E7%A7%BB%E6%A4%8D%E9%80%82%E9%85%8D%E6%96%B9%E6%A1%88.md)
+- [docs/development/history/releases/RELEASE_NOTES_0.3.3-rc68.md](history/releases/RELEASE_NOTES_0.3.3-rc68.md)
+- [docs/development/history/releases/RELEASE_NOTES_0.3.3-rc69.md](history/releases/RELEASE_NOTES_0.3.3-rc69.md)
 
-## 设计与草稿
+## 模块说明
 
-- [docs/development/designs/DISPLAY_REFRESH.md](designs/DISPLAY_REFRESH.md)
-- [docs/development/designs/MEMORY_MANAGEMENT.md](designs/MEMORY_MANAGEMENT.md)
+- [components/board_i2c/README.md](../../components/board_i2c/README.md)
+- [components/board_support/README.md](../../components/board_support/README.md)
+- [components/book_search/README.md](../../components/book_search/README.md)
+- [components/cst836u/README.md](../../components/cst836u/README.md)
+- [components/device_power/README.md](../../components/device_power/README.md)
+- [components/device_power/docs/llms-full_en.md](../../components/device_power/docs/llms-full_en.md)
+- [components/device_power/docs/llms-full_zh_cn.md](../../components/device_power/docs/llms-full_zh_cn.md)
+- [components/device_power/docs/pmu_datasheet_v1.0.8_en.pdf](../../components/device_power/docs/pmu_datasheet_v1.0.8_en.pdf)
+- [components/device_power/docs/pmu_datasheet_v1.0.8_zh_cn.pdf](../../components/device_power/docs/pmu_datasheet_v1.0.8_zh_cn.pdf)
+- [components/device_power/docs/pmu_registers_en.json](../../components/device_power/docs/pmu_registers_en.json)
+- [components/device_power/docs/pmu_registers_zh_cn.json](../../components/device_power/docs/pmu_registers_zh_cn.json)
+- [components/e0470_epaper_waveform/README.md](../../components/e0470_epaper_waveform/README.md)
+- [components/fca9555/README.md](../../components/fca9555/README.md)
+- [components/sc7a20h/README.md](../../components/sc7a20h/README.md)
+- [components/webp_decoder/README.md](../../components/webp_decoder/README.md)
 
-## 图片与附件
+## 规范、架构与其他资料
 
-- [components/device_power/docs/](../../components/device_power/docs)（2 项）
+- [docs/ARCHITECTURE.md](../ARCHITECTURE.md)
+- [docs/CHANGELOG.md](../CHANGELOG.md)
+- [docs/COMMIT_CONVENTION.md](../COMMIT_CONVENTION.md)
+- [docs/README.md](../README.md)
+- [docs/development/FEATURES.md](FEATURES.md)
+- [docs/development/INDEX.md](INDEX.md)
+- [docs/ota-release-notes/README.md](../ota-release-notes/README.md)
 
 本地过程记忆：`docs/local/tidy/changes/`，不在共享分类表列出。

@@ -38,10 +38,13 @@ static void sampler_task(void* arg) {
     (void)arg;
     cst836u_touch_t t;
     while (true) {
+        // 按事务开始时间归属坐标，跨越落屏边界的读取仍属于旧画面。
+        // Timestamp at read start so transactions spanning a display commit still belong to the old image.
+        const int64_t sample_ms = esp_timer_get_time() / 1000;
         if (cst836u_read(s_tp, &t) == ESP_OK) {
             unsigned wr = s_wr;  // 写者私有
             touch_frame_t* slot = &s_queue[wr & TS_QUEUE_MASK];
-            slot->t_ms = esp_timer_get_time() / 1000;
+            slot->t_ms = sample_ms;
             slot->x = t.x;
             slot->y = t.y;
             slot->count = t.count;

@@ -29,7 +29,10 @@ def unit():
     # 文案来自真实动作分支，避免预览与产品各维护一份。/ Pull copy from the action so previews cannot drift.
     messages = re.findall(r'"(?:\\.|[^"\\])*"', host.function("reader_toggle_touch", BOOK))
     assert len(messages) == 4
-    base += "\nstatic const char *messages[]={" + ",".join(messages) + ',"书签已添加"};\n'
+    landscape = re.search(r'^static const char s_landscape_turn_notice\[\] = (".+");$',
+                          BOOK.read_text(), re.M).group(1)
+    messages += ['"书签已添加"', landscape]
+    base += "\nstatic const char *messages[]={" + ",".join(messages) + "};\n"
     base += r'''
 static void bounds(uint8_t *fb,EpdRect area){
     unsigned ink=0;
@@ -49,7 +52,7 @@ int main(int argc,char **argv){
     memset(fb,0x77,684*1216/2);ui_reader_notice_draw(fb,"",120);
     for(size_t i=0;i<684*1216/2;++i)assert(fb[i]==0x77);
     for(display_rotation=0;display_rotation<4;++display_rotation)
-    for(font_percent=100;font_percent<=200;font_percent+=10)for(unsigned i=0;i<5;++i){
+    for(font_percent=100;font_percent<=200;font_percent+=10)for(unsigned i=0;i<sizeof(messages)/sizeof(messages[0]);++i){
         memset(fb,0x77,684*1216/2);
         EpdRect area=ui_reader_notice_area(messages[i],font_percent);
         allowed_top=area.y;allowed_bottom=area.y+area.height;

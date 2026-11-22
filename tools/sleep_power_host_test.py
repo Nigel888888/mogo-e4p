@@ -55,7 +55,9 @@ static uint8_t config[2], output[2];
 static int step, fault, clears;
 static bool buzzer, acc_on, transfer_ok = true, cellular_ok = true, ota;
 static bool cover_ok = true, avatar_ok = true;
+static bool home_library_quiesce(unsigned ms){assert(ms==2000);return true;}
 static bool book_cover_jobs_quiesce(unsigned ms) { assert(ms == 2000); return cover_ok; }
+static bool shutdown_wallpaper_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 bool lock_images_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 static bool ui_avatar_quiesce(unsigned ms) { assert(ms == 2000); return avatar_ok; }
 static int tp_mode, touch_wakes, acc_ups, acc_downs, cpu_requests;
@@ -92,15 +94,13 @@ static void app_s31_sleep_init(void) {}
 static int trace_replays;
 static void sleep_trace_replay(void) { ++trace_replays; }
 static bool pico_online_busy(void) { return ota; }
-static bool wifi_transfer_pause_for_sleep(void) { ++pauses; return transfer_ok; }
-static bool cellular_service_pause_for_sleep(void) {
-    assert(pauses == 1 && !resumes && !prepared && !step);
-    ++cellular_pauses; return cellular_ok;
-}
-static void cellular_service_resume_after_sleep(void);
-static void wifi_transfer_resume_after_sleep(void) {
-    assert(cellular_pauses == 1 && cellular_resumes == (cellular_ok ? 1 : 0));
-    ++resumes;
+static bool network_service_pause_for_sleep(void) {
+    ++pauses;
+    if (!transfer_ok) return false;
+    assert(!resumes && !prepared && !step);
+    ++cellular_pauses;
+    if (!cellular_ok) ++resumes;
+    return cellular_ok;
 }
 static int ble_pt_stop(int timeout) { assert(timeout == 2000); ++radio_stops; return ESP_OK; }
 static int fl_pauses, fl_resumes;
@@ -128,11 +128,12 @@ static int cst836u_wake(void *h) {
     assert((output[1] & P1_RAIL_MASK) == P1_RAIL_MASK);
     tp_mode = CST836U_MODE_NORMAL; ++touch_wakes; return ESP_OK;
 }
-static void cellular_service_resume_after_sleep(void) {
+static void network_service_resume_after_sleep(void) {
     assert(cellular_pauses == 1 && !resumes && touch_wakes == 1);
     assert(config[0] == P0_INPUT_MASK && config[1] == P1_INPUT_MASK);
     assert(tp_mode == CST836U_MODE_NORMAL);
     ++cellular_resumes;
+    ++resumes;
 }
 static int pmu_result(void) {
     assert(!key_sampling && prepared && !rails_on && !acc_on && tp_mode == CST836U_MODE_DEEPSLEEP);
@@ -277,6 +278,7 @@ settings_header = (ROOT / 'main/settings/settings.h').read_text()
 style_start = settings_header.index('typedef enum {', settings_header.index('/// 锁屏睡眠方式'))
 style_enum = settings_header[style_start:settings_header.index('} app_shutdown_style_t;', style_start) + len('} app_shutdown_style_t;')]
 timed_unit = r'''
+#include <stdlib.h>
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -285,24 +287,44 @@ timed_unit = r'''
 #include <setjmp.h>
 typedef void *sc7a20h_handle_t;
 typedef struct {int unused;} EpdiyHighlevelState;
+typedef struct {int unused;} app_lock_font_t;
+enum EpdDrawError {EPD_DRAW_SUCCESS, EPD_DRAW_TEST_FAILURE};
 typedef enum {APP_WAKE_NONE,APP_WAKE_KEY,APP_WAKE_PICKUP,APP_WAKE_TIMEOUT} app_wake_source_t;
 #define APP_SLEEP_OFF 2
 static int64_t now_us, seen_deadline;
-static unsigned waits, saves, marks, offs;
-static bool save_ok, off_success;
+static unsigned waits, saves, offs;
+static bool save_ok, draw_failed, off_success;
 static app_wake_source_t next_wake;
 static jmp_buf powered_off;
-static uint8_t framebuffer[1];
+static uint8_t framebuffer[684u*1216u/2u];
+#define MALLOC_CAP_SPIRAM 1
+#define MALLOC_CAP_8BIT 2
+static void *power_original;
+static void *heap_caps_malloc(size_t n,int caps){(void)caps;power_original=malloc(n);return power_original;}
+static unsigned shutdown_paints,shutdown_draws,shutdown_guards,lock_restores;
+static void app_font_begin_lock(app_lock_font_t *saved){assert(saved);}
+static void app_font_end_lock(app_lock_font_t *saved){assert(saved&&shutdown_guards==1);}
+static void ui_power_shutdown_prepare(uint8_t *fb){assert(fb==framebuffer);++shutdown_paints;fb[0]=0xa5;}
+static enum EpdDrawError update_display_full_clean(EpdiyHighlevelState *hl){
+    assert(hl&&shutdown_paints==1&&framebuffer[0]==0xa5);
+    ++shutdown_draws;
+    return draw_failed?EPD_DRAW_TEST_FAILURE:EPD_DRAW_SUCCESS;
+}
+static void guard_draw_result(EpdiyHighlevelState *hl,enum EpdDrawError result){
+    assert(hl&&shutdown_draws==1&&result==(draw_failed?EPD_DRAW_TEST_FAILURE:EPD_DRAW_SUCCESS));
+    ++shutdown_guards;
+}
+static void restore_lock_after_shutdown(EpdiyHighlevelState *hl,const uint8_t *saved){assert(hl&&saved&&saved[0]==0x37);memcpy(framebuffer,saved,sizeof(framebuffer));++lock_restores;}
+static void epd_poweroff(void){assert(!draw_failed&&shutdown_guards==1);}
 static int64_t esp_timer_get_time(void){return now_us;}
 static uint8_t *epd_hl_get_framebuffer(EpdiyHighlevelState *hl){assert(hl);return framebuffer;}
 static bool lock_screen_save(const uint8_t *fb){assert(fb==framebuffer&&waits==1);++saves;return save_ok;}
-static int pico_boot_mark_frame_cached(void){assert(save_ok&&saves==1);++marks;return 0;}
 static int app_enter_host_sleep(int mode){assert(mode==APP_SLEEP_OFF&&saves==1);++offs;if(off_success)longjmp(powered_off,1);return -1;}
 static app_wake_source_t light_sleep_wait_until(sc7a20h_handle_t acc,int64_t deadline,EpdiyHighlevelState *hl){
     assert(hl);
     (void)acc;++waits;seen_deadline=deadline;
     if(waits==1)return next_wake;
-    assert(offs==1&&!deadline);
+    assert(offs==(unsigned)!draw_failed&&!deadline);
     return APP_WAKE_KEY;
 }
 '''
@@ -310,31 +332,36 @@ static app_wake_source_t light_sleep_wait_until(sc7a20h_handle_t acc,int64_t dea
 # The driver model runs the real waiting loop; run the actual policy here to isolate shutdown success/failure boundaries.
 timed_unit += style_enum + '\nstatic app_shutdown_style_t s_shutdown_style;\n'
 timed_unit += function('app_settings_shutdown_minutes', ROOT / 'main/settings/settings.c') + '\n'
-for name in ('app_light_sleep_wait', 'app_lock_sleep_wait'):
-    timed_unit += function(name, sleep) + '\n'
+timed_unit += function('app_shutdown_present', sleep) + '\n'
+timed_unit += function('app_lock_sleep_wait', sleep) + '\n'
 timed_unit += r'''
 int main(void){
     EpdiyHighlevelState hl={0};
     const uint8_t durations[]={0,0,0,10,30,60};
     for(unsigned style=1;style<=5;++style)for(unsigned wake=APP_WAKE_KEY;wake<=APP_WAKE_PICKUP;++wake){
         s_shutdown_style=(app_shutdown_style_t)style;next_wake=(app_wake_source_t)wake;
-        waits=saves=marks=offs=0;now_us=123456789;
+        waits=saves=offs=0;now_us=123456789;
         assert(app_lock_sleep_wait(&hl,NULL)==next_wake&&waits==1&&!offs&&!saves);
         assert(seen_deadline==(durations[style]?now_us+(int64_t)durations[style]*60000000:0));
         now_us+=60000000;waits=0;
         assert(app_lock_sleep_wait(&hl,NULL)==next_wake);
         assert(seen_deadline==(durations[style]?now_us+(int64_t)durations[style]*60000000:0));
+        assert(!shutdown_paints&&!shutdown_draws);
     }
-    for(unsigned style=3;style<=5;++style)for(unsigned cache=0;cache<2;++cache)for(unsigned success=0;success<2;++success){
+    for(unsigned style=3;style<=5;++style)for(unsigned cache=0;cache<2;++cache)for(unsigned outcome=0;outcome<3;++outcome){
         s_shutdown_style=(app_shutdown_style_t)style;next_wake=APP_WAKE_TIMEOUT;
-        save_ok=cache;off_success=success;waits=saves=marks=offs=0;
+        save_ok=cache;draw_failed=outcome==0;off_success=outcome==2;
+        waits=saves=offs=shutdown_paints=lock_restores=0;
+        shutdown_draws=shutdown_guards=0;framebuffer[0]=0x37;
         if(!setjmp(powered_off)){
-            assert(app_lock_sleep_wait(&hl,NULL)==APP_WAKE_KEY&&!success);
+            assert(app_lock_sleep_wait(&hl,NULL)==APP_WAKE_KEY&&!off_success);
             assert(waits==2&&seen_deadline==0);
-        }else assert(success&&waits==1);
-        assert(saves==1&&offs==1&&marks==cache);
+        }else assert(off_success&&waits==1);
+        assert(saves==1&&offs==(unsigned)!draw_failed&&lock_restores==(unsigned)!off_success);
+        assert(shutdown_paints==1&&shutdown_draws==1&&shutdown_guards==1);
+        if(off_success)free(power_original);else assert(framebuffer[0]==0x37);
     }
-    puts("PASS: actual 10/30/60 shutdown policy, early wake/reset, lock cache, full-off success and failed-off locked wait");
+    puts("PASS: actual timed shutdown, clean full presentation, early wake, draw/hand-off failure and lock recovery");
 }
 '''
 # 直接执行设置页实际绘制/命中分支，避免仅靠文本存在性断言。

@@ -43,7 +43,7 @@ unit += r'''
 static uint8_t s_fb[1];
 static char s_labels[3][16];
 static char s_actions[3][16];
-static char s_row_names[KEY_ROW_COUNT][16];
+static char s_row_names[KEY_ROW_COUNT][32];
 static char s_row_values[KEY_ROW_COUNT][16];
 static int s_switch_x = -1, s_switch_on = -1;
 static int s_circle_x = -1, s_circle_count;
@@ -133,7 +133,7 @@ int main(void) {
     // The first screen shows all three actions and the volume switch.
     assert(!strcmp(s_row_names[0], "中键长按") && !strcmp(s_row_values[0], "返回主页"));
     assert(!strcmp(s_row_names[1], "中键双击") && !strcmp(s_row_values[1], "不操作"));
-    assert(!strcmp(s_row_names[2], "上键单击") && !strcmp(s_row_values[2], "不操作"));
+    assert(!strcmp(s_row_names[2], "上键（AI键）单击") && !strcmp(s_row_values[2], "不操作"));
     assert(!strcmp(s_row_names[3], "音量键翻页") && s_switch_x == 556);
 
     // 滚动边界为零，所有行仍完整可见。
@@ -142,7 +142,7 @@ int main(void) {
     s_key_scroll = KEY_ROW_MAX_SCROLL;
     draw_key_settings(s_fb);
     assert(!strcmp(s_row_names[0], "中键长按"));
-    assert(!strcmp(s_row_names[1], "中键双击") && !strcmp(s_row_names[2], "上键单击"));
+    assert(!strcmp(s_row_names[1], "中键双击") && !strcmp(s_row_names[2], "上键（AI键）单击"));
     assert(!strcmp(s_row_names[3], "音量键翻页") && !strcmp(s_row_values[3], "开启"));
     assert(s_switch_x == 556 && s_switch_on == 1);
     puts("PASS: key sheet keeps physical middle/left/right order and shows all four aligned rows without a footer button or scrolling");

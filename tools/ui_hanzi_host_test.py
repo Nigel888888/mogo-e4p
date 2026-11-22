@@ -22,7 +22,8 @@ with tempfile.TemporaryDirectory() as temp:
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 extern int fail;
-static inline void *heap_caps_malloc(size_t n,int c){(void)c;return fail?NULL:malloc(n);}
+extern int fail_block;
+static inline void *heap_caps_malloc(size_t n,int c){(void)c;return fail||(fail_block&&n==32*77)?NULL:malloc(n);}
 static inline void *heap_caps_calloc(size_t n,size_t s,int c){(void)c;return fail?NULL:calloc(n,s);}
 ''')
  (work/'miniz.h').write_text('''#pragma once
@@ -49,7 +50,7 @@ static inline tinfl_status tinfl_decompress(tinfl_decompressor *s,const unsigned
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-int fail;
+int fail,fail_block;
 static unsigned painted;
 static bool capture;
 static uint8_t actual[192*192];
@@ -58,9 +59,22 @@ static uint8_t raster[684*384];
 void epd_draw_pixel(int x,int y,uint8_t color,uint8_t *fb){(void)fb;painted++;if(preview){assert(x>=0&&x<684&&y>=0&&y<384);raster[y*684+x]=(color>>4)*17;}if(capture){assert(x>=0&&x<192&&y>=0&&y<192);assert(color==0);actual[y*192+x]=1;}}
 int main(void){
  uint8_t record[77],fb=0;
- fail=1;assert(!ui_hanzi_get(TEST_CP,record));fail=0;
- assert(ui_hanzi_get(TEST_CP,record));assert(!ui_hanzi_get(0x10ffff,record));
  static const uint16_t cps[]={CPS};
+ fail=1;assert(!ui_hanzi_get(TEST_CP,record));fail=0;
+ // 只让解码块分配失败，位图仍可分配，验证不会留下 .notdef。
+ // Fail only the decode buffer allocation, leaving bitmap allocations available; do not retain .notdef.
+ bool recovered=false;
+ for(unsigned i=0;i<sizeof(cps)/sizeof(cps[0]);i++){
+  char utf[4]={0xe0|(cps[i]>>12),0x80|((cps[i]>>6)&63),0x80|(cps[i]&63),0};
+  if(!ui_font_title_uses_supplement(utf))continue;
+  painted=0;fail_block=1;
+  ui_font_draw_title_px(&fb,100,100,24,utf,EPD_DRAW_ALIGN_LEFT);assert(painted==0);
+  fail_block=0;
+  ui_font_draw_title_px(&fb,100,100,24,utf,EPD_DRAW_ALIGN_LEFT);assert(painted>0);
+  recovered=true;break;
+ }
+ assert(recovered);
+ assert(ui_hanzi_get(TEST_CP,record));assert(!ui_hanzi_get(0x10ffff,record));
  unsigned supplement_seen=0;
  for(unsigned i=0;i<sizeof(cps)/sizeof(cps[0]);i++){
   assert(ui_hanzi_has(cps[i])&&ui_hanzi_get(cps[i],record));

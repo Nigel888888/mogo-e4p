@@ -160,14 +160,12 @@ def main():
                 '<navPoint><navLabel><text>第二章 继续</text></navLabel><content src="../text/combined.xhtml#two"/></navPoint>'
                 '</navMap></ncx>')
         case('good_multianchor', multianchor)
-        def chapter_breaks(files, named=False, fallback=False, auxiliary=False, long_body=False, plain=False):
+        def chapter_breaks(files, named=False, fallback=False, auxiliary=False, long_body=False):
             files['OPS/pkg/book.opf'] = ('<package><manifest>'
                 '<item id="body" href="../text/combined.xhtml" media-type="application/xhtml+xml"/>'
                 '<item id="toc" href="../toc/book.ncx" media-type="application/x-dtbncx+xml"/>'
                 '</manifest><spine toc="toc"><itemref idref="body"/></spine></package>')
             first, second = ('出发', '归来') if named else ('第一章 起点', '第2章 第二站')
-            first_tag = 'p style="text-align:center"' if plain else 'h1'
-            close_tag = 'p' if plain else 'h1'
             files['OPS/text/combined.xhtml'] = (
                 '<html><body' + (' epub:type="copyright"' if auxiliary else '') + '>'
                 '<h1>作者信息</h1><p>出版社与版权资料</p>'
@@ -175,10 +173,10 @@ def main():
                 '<h1>目录</h1><p>第一章 假目录条目</p><p>第2章 假目录条目</p><p>目录说明</p>'
                 '<section role="doc-toc"><h2>第3章 容器中的目录</h2></section>'
                 '<p><a href="#one">第4章 目录链接</a></p>'
-                f'<{first_tag} id="one">{first}</{close_tag}><p>第一章正文内容。</p>'
+                f'<h1 id="one">{first}</h1><p>第一章正文内容。</p>'
                 '<h2>普通小节</h2><p>同一章节里的另一段正文。</p>'
                 '<p>第1章说到的人物并不是本章的标题</p>'
-                f'<{first_tag} id="two">{second}</{close_tag}><p>第二章正文内容。</p></body></html>')
+                f'<h1 id="two">{second}</h1><p>第二章正文内容。</p></body></html>')
             files['OPS/toc/book.ncx'] = ('<ncx><navMap>'
                 f'<navPoint><navLabel><text>{first}</text></navLabel><content src="../text/combined.xhtml#one"/></navPoint>'
                 f'<navPoint><navLabel><text>{second}</text></navLabel><content src="../text/combined.xhtml#two"/></navPoint>'
@@ -191,7 +189,6 @@ def main():
                 files.pop('OPS/toc/book.ncx')
         case('good_chapter_breaks_numbered', chapter_breaks)
         case('good_chapter_breaks_named', lambda f: chapter_breaks(f, named=True))
-        case('good_chapter_breaks_plain', lambda f: chapter_breaks(f, plain=True))
         case('good_chapter_breaks_fallback', lambda f: chapter_breaks(f, fallback=True))
         case('good_chapter_breaks_auxiliary', lambda f: chapter_breaks(f, auxiliary=True))
         case('good_chapter_breaks_long_body', lambda f: chapter_breaks(f, fallback=True, long_body=True))

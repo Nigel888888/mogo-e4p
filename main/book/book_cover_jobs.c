@@ -78,13 +78,14 @@ static void prepare(cover_job_slot_t *job,unsigned generation) {
     uint8_t *bits=heap_caps_calloc(q->height,q->stride,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if(!bits){free(gray);return;}
     book_crop_t crop=book_cover_crop(sw,sh,q->width,q->height);
+    image_gray_axis_t xs=image_gray_axis(crop.width,q->width),ys=image_gray_axis(crop.height,q->height);
+    const uint8_t *window=gray+(size_t)crop.y*sw+crop.x;
     for(unsigned y=0;y<q->height;++y){
         if(!(y&15)&&!current(generation)){free(bits);free(gray);return;}
-        unsigned sy=crop.y+(uint64_t)y*crop.height/q->height;
+        image_gray_row_t row=image_gray_row(window,sw,ys,y);
         for(unsigned x=0;x<q->width;++x){
-            unsigned sx=crop.x+(uint64_t)x*crop.width/q->width;
-            uint8_t tone=contrast_gray(gray[(size_t)sy*sw+sx],q->contrast);
-            bool white=q->natural?ui_image_dither_bw(tone,x,y):ui_image_dither_cover_bw((tone>>4)*17u,q->x+x,q->y+y);
+            uint8_t tone=ui_image_cover_tone(image_gray_sample(row,xs,x),q->contrast);
+            bool white=ui_image_dither_bw(tone,q->natural?x:q->x+x,q->natural?y:q->y+y);
             if(white)bits[(size_t)y*q->stride+x/8]|=1u<<(x&7);
         }
     }

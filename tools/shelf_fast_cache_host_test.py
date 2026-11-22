@@ -27,6 +27,7 @@ def function(name, path):
 book = ROOT / 'main/apps/app_book.c'
 unit = r'''
 #include <assert.h>
+#include "''' + str(ROOT/'main/image/image_decode.h') + r'''"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -108,11 +109,13 @@ static void verify_bitmap(int row) {
     int image_x=card.x+(card.width-164)/2,image_y=card.y;
     book_crop_t crop=book_cover_crop(176,240,164,214);
     assert(fast_cover_matches(row,(EpdRect){image_x,image_y,164,214}));
+    uint8_t source[176*240];
+    for(unsigned i=0;i<sizeof(source);++i)source[i]=source_pixel(row,i);
+    const image_gray_axis_t xs=image_gray_axis(crop.width,164),ys=image_gray_axis(crop.height,214);
     for(int y=0;y<214;++y)for(int x=0;x<164;++x) {
-        unsigned sx=crop.x+(uint64_t)(unsigned)x*crop.width/164;
-        unsigned sy=crop.y+(uint64_t)(unsigned)y*crop.height/214;
-        uint8_t tone=(ui_contrast_gray(source_pixel(row,sy*176+sx))>>4)*17u;
-        int expected=ui_image_dither_cover_bw(tone,image_x+x,image_y+y)!=0;
+        const image_gray_row_t samples=image_gray_row(source+crop.y*176+crop.x,176,ys,y);
+        uint8_t tone=ui_image_cover_tone(image_gray_sample(samples,xs,x),contrast);
+        int expected=ui_image_dither_bw(tone,image_x+x,image_y+y)!=0;
         assert(!!(s_covers[row].fast_bits[y*21+x/8]&(1u<<(x&7)))==expected);
     }
     assert(fast_cover_matches(row,(EpdRect){image_x,image_y-16,164,214}));
@@ -153,15 +156,14 @@ int main(void) {
     fast=true;for(int i=0;i<9;++i)seed_gray(i);prepare_fast_covers();s_view=MANAGE;prepare_fast_covers();assert(!allocated_bytes);
     s_view=SHELF;for(int i=0;i<9;++i)seed_gray(i);prepare_fast_covers();invalidate_covers();assert(!allocated_bytes);
     for(int row=0;row<13;++row)assert(!s_covers[row].gray && !s_covers[row].fast_bits && s_covers[row].index==-1);
-    // 快刷封面白底纯白，黑区少量白点；字形与收藏在缓存之外绘制。
-    // Pure white cover backgrounds remain white, while solid blacks contain sparse white dots; glyphs and favorites are outside the cache.
+    // 快刷保持黑白端点，中间调多保留黑点。/ Fast covers preserve the endpoints and retain more black dots in midtones.
     int black=0,midgray=0;
     for(int y=0;y<4;++y)for(int x=0;x<4;++x){
-        assert(ui_image_dither_cover_bw((ui_contrast_gray(255)>>4)*17u,x,y)==255);
-        black+=ui_image_dither_cover_bw(0,x,y)==0;
-        midgray+=ui_image_dither_cover_bw(128,x,y)==0;
+        assert(ui_image_dither_bw(ui_image_cover_tone(255,100),x,y)==255);
+        black+=ui_image_dither_bw(ui_image_cover_tone(0,100),x,y)==0;
+        midgray+=ui_image_dither_bw(ui_image_cover_tone(128,100),x,y)==0;
     }
-    assert(black==15 && midgray==8);
+    assert(black==16 && midgray==9);
     invalidate_covers();style=5;rows=4;
     for(int i=0;i<4;++i){seed_gray(i);s_covers[i].width=i==0?176:i==1?70:160;s_covers[i].height=i==0?100:i==1?240:160;}
     prepare_fast_covers();assert(allocated_bytes==4u*4494);

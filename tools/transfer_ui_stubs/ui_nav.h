@@ -3,6 +3,7 @@
 #include "../../main/ui/ui_nav_layout.h"
 #define UI_KEY_1 1
 #define UI_KEY_2 2
+#define UI_KEY_3 3
 
 static inline void ui_nav_draw(uint8_t *fb, int active) { (void)fb; (void)active; }
 static inline void ui_nav_status(uint8_t *fb) { (void)fb; }

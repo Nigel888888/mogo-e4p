@@ -35,6 +35,7 @@ size_t heap_caps_get_largest_free_block(int);
  assets+=f'asm(".globl _binary_builtin_ttf_end\\n.set _binary_builtin_ttf_end, _binary_builtin_ttf_start + {len(builtin)}");\n';(p/'assets.c').write_text(assets)
  unit=r'''
 #include <assert.h>
+#include "''' + str(ROOT/'main/image/image_decode.h') + r'''"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +64,7 @@ typedef struct {uint16_t x,y;} Coord_xy;
 #define UI_GRAY_BLACK 0
 #define UI_GRAY_LIGHT 192
 static uint8_t ui_contrast_gray(uint8_t gray){return gray;}
+static uint8_t app_settings_system_contrast(void){return 100;}
 '''
  unit+=function('ui_control_gray',ROOT/'main/ui/ui_kit.h')+'\n'
  for n in ('_rotate','epd_draw_pixel','epd_get_pixel','epd_draw_hline','epd_draw_vline','epd_fill_rect','epd_draw_circle','epd_fill_circle_helper','epd_fill_circle','epd_write_line','epd_draw_line'):
@@ -73,6 +75,10 @@ static uint8_t ui_contrast_gray(uint8_t gray){return gray;}
  unit+=function('book_cover_crop',ROOT/'main/image/image_decode.c')+'\n'
  unit+=r'''
 #include "ui_image_dither.h"
+#include "assets/ui_icons.h"
+void ui_draw_icon(uint8_t *fb,int x,int y,int px,ui_icon_t icon,uint8_t ink){
+    assert(icon==UI_ICON_BOOK_OPEN&&px==42);epd_draw_pixel(x,y,ink,fb);
+}
 #define BOOK_COVER_W 176
 #define BOOK_COVER_H 240
 static int s_view=0,style=5,s_pressed_control=-1;

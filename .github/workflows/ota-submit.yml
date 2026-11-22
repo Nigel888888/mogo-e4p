@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
       - name: Validate version tag
         shell: bash
         run: |
@@ -46,11 +46,25 @@ jobs:
         run: python3 tools/prepare_platform_submission.py --check-notes
       - name: Build production firmware for ESP32-S31
         shell: bash
+        env:
+          MOGO_CLOUDZAO_INTEGRATION_ID: ${{ secrets.MOGO_CLOUDZAO_INTEGRATION_ID }}
         run: |
           . "$IDF_PATH/export.sh"
-          idf.py --preview set-target esp32s31
-          idf.py --preview build
+          idf.py --preview -D MOGO_PUBLIC_RELEASE=ON set-target esp32s31
+          idf.py --preview -D MOGO_PUBLIC_RELEASE=ON build
           idf.py --preview size
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          integration_id = os.environ['MOGO_CLOUDZAO_INTEGRATION_ID'].encode()
+          if not integration_id or integration_id + b'\0' not in Path('build/Read_Pico.bin').read_bytes():
+              raise SystemExit('Release image is missing the CloudZao integration ID')
+          for path in [Path('sdkconfig'), Path('build/project_description.json'),
+                       Path('build/compile_commands.json'), *Path('build/config').rglob('*')]:
+              if path.is_file() and integration_id in path.read_bytes():
+                  raise SystemExit('CloudZao integration ID found in release configuration metadata')
+          PY
       - name: Verify LGPL relinking inputs
         shell: bash
         run: |
@@ -110,7 +124,7 @@ jobs:
           python3 tools/vertical_punctuation_host_test.py
           python3 tools/vertical_number_host_test.py
           python3 tools/test_platform_submission.py
-          cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-omit-frame-pointer -Imain/book -Imain -Itools/book_layout_stubs -Itools/book_source_host_stubs tools/book_layout_host_test.c main/book/reader_session.c main/book/book_layout.c main/book/html_text.c -o build/book-tests/layout
+          cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-omit-frame-pointer -Imain/book -Imain -Itools/book_layout_stubs -Itools/book_source_host_stubs tools/book_layout_host_test.c main/book/reader_session.c main/book/book_layout.c main/book/book_hyphen_en.c main/book/html_text.c -o build/book-tests/layout
           build/book-tests/layout
       - name: Verify and prepare submission
         shell: bash

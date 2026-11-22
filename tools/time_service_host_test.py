@@ -63,6 +63,8 @@ int main(void){
 }
 '''
 scheduler=common+r'''
+#include "memory_peak.h"
+#define ESP_ERR_NO_MEM 0x101
 typedef int nvs_handle_t;
 enum {WIFI_TRANSFER_STOPPED,WIFI_TRANSFER_STARTING,WIFI_TRANSFER_READY,WIFI_TRANSFER_UPLOADING,WIFI_TRANSFER_ERROR};
 enum {WIFI_TRANSFER_MODE_AP,WIFI_TRANSFER_MODE_STA};
@@ -96,7 +98,8 @@ static void wifi_transfer_get_status(wifi_transfer_status_t *s){event('S');*s=ne
 static int wifi_transfer_get_saved_wifi(char *s,bool *b){*s=0;++credential_reads;*b=creds;return ESP_OK;}
 static int wifi_transfer_sync_time_auto(uint32_t *v){*v=wall;if(!worker_result)pending=wall;return worker_result;}
 static int wifi_transfer_sync_time(uint32_t *v);
-static int network_service_sync_time(uint32_t *v,bool automatic){
+static int network_service_sync_time(uint32_t *v,bool automatic,bool (*cancelled)(void)){
+ assert(cancelled && !cancelled());
  if (!automatic) return wifi_transfer_sync_time(v);
  if (network.mode == WIFI_TRANSFER_MODE_AP) return ESP_ERR_INVALID_STATE;
  if (network.state == WIFI_TRANSFER_STOPPED) {
@@ -141,9 +144,20 @@ scheduler+=r'''
 static void reset(void){
  manual_trace=false;manual_event_count=0;manual_events[0]=0;
  manual_error=write_error=read_error=pmu_offset=0;pmu_absent=false;the_pmu.time_synced=true;written_utc=0;
+ s_manual_result_ready=false;atomic_store(&s_manual_network_done,false);
  s_loaded=false;s_last_sync=0;s_next_attempt_us=15000000;s_boot_attempts=0;atomic_store(&s_running,false);
  stored=pending=jobs=pmu_syncs=saves=credential_reads=worker_result=record_saves=0;s_last_record=0;task_ok=1;creds=true;mono=15000000;
  network=(wifi_transfer_status_t){WIFI_TRANSFER_STOPPED,WIFI_TRANSFER_MODE_STA,false};
+}
+static app_time_sync_result_t complete_manual(void){
+ app_time_sync_result_t r;
+ assert(app_time_service_start_manual()==ESP_OK&&app_time_service_busy());
+ assert(!app_time_service_take_manual_result(&r)&&!manual_event_count);
+ assert(app_time_service_start_manual()==MEMORY_PEAK_BUSY&&jobs==1);
+ job(NULL);assert(!app_time_service_busy()&&!record_saves&&!written_utc&&!strcmp(manual_events,"N"));
+ assert(app_time_service_take_manual_result(&r));
+ app_time_sync_result_t unused;assert(!app_time_service_take_manual_result(&unused));
+ return r;
 }
 int main(void){
  reset();app_time_service_poll(false);assert(!jobs&&!s_loaded);app_time_service_poll(true);assert(jobs==1);
@@ -170,22 +184,32 @@ int main(void){
  // 保留部分成功、写入/回读顺序、十秒容差和当前主机秒数，不回写网络旧秒数。
  // Retain partial success, write/read ordering, ten-second tolerance and current host time rather than stale network seconds.
  for(int error=ESP_FAIL;error<=ESP_ERR_NOT_FOUND;++error){
-  reset();manual_trace=true;manual_error=error;app_time_sync_result_t r=app_time_service_sync_manual();
+  reset();manual_trace=true;manual_error=error;app_time_sync_result_t r=complete_manual();
   assert(r.error==error&&!r.network_time_received&&!record_saves&&!saves&&!written_utc&&!strcmp(manual_events,"N"));
  }
- reset();manual_trace=true;write_error=ESP_FAIL;app_time_sync_result_t r=app_time_service_sync_manual();
+ reset();manual_trace=true;write_error=ESP_FAIL;app_time_sync_result_t r=complete_manual();
  assert(r.error==ESP_FAIL&&r.network_time_received&&!record_saves&&!saves&&!strcmp(manual_events,"NW"));
- reset();manual_trace=true;read_error=ESP_ERR_TIMEOUT;r=app_time_service_sync_manual();
+ reset();manual_trace=true;read_error=ESP_ERR_TIMEOUT;r=complete_manual();
  assert(r.error==ESP_ERR_TIMEOUT&&r.network_time_received&&!record_saves&&!saves&&!strcmp(manual_events,"NWR"));
  for(int fault=0;fault<4;++fault){
   reset();manual_trace=true;pmu_absent=fault==0;the_pmu.time_synced=fault!=1;pmu_offset=fault==2?-1:fault==3?11:0;
-  r=app_time_service_sync_manual();assert(r.error==ESP_ERR_INVALID_RESPONSE&&r.network_time_received&&!record_saves&&!saves&&!strcmp(manual_events,"NWRP"));
+  r=complete_manual();assert(r.error==ESP_ERR_INVALID_RESPONSE&&r.network_time_received&&!record_saves&&!saves&&!strcmp(manual_events,"NWRP"));
  }
  for(int offset=0;offset<=10;offset+=10){
-  reset();manual_trace=true;pmu_offset=offset;s_boot_attempts=3;r=app_time_service_sync_manual();
+  reset();manual_trace=true;pmu_offset=offset;s_boot_attempts=3;r=complete_manual();
   assert(r.error==ESP_OK&&r.network_time_received&&record_saves==1&&saves==1&&s_last_record==(uint32_t)wall&&stored==(uint32_t)wall);
   assert(!s_boot_attempts&&s_next_attempt_us==mono+CLOCK_RETRY_US&&!strcmp(manual_events,"NWRPLOVCX"));
  }
+ reset();task_ok=0;
+ assert(app_time_service_start_manual()==ESP_ERR_NO_MEM&&!app_time_service_busy());
+ reset();manual_trace=true;
+ assert(app_time_service_start_manual()==ESP_OK);
+ app_time_service_cancel();job(NULL);
+ assert(app_time_service_take_manual_result(&r)&&r.error==ESP_ERR_INVALID_STATE&&!r.network_time_received&&!manual_event_count);
+ reset();s_auto=false;assert(app_time_service_start_manual()==ESP_OK);job(NULL);
+ assert(!record_saves&&!written_utc);
+ app_time_service_poll(true);assert(record_saves==1&&written_utc==(uint32_t)wall);
+ assert(app_time_service_take_manual_result(&r)&&r.error==ESP_OK);
  puts("PASS: manual sync preserves partial network success, fresh host seconds, PMU write/read validation and success-only NVS bookkeeping");
  puts("PASS: actual scheduler on a flat six-hour cadence (online link reused, offline dialed), the settings last-sync record refreshed on every success, idle gating, single temporary worker, AP/upload exclusion, no-credential/OOM/error backoff and real-sync-only PMU/NVS handoff");
 }
@@ -201,14 +225,16 @@ static esp_err_t sync_time_impl(uint32_t *utc){assert(s_time_active&&s_config_bu
 static esp_err_t sync_time_online_impl(uint32_t *utc){return sync_time_impl(utc);}
 '''+function('sync_time_run',root/'components/wifi_transfer/wifi_transfer.c')+r'''
 int main(void){uint32_t utc;
- assert(sync_time_run(NULL,false,true)==ESP_ERR_INVALID_ARG);
- assert(sync_time_run(&utc,false,true)==ESP_OK&&impl_calls==1&&s_time_pending_utc==wall);
+ assert(sync_time_run(NULL,false,true,true)==ESP_ERR_INVALID_ARG);
+ assert(sync_time_run(&utc,false,true,true)==ESP_OK&&impl_calls==1&&s_time_pending_utc==wall);
  assert(!s_time_active&&!s_config_busy);
- s_config_busy=true;assert(sync_time_run(&utc,false,true)==ESP_ERR_INVALID_STATE&&impl_calls==1);s_config_busy=false;
- s_time_active=true;assert(sync_time_run(&utc,true,true)==ESP_ERR_INVALID_STATE);assert(sync_time_run(&utc,false,false)==ESP_ERR_INVALID_STATE);s_time_active=false;
- s_time_pending_utc=0;impl_result=ESP_FAIL;assert(sync_time_run(&utc,true,false)==ESP_FAIL&&!s_time_pending_utc&&!s_time_active&&!s_config_busy);
- s_stopping=true;s_status.state=WIFI_TRANSFER_READY;assert(sync_time_run(&utc,false,true)==ESP_ERR_INVALID_STATE);
- s_status.state=WIFI_TRANSFER_STOPPED;assert(sync_time_run(&utc,false,true)==ESP_FAIL);
+ s_config_busy=true;assert(sync_time_run(&utc,false,true,true)==ESP_ERR_INVALID_STATE&&impl_calls==1);s_config_busy=false;
+ s_time_active=true;assert(sync_time_run(&utc,true,true,true)==ESP_ERR_INVALID_STATE);assert(sync_time_run(&utc,false,false,true)==ESP_ERR_INVALID_STATE);s_time_active=false;
+ s_time_pending_utc=0;impl_result=ESP_FAIL;assert(sync_time_run(&utc,true,false,true)==ESP_FAIL&&!s_time_pending_utc&&!s_time_active&&!s_config_busy);
+ s_stopping=true;s_status.state=WIFI_TRANSFER_READY;assert(sync_time_run(&utc,false,true,true)==ESP_ERR_INVALID_STATE);
+ s_status.state=WIFI_TRANSFER_STOPPED;assert(sync_time_run(&utc,false,true,true)==ESP_FAIL);
+ s_stopping=false;impl_result=ESP_OK; s_time_pending_utc=0;
+ assert(sync_time_run(&utc,true,true,false)==ESP_OK&&utc==wall&&!s_time_pending_utc);
  puts("PASS: SNTP/config share one admission lock; active operations cannot be reentered, failed work publishes no success, stopped network can calibrate");
 }
 '''
@@ -235,7 +261,8 @@ int main(void){uint32_t utc=0;
 }
 '''
 with tempfile.TemporaryDirectory(prefix='kiiko-clock-test-',dir='/private/tmp') as folder:
+ (Path(folder)/'esp_err.h').write_text('#pragma once\n')
  for name,unit in [('restore',restore),('scheduler',scheduler),('lease',lease),('ntp',ntp)]:
   c=Path(folder)/(name+'.c');binary=Path(folder)/name;c.write_text(unit)
-  subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-g','-fsanitize=address,undefined',str(c),'-o',str(binary)],check=True)
+  subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-g','-fsanitize=address,undefined','-I'+folder,str(c),'-o',str(binary)],check=True)
   subprocess.run([str(binary)],check=True)

@@ -110,17 +110,18 @@ int main(void) {
     assert(commits > 0);
     present=false;memset(&durable,0,sizeof(durable));pico_boot_init(false);pico_boot_ready();
     strcpy(resume.path,"/sdcard/books/deep.epub");
-    assert(pico_boot_save_resume(&resume)==ESP_OK&&pico_boot_mark_frame_cached()==ESP_OK);
-    pico_boot_init(false);assert(pico_boot_has_resume()&&pico_boot_resume_frame_cached());
-    assert(durable.reserved[0]==0&&!durable.resume_valid);
-    assert(pico_boot_take_resume(&out)&&!pico_boot_resume_frame_cached());pico_boot_ready();
-    assert(pico_boot_save_resume(&resume)==ESP_OK);fail_commit=true;
-    assert(pico_boot_mark_frame_cached()==ESP_FAIL);fail_commit=false;
-    pico_boot_init(false);assert(pico_boot_has_resume()&&!pico_boot_resume_frame_cached());
-    pico_boot_ready();assert(pico_boot_take_resume(&out));
+    assert(pico_boot_save_resume(&resume)==ESP_OK);
+    // 模拟旧固件标记锁屏缓存，但仍应正常消费续读检查点。
+    // Simulate the old firmware's lock-cache flag; the reader checkpoint must still be consumed.
+    durable_raw[offsetof(boot_packed_header_t,frame)]=1;
+    uint32_t old_checksum=packed_checksum(durable_raw,durable_size);
+    memcpy(durable_raw+offsetof(boot_packed_header_t,checksum),&old_checksum,sizeof(old_checksum));
+    pico_boot_init(false);assert(pico_boot_has_resume()&&!pico_boot_recovery());
+    assert(!durable_raw[offsetof(boot_packed_header_t,frame)]&&!durable.resume_valid);
+    assert(pico_boot_take_resume(&out)&&!strcmp(out.path,resume.path));pico_boot_ready();
     // 紧凑记录迁移旧格式，非图书缓存不再隔离；真实 EPUB 中断仍拦截。
     // Migrate legacy records and ignore non-book cache entries while retaining EPUB quarantine.
-    boot_record_t legacy={.resume_valid=1,.resume={.tab=1,.reader=1,.fullscreen=1,.path="/sdcard/books/deep.epub"}};
+    boot_record_t legacy={.resume_valid=1,.reserved={1,0},.resume={.tab=1,.reader=1,.fullscreen=1,.path="/sdcard/books/deep.epub"}};
     seed_legacy(legacy);pico_boot_init(false);
     assert(pico_boot_take_resume(&out)&&!strcmp(out.path,legacy.resume.path));
     assert(durable_size<128);pico_boot_ready();

@@ -4,7 +4,7 @@
  * English: Stub BLE/settings/network services; Python compiles the real controller and native drawing.
  */
 #include <strings.h>
-static bool enabled, running, connected, connecting, scanning, wifi_busy, save_error, scan_error;
+static bool enabled, running, connected, connecting, scanning, wifi_busy, cellular_busy, save_error, scan_error;
 static int connect_error, bind_error, mutations, scan_starts, scan_stops, disconnects, connects, forgets, binds, learn_begins;
 static int failure_resets, recent_cancels, raw_count, raw_at, key_count;
 static char address[18], peer_name[32], target[18], forgotten[18], failure[96];
@@ -13,9 +13,10 @@ static ble_pt_device_t devices[BLE_PT_MAX_DEVICES];
 static ble_pt_raw_t reports[8];
 static uint8_t bond_count, device_count;
 static bool bindings[2];
-enum {WIFI_TRANSFER_STOPPED, WIFI_TRANSFER_ACTIVE};
-typedef struct {int state;} wifi_transfer_status_t;
-static void wifi_transfer_get_status(wifi_transfer_status_t *out){out->state=wifi_busy?WIFI_TRANSFER_ACTIVE:WIFI_TRANSFER_STOPPED;}
+static const char *enable_block;
+bool ble_pt_cellular_paused(void){return cellular_busy;}
+bool ble_pt_network_paused(void){return wifi_busy || cellular_busy;}
+const char *ble_pt_enable_block_reason(void){return cellular_busy ? "4G 使用中，请先关闭移动网络" : wifi_busy ? "Wi-Fi 使用中，请先结束 Wi-Fi" : enable_block;}
 static bool app_settings_ble_turner(void){return enabled;}
 static void app_settings_set_ble_turner(bool value){++mutations;if(!save_error)enabled=value;}
 bool ble_pt_running(void){return running;}
@@ -64,7 +65,8 @@ static void seed_devices(int n){
 }
 static void link_peer(int i){connected=true;connecting=false;snprintf(address,sizeof(address),"%s",bonds[i].addr);snprintf(peer_name,sizeof(peer_name),"%s",bonds[i].name);}
 static void reset(void){
-    enabled=running=true;connected=connecting=scanning=wifi_busy=save_error=scan_error=false;
+    enabled=running=true;connected=connecting=scanning=wifi_busy=cellular_busy=save_error=scan_error=false;
+    enable_block=NULL;
     connect_error=bind_error=mutations=scan_starts=scan_stops=disconnects=connects=forgets=binds=learn_begins=0;
     failure_resets=recent_cancels=raw_count=raw_at=key_count=device_count=0;
     address[0]=peer_name[0]=target[0]=forgotten[0]=failure[0]=0;memset(bindings,0,sizeof(bindings));
@@ -80,6 +82,15 @@ static void check_workflows(void){
     assert(!failure_resets);save_error=false;assert(press(CONTROL_TOGGLE)&&!enabled&&bond_count==3&&failure_resets==1&&recent_cancels==1);
     assert(!press(CONTROL_ADD)&&!press(CONTROL_LEARN_PREV));assert(press(CONTROL_TOGGLE)&&enabled&&failure_resets==1);
     wifi_busy=true;assert(settings_bluetooth_tick(20));assert(!press(CONTROL_ADD));
+    assert(press(CONTROL_TOGGLE)&&!enabled&&failure_resets==2&&recent_cancels==2);
+    int writes=mutations;
+    assert(press(CONTROL_TOGGLE)&&!enabled&&mutations==writes&&strstr(s_ble_notice,"Wi-Fi 使用中"));
+    wifi_busy=false;cellular_busy=true;
+    assert(press(CONTROL_TOGGLE)&&!enabled&&mutations==writes&&strstr(s_ble_notice,"4G 使用中"));
+    cellular_busy=false;enable_block="可用内存不足，请稍后重试";
+    assert(press(CONTROL_TOGGLE)&&!enabled&&mutations==writes&&strstr(s_ble_notice,"内存不足"));
+    enable_block=NULL;
+    assert(press(CONTROL_TOGGLE)&&enabled&&mutations==writes+1&&!s_ble_notice[0]);
 
     reset();link_peer(0);settings_bluetooth_tick(1);assert(press(CONTROL_ADD)&&s_view==BLE_SCAN_CONFIRM&&!disconnects&&!scan_starts);
     assert(press(CONTROL_CANCEL)&&s_view==BLE_HOME&&!disconnects);

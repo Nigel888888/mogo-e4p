@@ -2,19 +2,22 @@
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
  *
- * 出厂 VCOM 标定。PMU 未标定时拦住开机；数字区跟随 DU，三位凑齐进确认页再写。
+ * 出厂 VCOM 标定。未标定时拦住开机；数字区跟随 DU，三位凑齐进确认页再写。
+ * S31 后端保存至 ESP NVS panel/vcom，产品页不提供修改入口。
  *
- * Factory VCOM calibration. Gates boot when the PMU is unset; the number band
- * uses FOLLOW DU; three digits go to the confirm page, then write.
+ * Factory VCOM calibration. Gates boot when unset; the number band uses
+ * FOLLOW DU; three digits go to the confirm page, then write. The S31 backend
+ * saves to ESP NVS panel/vcom; product pages provide no editing entry.
  *
  * 冻结：副标题不写范围；数字只刷上方一块 FOLLOW DU；三位合法自动进确认；
- * 确认页 168px 大号 + mV；写入失败留在确认页；不写 ESP NVS。
+ * 确认页 168px 大号 + mV；写入失败留在确认页；仅经后端接口保存出厂标定。
  * Frozen: subtitle has no range; the number band uses FOLLOW DU only;
  * three valid digits go to confirm automatically; confirm page is 168px plus mV;
- * write failure stays on confirm; do not write ESP NVS.
+ * write failure stays on confirm; save factory calibration only through the backend API.
  */
 
 #include "vcom_setup.h"
+#include "display_orientation.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -281,6 +284,7 @@ void vcom_setup_run(EpdiyHighlevelState* hl, uint8_t* fb, cst836u_handle_t tp) {
             continue;
         }
 
+        if (!display_orientation_touch(&touch.x, &touch.y)) continue;
         int hit = vcom_hit(&g, s.confirm, touch.x, touch.y);
         if (s.confirm) {
             if (hit == VCOM_HIT_BACK) {

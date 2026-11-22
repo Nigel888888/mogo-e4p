@@ -46,9 +46,10 @@ typedef struct {
 } e0470_trim_t;
 
 /// 按参数从 src 派生一张表写进 dst_data，容量至少要 src->phases 相。返回新相数，
-/// 参数不合法返回 0。src 可以是 GC16 也可以是 GL16，骨架一样。
+/// 参数不合法返回 0 且不写目标。src 可以是 GC16 或 GL16；源/目标可完全同址或互不重叠。
 /// / Derive a table from src into dst_data (at least src->phases). Returns
-/// the new phase count, or 0 on bad args. src may be GC16 or GL16; same skeleton.
+/// the new phase count, or 0 without writing on bad args. src may be GC16 or GL16;
+/// source and destination may share the same base address or be disjoint.
 int e0470_waveform_trim(
     const EpdWaveformPhases* src, const e0470_trim_t* trim, uint8_t (*dst_data)[16][4]
 );

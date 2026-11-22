@@ -18,6 +18,11 @@
 static book_txt_t s_book;
 static book_epub_t *s_epub;
 static book_mobi_t *s_mobi;
+size_t book_open_min_psram_block(const char *path) {
+    const char *ext = path ? strrchr(path, '.') : NULL;
+    return ext && !strcasecmp(ext, ".txt") ? sizeof(book_entry_t) * BOOK_CHAPTER_MAX : 0;
+}
+
 esp_err_t book_open(const char *path) {
     book_close();
     if (!path || !*path) return ESP_ERR_INVALID_ARG;
@@ -89,8 +94,7 @@ esp_err_t book_chapter_load_blocks(size_t i, html_text_t *out) {
     memset(out, 0, sizeof(*out));
     if (s_mobi) return book_mobi_load_target(s_mobi, i, NULL, SIZE_MAX, NULL, out);
     if (s_epub) return book_epub_load(s_epub, i, out);
-    if (!s_book.file || i >= s_book.count) return ESP_ERR_INVALID_ARG;
-    return book_txt_load_blocks(&s_book, i, out);
+    return book_chapter_load(i, &out->utf8, &out->len);
 }
 esp_err_t book_chapter_load_blocks_anchor(size_t i, const char *anchor,
                                            size_t *anchor_offset, html_text_t *out) {

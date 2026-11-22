@@ -58,6 +58,7 @@ public:
     struct BufferPoolConfig {
         size_t buffer_count;        // Number of buffers in pool / 池中缓冲区数量
         size_t buffer_size;         // Size of each buffer / 每个缓冲区大小
+        bool prefer_psram;          // 支持时优先使用外存承载数据 / Prefer external payloads when supported
     };
 
     // Configuration structure
@@ -145,7 +146,7 @@ private:
 
     // Re-mount all buffers and restart DMA (used for initial start and overflow recovery)
     // flush_uart_fifo: if true, flush UART RX FIFO before restarting (for overflow recovery)
-    void RemountAndRestartDma(bool flush_uart_fifo = false);
+    esp_err_t RemountAndRestartDma(bool flush_uart_fifo = false);
 
 public:
     // Handle GDMA RX done callback (called from ISR)
@@ -174,6 +175,8 @@ private:
     size_t rx_buffer_size_{0};              // Size of each buffer
     uintptr_t rx_dma_link_head_addr_{0};    // DMA link list head address
     size_t rx_cache_line_{0};
+    size_t rx_payload_align_{0};
+    bool rx_payload_psram_{false};
     size_t rx_int_mem_align_{0};
     size_t rx_ext_mem_align_{0};
     std::atomic<bool> rx_running_{false};

@@ -12,13 +12,39 @@
 #include <time.h>
 static time_t wall_time;
 static time_t weather_test_time(time_t *out) {if(out)*out=wall_time;return wall_time;}
+#include "memory_peak.h"
+#undef memory_peak_try_begin
+#undef memory_peak_check
+#undef memory_peak_finish
+#define memory_peak_try_begin test_peak_begin
+#define memory_peak_check test_peak_check
+#define memory_peak_finish test_peak_finish
+static esp_err_t test_peak_begin(memory_peak_kind_t, memory_peak_token_t *);
+static esp_err_t test_peak_check(memory_peak_heap_t);
+static void test_peak_finish(memory_peak_token_t);
 #define time weather_test_time
 #include "../main/services/weather_service.c"
 #undef time
 static void (*pending)(void *);
+static void *worker_arg;
+static bool peak_held, peak_busy, time_busy;
+static esp_err_t peak_capacity;
+static esp_err_t test_peak_begin(memory_peak_kind_t kind, memory_peak_token_t *token) {
+    assert(kind == MEMORY_PEAK_WEATHER && !peak_held);
+    if (peak_busy) return MEMORY_PEAK_BUSY;
+    *token = 42; peak_held = true;
+    return ESP_OK;
+}
+static esp_err_t test_peak_check(memory_peak_heap_t need) {
+    assert(peak_held && need.internal_block == WEATHER_TASK_STACK_BYTES && need.psram_block == WEATHER_BODY_LIMIT + 1);
+    return peak_capacity;
+}
+static void test_peak_finish(memory_peak_token_t token) { assert(peak_held && token == 42); peak_held = false; }
 bool weather_test_cellular;
+unsigned weather_regular_acquires;
+network_use_t weather_last_use;
 static bool done,worker,flash,saved=true,fail_flash,fail_task,fail_alloc,cancel_read,cancel_connect,ota_busy,ble_connected;
-static unsigned starts,stops,requests,auto_calls,forecast_calls,search_calls,ns_writes,time_cancels;
+static unsigned starts,stops,requests,auto_calls,forecast_calls,search_calls,ns_writes;
 static int network_state,scenario;
 static int64_t monotonic;
 static unsigned pending_opens,header_calls;
@@ -40,6 +66,8 @@ static bool duplicate_date,cancel_forecast_read,incomplete_forecast;
 static int64_t forecast_progress_us;
 static unsigned char prefs_bytes[1024],cache_bytes[2048];
 static size_t prefs_size,cache_size;
+static unsigned worker_cache_writes;
+static bool cancel_before_lock;
 static pmu_snapshot_t battery={80};
 struct FakeHttp {
     const char *body,*date;size_t size,at;int status;char payload[WEATHER_BODY_LIMIT+1];
@@ -47,12 +75,17 @@ struct FakeHttp {
     int (*event_handler)(esp_http_client_event_t *);
     void *user_data;
 };
-static void run_worker(void) {assert(pending);void(*f)(void*)=pending;pending=NULL;worker=true;f(NULL);worker=false;}
+static void run_worker(void) {assert(pending);void(*f)(void*)=pending;pending=NULL;worker=true;f(worker_arg);worker=false;assert(!peak_held);}
 void *heap_caps_malloc(size_t n,int c){
     (void)c;if(fail_alloc||fail_alloc_after==0)return NULL;if(fail_alloc_after>0)--fail_alloc_after;
     void *p=malloc(n);if(p)++heap_allocs;return p;
 }
 void heap_caps_free(void *p){if(p){assert(heap_allocs);--heap_allocs;}free(p);}
+void *mm_alloc(mm_owner_t owner, mm_pool_t pool, size_t bytes, size_t align, size_t reserve) {
+    assert(peak_held && owner == MM_OWNER_NETWORK && pool == MM_POOL_PSRAM && !align && !reserve);
+    return heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+}
+bool mm_free(void *ptr) { heap_caps_free(ptr); return true; }
 SemaphoreHandle_t xSemaphoreCreateBinary(void){return (void*)1;}
 int xSemaphoreTake(SemaphoreHandle_t s,uint32_t wait){
     assert(s==(void*)1);if(wait&&pending)run_worker();
@@ -60,15 +93,19 @@ int xSemaphoreTake(SemaphoreHandle_t s,uint32_t wait){
 }
 int xSemaphoreGive(SemaphoreHandle_t s){assert(s==(void*)1&&!done);done=true;return pdTRUE;}
 int xTaskCreate(void(*f)(void*),const char*n,unsigned stack,void*a,unsigned p,void*t){
-    (void)n;(void)a;(void)p;(void)t;assert(stack==8192&&!pending);if(fail_task)return 0;pending=f;return pdPASS;
+    (void)n;(void)t;assert(stack==8192&&p==tskIDLE_PRIORITY&&!pending&&peak_held);if(fail_task)return 0;worker_arg=a;pending=f;return pdPASS;
 }
 void vTaskDelete(void *p){(void)p;}
-void vTaskDelay(unsigned ms){monotonic+=(int64_t)ms*1000;if(cancel_connect)atomic_store(&s_cancel,true);}
+void vTaskDelay(unsigned ms){monotonic+=(int64_t)ms*1000;if(cancel_connect)app_weather_cancel();}
 int64_t esp_timer_get_time(void){return monotonic;}
-bool epd_flash_begin(void){assert(!worker&&!flash);if(fail_flash)return false;flash=true;return true;}
+bool epd_flash_begin(void){
+    assert(!flash);if(fail_flash)return false;
+    if(worker&&cancel_before_lock)app_weather_cancel();
+    flash=true;return true;
+}
 void epd_flash_end(void){assert(flash);flash=false;}
 esp_err_t nvs_open(const char *ns,int mode,nvs_handle_t *h){
-    assert(!strcmp(ns,"kiiko_weather"));if(mode==NVS_READWRITE)assert(flash&&!worker);*h=1;return ESP_OK;
+    assert(!strcmp(ns,"kiiko_weather"));if(mode==NVS_READWRITE)assert(flash);*h=1;return ESP_OK;
 }
 void nvs_close(nvs_handle_t h){assert(h==1);}
 esp_err_t nvs_get_blob(nvs_handle_t h,const char *key,void *out,size_t *size){
@@ -77,15 +114,16 @@ esp_err_t nvs_get_blob(nvs_handle_t h,const char *key,void *out,size_t *size){
     if(!n||*size<n)return ESP_ERR_NVS_NOT_FOUND;memcpy(out,p,n);*size=n;return ESP_OK;
 }
 esp_err_t nvs_set_blob(nvs_handle_t h,const char *key,const void *v,size_t n){
-    assert(h==1&&flash&&!worker);++ns_writes;
+    assert(h==1&&flash);++ns_writes;
+    if(worker){assert(!strcmp(key,"cache"));++worker_cache_writes;}
     if(!strcmp(key,"prefs")){assert(n<=sizeof(prefs_bytes));memcpy(prefs_bytes,v,n);prefs_size=n;}
     else{assert(!strcmp(key,"cache")&&n<=sizeof(cache_bytes));memcpy(cache_bytes,v,n);cache_size=n;}return ESP_OK;
 }
-esp_err_t nvs_erase_key(nvs_handle_t h,const char *key){assert(h==1&&flash&&!worker&&!strcmp(key,"cache"));cache_size=0;return ESP_OK;}
-esp_err_t nvs_commit(nvs_handle_t h){assert(h==1&&flash&&!worker);return ESP_OK;}
+esp_err_t nvs_erase_key(nvs_handle_t h,const char *key){assert(h==1&&flash&&!strcmp(key,"cache"));cache_size=0;return ESP_OK;}
+esp_err_t nvs_commit(nvs_handle_t h){assert(h==1&&flash);return ESP_OK;}
 bool pico_online_busy(void){return ota_busy;}
 bool ble_pt_connected(void){return ble_connected;}
-void app_time_service_cancel(void){++time_cancels;}
+bool app_time_service_busy(void){return time_busy;}
 const pmu_snapshot_t *device_power_get(void){return &battery;}
 int pmu_battery_percent(const pmu_snapshot_t *p){return p->battery;}
 bool pmu_battery_charging(const pmu_snapshot_t *p){(void)p;return false;}
@@ -150,7 +188,7 @@ esp_err_t esp_http_client_set_header(esp_http_client_handle_t h,const char*k,con
 }
 esp_err_t esp_http_client_open(esp_http_client_handle_t h,int n){
     (void)h;assert(n==0);++open_calls;
-    if(cancel_http_connect){atomic_store(&s_cancel,true);return ESP_ERR_HTTP_EAGAIN;}
+    if(cancel_http_connect){app_weather_cancel();return ESP_ERR_HTTP_EAGAIN;}
     if(failed_opens){--failed_opens;return ESP_FAIL;}
     if(stall_http_connect)return ESP_ERR_HTTP_EAGAIN;
     if(pending_opens){--pending_opens;return ESP_ERR_HTTP_EAGAIN;}
@@ -159,7 +197,7 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t h,int n){
 esp_err_t esp_http_client_set_timeout_ms(esp_http_client_handle_t h,int ms){(void)h;assert(ms>0&&ms<=200);io_timeout_ms=ms;return ESP_OK;}
 int64_t esp_http_client_fetch_headers(esp_http_client_handle_t h){
     ++header_calls;
-    if(cancel_headers){atomic_store(&s_cancel,true);return -ESP_ERR_HTTP_EAGAIN;}
+    if(cancel_headers){app_weather_cancel();return -ESP_ERR_HTTP_EAGAIN;}
     if(fail_headers)return ESP_FAIL;
     if(header_eagain||stall_headers){if(header_eagain)--header_eagain;monotonic+=(int64_t)io_timeout_ms*1000;return -ESP_ERR_HTTP_EAGAIN;}
     if(!h->headers_sent&&h->date&&h->event_handler) {
@@ -174,9 +212,9 @@ int64_t esp_http_client_fetch_headers(esp_http_client_handle_t h){
 int esp_http_client_get_status_code(esp_http_client_handle_t h){return h->status;}
 int esp_http_client_read(esp_http_client_handle_t h,char *out,int size){
     ++body_reads;assert(size>0&&size<=512);
-    if(h->forecast&&cancel_forecast_read){atomic_store(&s_cancel,true);return -1;}
+    if(h->forecast&&cancel_forecast_read){app_weather_cancel();return -1;}
     if(h->forecast&&h->at&&incomplete_forecast)return 0;
-    if(cancel_read){atomic_store(&s_cancel,true);cancel_read=false;return -1;}
+    if(cancel_read){app_weather_cancel();cancel_read=false;return -1;}
     if(clear_during_read){app_weather_clear_search();clear_during_read=false;}
     if(body_eagain||stall_body){if(body_eagain)--body_eagain;monotonic+=(int64_t)io_timeout_ms*1000;return -ESP_ERR_HTTP_EAGAIN;}
     if(h->at&&fail_body)return ESP_FAIL;
@@ -190,7 +228,8 @@ esp_err_t esp_http_client_close(esp_http_client_handle_t h){(void)h;return ESP_O
 esp_err_t esp_http_client_cleanup(esp_http_client_handle_t h){free(h);return ESP_OK;}
 static void request(app_weather_request_t type,const char *query) {
     assert(app_weather_request(type,query)&&app_weather_busy());
-    run_worker();assert(!app_weather_busy());assert(app_weather_poll(false));assert(!pending&&!done);
+    run_worker();assert(!app_weather_busy());bool cancelled = atomic_load(&s_cancel);
+    assert(app_weather_poll(false)||cancelled);assert(!pending&&!done);
 }
 static void clock_setup(time_t device_time) {
     assert(!pending&&!s_pending&&!done&&!app_weather_busy());
@@ -282,7 +321,7 @@ static void weather_clocks(void) {
     monotonic+=1000000;assert(app_weather_poll(false));
     assert(weather_day_for(&s_view.forecast,app_weather_now(),false)->humidity==82);
     assert(!weather_day_for(&s_view.forecast,app_weather_now(),true));
-    monotonic+=WEATHER_RETRY_US;assert(app_weather_poll(true)&&pending);app_weather_cancel_join();
+    monotonic+=WEATHER_RETRY_US;assert(!app_weather_poll(true)&&pending);app_weather_cancel_join();
     free(midnight);forecast_override=NULL;
     unsigned writes=ns_writes;weather_cache_t cache;
     memcpy(&cache,cache_bytes,sizeof(cache));wall_time=cache.forecast.fetched-121;monotonic=0;
@@ -305,6 +344,18 @@ int main(void) {
     assert(s_view.has_city&&s_view.has_forecast&&auto_calls==1&&forecast_calls==1&&starts==stops);
     assert(cache_size&&prefs_size&&!flash);
     assert(app_weather_set_enabled(true));
+    // 有可用预报时自动刷新不重画加载态，回收结果也不落盘。
+    // A scheduled refresh with a usable forecast does not repaint loading or save on collection.
+    unsigned before_worker=worker_cache_writes, before_revision=s_view.revision;
+    assert(request_page(APP_WEATHER_FETCH,NULL,0,false)&&pending&&s_view.state==APP_WEATHER_READY);
+    assert(s_view.revision==before_revision);
+    run_worker();assert(worker_cache_writes==before_worker+1);
+    unsigned auto_writes=ns_writes;
+    assert(app_weather_poll(false)&&ns_writes==auto_writes);
+    assert(request_page(APP_WEATHER_FETCH,NULL,0,false)&&pending);
+    cancel_before_lock=true;run_worker();cancel_before_lock=false;
+    app_weather_poll(false);assert(ns_writes==auto_writes&&worker_cache_writes==before_worker+1);
+    request(APP_WEATHER_FETCH,NULL);
     const time_t base_time=wall_time;
     weather_forecast_t original_forecast=s_view.forecast;
     unsigned writes_before=ns_writes;
@@ -315,7 +366,7 @@ int main(void) {
     weather_preferences_t stored;memcpy(&stored,prefs_bytes,sizeof(stored));
     assert(stored.schema==3&&!stored.auto_refresh&&stored.has_city&&stored.enabled);
     s_view=(app_weather_view_t){0};s_loaded=false;app_weather_init();assert(!s_view.auto_refresh&&s_view.has_forecast);
-    wall_time=original_forecast.fetched+WEATHER_REFRESH_SECONDS;monotonic+=WEATHER_RETRY_US+1;
+    wall_time=original_forecast.fetched+WEATHER_MAX_AGE_SECONDS;monotonic+=WEATHER_RETRY_US+1;
     app_weather_poll(true);assert(!pending);
     wall_time=base_time;request(APP_WEATHER_FETCH,NULL);assert(!s_view.auto_refresh&&s_view.has_forecast);
     weather_location_t selected=s_view.city;
@@ -324,12 +375,16 @@ int main(void) {
     assert(app_weather_set_enabled(true)&&!s_view.auto_refresh);
     request(APP_WEATHER_FETCH,NULL);assert(!s_view.auto_refresh&&s_view.has_forecast);
     assert(app_weather_request(APP_WEATHER_FETCH,NULL));unsigned starts_before=starts;
-    assert(app_weather_set_auto_refresh(false)&&!pending&&!s_pending&&starts==starts_before);
+    assert(app_weather_set_auto_refresh(false)&&pending&&s_pending&&starts==starts_before);
+    run_worker();app_weather_poll(false);
+    assert(!pending&&!s_pending&&starts==starts_before);
     assert(app_weather_set_auto_refresh(true));
     s_view=(app_weather_view_t){0};s_loaded=false;app_weather_init();assert(s_view.auto_refresh&&s_view.has_forecast);
     wall_time=original_forecast.fetched+3601;monotonic+=WEATHER_RETRY_US+1;
     app_weather_poll(true);assert(!pending);
-    wall_time=original_forecast.fetched+WEATHER_REFRESH_SECONDS-1;app_weather_poll(true);assert(!pending);
+    s_view.forecast.serve = original_forecast.fetched + WEATHER_MAX_AGE_SECONDS;
+    wall_time=original_forecast.fetched+6*3600;app_weather_poll(true);assert(!pending);
+    wall_time=original_forecast.fetched+WEATHER_MAX_AGE_SECONDS-1;app_weather_poll(true);assert(!pending);
     wall_time++;app_weather_poll(false);assert(!pending);
     app_weather_poll(true);assert(pending);
     scenario=3;run_worker();app_weather_poll(true);assert(!pending&&s_view.state==APP_WEATHER_UNAVAILABLE);
@@ -365,14 +420,14 @@ int main(void) {
     scenario=1;request(APP_WEATHER_LOCATE,NULL);assert(s_view.state==APP_WEATHER_CITY_REQUIRED);
     monotonic+=WEATHER_RETRY_US+1;before=auto_calls;app_weather_poll(true);assert(!pending&&auto_calls==before);
     scenario=0;request(APP_WEATHER_SEARCH,"杭州");assert(s_view.result_count==8&&s_view.result_total==17&&search_calls==1);
-    unsigned paging_requests=requests,paging_starts=starts,paging_cancels=time_cancels,paging_writes=ns_writes;
+    unsigned paging_requests=requests,paging_starts=starts,paging_writes=ns_writes;
     ota_busy=ble_connected=true;battery.battery=5;wall_time=0;
     assert(app_weather_search("杭州",1)&&!pending&&!app_weather_busy());
     assert(s_view.result_page==1&&s_view.result_total==17&&s_view.result_count==8&&!strcmp(s_view.results[0].id,"101210109"));
     assert(app_weather_search("杭州",2)&&!pending&&s_view.result_count==1&&!strcmp(s_view.results[0].id,"101210117"));
     assert(app_weather_search("杭州",0)&&!pending&&s_view.result_count==8);
     assert(!app_weather_search("杭州",3)&&!pending);
-    assert(requests==paging_requests&&starts==paging_starts&&time_cancels==paging_cancels&&ns_writes==paging_writes);
+    assert(requests==paging_requests&&starts==paging_starts&&ns_writes==paging_writes);
     ota_busy=ble_connected=false;battery.battery=80;wall_time=base_time;
     search_total=41;request(APP_WEATHER_SEARCH,"杭州");paging_requests=requests;
     assert(app_weather_search("杭州",2)&&pending);run_worker();assert(app_weather_poll(false));
@@ -537,7 +592,81 @@ int main(void) {
     free(alphanumeric_forecast);alphanumeric_forecast=NULL;
     wall_time=0;assert(!app_weather_request(APP_WEATHER_FETCH,NULL));
     assert(!weather_day_for(&s_view.forecast,wall_time,false));
-    assert(starts==stops&&time_cancels>0&&!heap_allocs);
+    assert(starts==stops&&!heap_allocs);
+    clock_setup(weather_timestamp("2026-11-02T00:21:00Z"));
+    time_busy=true;
+    assert(!app_weather_poll(true)&&!pending&&s_next_attempt==WEATHER_DEFER_US);
+    time_busy=false; monotonic=s_next_attempt-1;
+    assert(!app_weather_poll(true)&&!pending);
+    peak_busy=true; ++monotonic;
+    assert(!app_weather_poll(true)&&!pending&&s_next_attempt==monotonic+WEATHER_DEFER_US);
+    peak_busy=false; peak_capacity=MEMORY_PEAK_FRAGMENT;
+    assert(!app_weather_request(APP_WEATHER_FETCH,NULL)&&!peak_held&&!pending);
+    peak_capacity=ESP_OK; fail_task=true;
+    assert(!app_weather_request(APP_WEATHER_FETCH,NULL)&&!peak_held&&!pending&&!app_weather_busy());
+    fail_task=false;
+    unsigned writes=ns_writes;
+    assert(app_weather_request(APP_WEATHER_FETCH,NULL)&&peak_held&&pending);
+    app_weather_cancel();
+    assert(pending&&app_weather_busy()&&s_view.state==APP_WEATHER_IDLE);
+    assert(app_weather_request(APP_WEATHER_FETCH,NULL)&&s_fetch_after_cancel);
+    run_worker();
+    assert(app_weather_poll(false)&&pending&&ns_writes==writes);
+    run_worker();assert(app_weather_poll(false)&&s_view.has_forecast&&ns_writes>writes);
+    assert(app_weather_request(APP_WEATHER_SEARCH,"杭州"));
+    run_worker();app_weather_reap_cancelled();
+    assert(s_pending && done && heap_allocs);
+    app_weather_cancel();
+    assert(!s_pending && !done && !heap_allocs);
+    assert(app_weather_request(APP_WEATHER_SEARCH,"杭州"));
+    app_weather_cancel();run_worker();
+    assert(s_pending && done && !app_weather_busy());
+    app_weather_reap_cancelled();
+    assert(!s_pending && !done && !heap_allocs);
     weather_clocks();
-    puts("PASS: weather proxy session, six-hour boundary, shorter expiry, midnight, toggle persistence, city-ID fetch, paginated search, no device relabeling, owned cleanup, cancellation, NVS main-only and resource guards");
+
+    clock_setup(base_time);
+    ble_connected=true; weather_test_cellular=true;
+    unsigned before_network=weather_regular_acquires;
+    requests_before=requests;
+    app_weather_poll(true); assert(!pending);
+    assert(!app_weather_request(APP_WEATHER_SEARCH,"上海") && !pending);
+    assert(!app_weather_request(APP_WEATHER_FETCH,NULL) && !pending);
+    assert(strstr(s_view.notice,"请先关闭蓝牙") && weather_regular_acquires==before_network);
+    ble_connected=false;
+    assert(app_weather_request(APP_WEATHER_FETCH,NULL) && pending);
+    ble_connected=true; run_worker(); assert(app_weather_poll(false));
+    assert(s_view.state==APP_WEATHER_UNAVAILABLE && weather_regular_acquires==before_network);
+    assert(requests==requests_before && !heap_allocs);
+    ble_connected=false; request(APP_WEATHER_FETCH,NULL);
+    assert(s_view.state==APP_WEATHER_READY && requests>requests_before && !heap_allocs);
+    assert(weather_last_use == NETWORK_USE_WEATHER_MANUAL);
+    clock_setup(base_time);
+    app_weather_poll(true); assert(pending);
+    run_worker(); app_weather_poll(false);
+    assert(weather_last_use == NETWORK_USE_WEATHER);
+    weather_test_cellular=false;
+    clock_setup(base_time);
+    network_state=WIFI_TRANSFER_STOPPED;
+    unsigned radio_starts=starts, radio_stops=stops, nvs_before=ns_writes;
+    app_weather_background_poll();assert(!pending && starts==radio_starts);
+    network_state=WIFI_TRANSFER_READY;
+    s_view.has_city=false;
+    app_weather_background_poll();assert(!pending);
+    s_view.has_city=true;s_view.auto_refresh=false;
+    app_weather_background_poll();assert(!pending);
+    s_view.auto_refresh=true;
+    unsigned revision=s_view.revision;
+    app_weather_background_poll();assert(pending && s_view.revision==revision);
+    app_weather_background_pause();assert(pending && atomic_load(&s_cancel));
+    run_worker();app_weather_background_pause();assert(!s_pending && ns_writes==nvs_before);
+    monotonic+=WEATHER_RETRY_US;
+    app_weather_background_poll();assert(pending);
+    run_worker();assert(ns_writes==nvs_before+1);
+    app_weather_background_poll();assert(!s_pending && s_view.has_forecast && ns_writes==nvs_before+1);
+    assert(weather_last_use==NETWORK_USE_WEATHER_BACKGROUND && starts==radio_starts && stops==radio_stops);
+    network_state=WIFI_TRANSFER_STOPPED;
+    puts("PASS: quiet weather only borrows ready links, skips unset cities and disabled refresh, cancels without joining, and collects without main-loop writes");
+    puts("PASS: active BLE blocks manual and automatic weather without borrowing a bearer; standalone 4G works");
+    puts("PASS: weather proxy session, ten-hour boundary, shorter expiry, midnight, toggle persistence, city-ID fetch, paginated search, no device relabeling, owned cleanup, cancellation, guarded background cache writes, UI-owned preferences and resource guards");
 }

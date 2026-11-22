@@ -129,7 +129,18 @@ int ff_mutex_take(int drive){(void)drive;return 1;}
 void ff_mutex_give(int drive){(void)drive;}
 // CD 故障由边界替身注入；当前 S31 无 CD 时由真实 CMD13 检测生命周期。
 // Inject CD faults at the board boundary; real CMD13 lifecycle checks cover the S31 without a CD pin.
-esp_err_t sdmmc_get_status(sdmmc_card_t *c){(void)c;return present?ESP_OK:ESP_ERR_TIMEOUT;}
+static unsigned mount_reads_during_health;
+esp_err_t sdmmc_get_status(sdmmc_card_t *c){
+    (void)c;
+    if(present && !health_absent){
+        // 模拟接收任务恰好在健康检测占住忙状态时查询。/ Sample mount state while the health check owns the busy state.
+        board_sd_info_t info;
+        assert(board_sd_get_info(&info)==ESP_ERR_NOT_FINISHED && info.mounted);
+        assert(board_sd_is_mounted());
+        ++mount_reads_during_health;
+    }
+    return present?ESP_OK:ESP_ERR_TIMEOUT;
+}
 esp_err_t sdmmc_card_init(const sdmmc_host_t *h,sdmmc_card_t *c){(void)h;(void)c;return present?ESP_OK:ESP_ERR_TIMEOUT;}
 bool board_sd_has_cd(void){return has_cd;}
 esp_err_t board_sd_detect(bool *detected){
@@ -157,6 +168,7 @@ int main(void) {
     detect_fail=false;
     assert(board_sd_get_info(NULL)==ESP_ERR_INVALID_ARG);
     assert(board_sd_start_probe()==ESP_ERR_NOT_FINISHED);
+    assert(!board_sd_is_mounted());
     assert(board_sd_remount()==ESP_ERR_NOT_FINISHED);
     assert(board_sd_sync()==ESP_ERR_NOT_FINISHED);
     finish_probe();
@@ -256,7 +268,9 @@ int main(void) {
     assert(board_sd_sync()==ESP_OK);
     has_cd=false;
     assert(board_sd_remount()==ESP_ERR_NOT_FINISHED);finish_probe();
-    assert(health_started && board_sd_get_info(&info)==ESP_OK);
+    assert(health_started && board_sd_get_info(&info)==ESP_OK && board_sd_is_mounted());
+    sd_health_tick();
+    assert(mount_reads_during_health==1);
     present=false;
     sd_health_tick();assert(!health_absent);
     present=true;sd_health_tick();assert(!health_fails);
@@ -264,8 +278,10 @@ int main(void) {
     mock_us+=60000;(void)board_sd_get_info(&info);
     mock_us+=60000;(void)board_sd_get_info(&info);
     mock_us+=60000;assert(board_sd_get_info(&info)==ESP_ERR_NOT_FOUND && !info.mounted);
+    assert(!board_sd_is_mounted());
     present=true;sd_health_tick();assert(!health_absent);
     assert(board_sd_get_info(&info)==ESP_ERR_INVALID_STATE && info.present && !info.mounted);
+    assert(!board_sd_is_mounted());
     assert(board_sd_start_probe()==ESP_ERR_INVALID_STATE);
     assert(board_sd_remount()==ESP_ERR_NOT_FINISHED);finish_probe();
     assert(board_sd_get_info(&info)==ESP_OK && info.mounted);
@@ -273,8 +289,8 @@ int main(void) {
     for(int i=0;i<3;i++)sd_health_tick();
     assert(board_sd_remount()==ESP_ERR_NOT_FINISHED);finish_probe();
     assert(board_sd_get_info(&info)==ESP_OK && info.mounted);
-    assert(formats==0);
-    puts("PASS: real SD lifecycle, CD faults, S31 no-CD/CMD13 removal and reinsertion, explicit remount, USB handoff, concurrent snapshots, no autoformat");
+    assert(board_sd_is_mounted() && formats==0);
+    puts("PASS: mounted during health check, real SD lifecycle, CD faults, S31 no-CD/CMD13 removal and reinsertion, explicit remount, USB handoff, concurrent snapshots, no autoformat");
 }
 '''
 (out / 'test.c').write_text(source, encoding='utf-8')

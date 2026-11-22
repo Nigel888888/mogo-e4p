@@ -217,7 +217,7 @@ bool weather_forecast_valid(const weather_forecast_t *f, int64_t now) {
     if (!f || !weather_clock_valid(now) || !weather_location_valid(&f->location) ||
         f->stale > 1 ||
         f->fetched < 1704067200 || f->fetched > now + 120 || f->fresh <= f->fetched ||
-        f->serve < f->fresh || f->serve - f->fetched > 21600 || now >= f->serve ||
+        f->serve < f->fresh || f->serve - f->fetched > WEATHER_MAX_AGE_SECONDS || now >= f->serve ||
         f->days[0].date != weather_local_day(f->fetched) || f->days[1].date != f->days[0].date + 1) return false;
     for (unsigned i = 0; i < 2; ++i) {
         const weather_day_t *d = &f->days[i];

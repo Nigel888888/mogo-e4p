@@ -18,12 +18,7 @@
 #include <string.h>
 #include "esp_heap_caps.h"
 
-#define STBTT_STATIC
-#define STB_TRUETYPE_IMPLEMENTATION
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "stb_truetype.h"
-#pragma GCC diagnostic pop
+#include "stb_glyph_raster.h"
 
 #define UI_GLYPH_SLOTS 256
 #define UI_GLYPH_LIMIT (512u * 1024u)
@@ -159,66 +154,100 @@ static void evict(ui_glyph_t *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static ui_glyph_t *glyph(uint32_t cp, int px) {
-    if (!ready()) return NULL;
-    if (!glyphs_alloc()) return NULL;
-    px = clamp_px(px);
+static ui_glyph_t *glyph_lookup(uint32_t cp, int px) {
+    if (!s_glyphs) return NULL;
     for (int i = 0; i < UI_GLYPH_SLOTS; ++i)
-        if (s_glyphs[i].used && s_glyphs[i].cp == cp && s_glyphs[i].px == px) {
-            s_glyphs[i].age = ++s_age;
+        if (s_glyphs[i].used && s_glyphs[i].cp == cp && s_glyphs[i].px == px)
             return &s_glyphs[i];
-        }
-    int slot = 0;
-    for (int i = 0; i < UI_GLYPH_SLOTS; ++i)
-        if (!s_glyphs[i].used || s_glyphs[i].age < s_glyphs[slot].age) slot = i;
-    ui_glyph_t *g = &s_glyphs[slot];
-    evict(g);
-    float scale = scale_for(px);
+    return NULL;
+}
+
+static int outline_advance(int gid, float scale) {
     int advance, left;
-    stbtt_GetCodepointHMetrics(&s_font, (int)cp, &advance, &left);
-    int x0, y0, x1, y1;
-    stbtt_GetCodepointBitmapBox(&s_font, (int)cp, scale, scale, &x0, &y0, &x1, &y1);
+    stbtt_GetGlyphHMetrics(&s_font, gid, &advance, &left);
+    return (int)lroundf(advance * scale);
+}
+
+static int supplement_advance(const uint8_t extra[UI_HANZI_RECORD], int px) {
+    return (extra[4] * px + UI_HANZI_BASE_PX / 2) / UI_HANZI_BASE_PX;
+}
+
+static int glyph_advance(uint32_t cp, int px, float scale) {
+    const ui_glyph_t *cached = glyph_lookup(cp, px);
+    if (cached) return cached->advance;
+    int gid = stbtt_FindGlyphIndex(&s_font, (int)cp);
     uint8_t extra[UI_HANZI_RECORD];
-    bool supplemental = !stbtt_FindGlyphIndex(&s_font, (int)cp) && ui_hanzi_get(cp, extra);
-    int fallback_advance = 0;
+    if (!gid && ui_hanzi_get(cp, extra)) return supplement_advance(extra, px);
+    return outline_advance(gid, scale);
+}
+
+static ui_glyph_t *glyph(uint32_t cp, int px, float scale) {
+    ui_glyph_t *cached = glyph_lookup(cp, px);
+    if (cached) {
+        cached->age = ++s_age;
+        return cached;
+    }
+    if (!glyphs_alloc()) return NULL;
+
+    int gid = stbtt_FindGlyphIndex(&s_font, (int)cp);
+    uint8_t extra[UI_HANZI_RECORD];
+    bool supplemental = !gid && ui_hanzi_has(cp);
+    int x0, y0, x1, y1, advance;
     if (supplemental) {
+        // 块解码失败不是缺字；不要缓存临时的 .notdef 位图。
+        // A failed block decode is not a missing glyph; do not cache a temporary .notdef bitmap.
+        if (!ui_hanzi_get(cp, extra)) return NULL;
         x0 = (int)floorf((int8_t)extra[0] * (float)px / UI_HANZI_BASE_PX);
         y0 = (int)floorf((int8_t)extra[1] * (float)px / UI_HANZI_BASE_PX);
         x1 = x0 + (extra[2] * px + UI_HANZI_BASE_PX - 1) / UI_HANZI_BASE_PX;
         y1 = y0 + (extra[3] * px + UI_HANZI_BASE_PX - 1) / UI_HANZI_BASE_PX;
-        fallback_advance = (extra[4] * px + UI_HANZI_BASE_PX / 2) / UI_HANZI_BASE_PX;
+        advance = supplement_advance(extra, px);
+    } else {
+        stbtt_GetGlyphBitmapBox(&s_font, gid, scale, scale, &x0, &y0, &x1, &y1);
+        advance = outline_advance(gid, scale);
     }
-    *g = (ui_glyph_t){.cp = cp, .px = px, .age = ++s_age, .used = true,
-        .x0 = x0, .y0 = y0, .width = x1 - x0, .height = y1 - y0,
-        .advance = (int16_t)(supplemental ? fallback_advance : lroundf(advance * scale))};
-    if (g->width <= 0 || g->height <= 0) return g;
-    g->bytes = (size_t)g->width * g->height;
-    while (s_bytes + g->bytes > UI_GLYPH_LIMIT) {
-        ui_glyph_t *oldest = NULL;
-        for (int i = 0; i < UI_GLYPH_SLOTS; ++i)
-            if (&s_glyphs[i] != g && s_glyphs[i].bitmap && (!oldest || s_glyphs[i].age < oldest->age)) oldest = &s_glyphs[i];
-        if (!oldest) break;
-        evict(oldest);
-    }
-    g->bitmap = heap_caps_malloc(g->bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (g->bitmap) {
-        if (supplemental) for (int y = 0; y < g->height; ++y) for (int x = 0; x < g->width; ++x) {
-            g->bitmap[y * g->width + x] = ui_hanzi_coverage(extra, g->width, g->height, x, y);
+    ui_glyph_t fresh = {.cp = cp, .px = px, .used = true,
+        .x0 = x0, .y0 = y0, .width = x1 - x0, .height = y1 - y0, .advance = advance};
+    if (fresh.width > 0 && fresh.height > 0) {
+        fresh.bytes = (size_t)fresh.width * fresh.height;
+        if (fresh.bytes > UI_GLYPH_LIMIT) return NULL;
+        while (s_bytes + fresh.bytes > UI_GLYPH_LIMIT) {
+            ui_glyph_t *oldest = NULL;
+            for (int i = 0; i < UI_GLYPH_SLOTS; ++i)
+                if (s_glyphs[i].bitmap && (!oldest || s_glyphs[i].age < oldest->age)) oldest = &s_glyphs[i];
+            if (!oldest) return NULL;
+            evict(oldest);
         }
-        else stbtt_MakeCodepointBitmap(&s_font, g->bitmap, g->width, g->height, g->width,
-                                      scale, scale, (int)cp);
-        s_bytes += g->bytes;
-    } else g->bytes = 0;
-    return g;
+        fresh.bitmap = heap_caps_malloc(fresh.bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!fresh.bitmap) return NULL;
+        if (supplemental) {
+            for (int y = 0; y < fresh.height; ++y) for (int x = 0; x < fresh.width; ++x) {
+                fresh.bitmap[y * fresh.width + x] = ui_hanzi_coverage(extra, fresh.width, fresh.height, x, y);
+            }
+        } else if (stb_glyph_make_bitmap(&s_font, gid, scale, x0, y0, fresh.width, fresh.height,
+                                         fresh.bitmap) != STB_GLYPH_OK) {
+            free(fresh.bitmap);
+            return NULL;
+        }
+    }
+    // 成功的位图或合法空白才可发布；失败保留为 miss，下一次重绘可重试。
+    // Publish only a completed bitmap or a legitimate blank; a miss can retry on the next redraw.
+    int slot = 0;
+    for (int i = 0; i < UI_GLYPH_SLOTS; ++i)
+        if (!s_glyphs[i].used || s_glyphs[i].age < s_glyphs[slot].age) slot = i;
+    evict(&s_glyphs[slot]);
+    fresh.age = ++s_age;
+    s_glyphs[slot] = fresh;
+    s_bytes += fresh.bytes;
+    return &s_glyphs[slot];
 }
 
 int ui_font_text_width_px(int px, const char *text) {
     if (!text || !ready()) return 0;
+    px = clamp_px(px);
+    float scale = scale_for(px);
     int width = 0;
-    while (*text) {
-        ui_glyph_t *g = glyph(next_cp(&text), px);
-        if (g) width += g->advance;
-    }
+    while (*text) width += glyph_advance(next_cp(&text), px, scale);
     return width;
 }
 
@@ -226,12 +255,18 @@ static void draw_text_px(uint8_t *fb, int x, int baseline, int px,
                           const char *text, enum EpdFontFlags align,
                           uint8_t fg, uint8_t bg, unsigned threshold) {
     if (!fb || !text || !ready()) return;
+    px = clamp_px(px);
+    float scale = scale_for(px);
     int cursor = x;
     if (align & EPD_DRAW_ALIGN_CENTER) cursor -= ui_font_text_width_px(px, text) / 2;
     else if (align & EPD_DRAW_ALIGN_RIGHT) cursor -= ui_font_text_width_px(px, text);
     while (*text) {
-        ui_glyph_t *g = glyph(next_cp(&text), px);
-        if (!g) continue;
+        uint32_t cp = next_cp(&text);
+        const ui_glyph_t *g = glyph(cp, px, scale);
+        if (!g) {
+            cursor += glyph_advance(cp, px, scale);
+            continue;
+        }
         if (g->bitmap) for (int y = 0; y < g->height; ++y)
             for (int xx = 0; xx < g->width; ++xx) {
                 uint8_t alpha = g->bitmap[y * g->width + xx];

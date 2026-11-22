@@ -18,6 +18,7 @@ void epd_build_1ppB_lut_1k(uint8_t* lut, const EpdWaveformPhases* phases, int fr
 EpdRect epd_difference_image_cropped(const uint8_t* to, const uint8_t* from, EpdRect area,
                                       uint8_t* difference, bool* dirty_lines, uint8_t* dirty_columns);
 void epd_set_line_phase_luts(const uint8_t* const* phase_luts, const int8_t* line_phase);
+void epd_set_line_phase_outer_lut(const uint8_t* lut, int x0, int x1);
 void epd_set_col_phase_luts(const uint8_t* const* phase_luts, const int* x0, const int* x1,
                             const int8_t* phase, int nbands);
 void epd_clear_phase_luts(void);

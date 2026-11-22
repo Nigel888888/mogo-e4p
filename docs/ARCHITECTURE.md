@@ -3,8 +3,11 @@
 本项目的产品目标是 Metalio E-INK4 Plus（ESP32-S31）。构建入口是根目录与 main 的 CMakeLists.txt；页面以 app_registry.c 和 app_desc_t 为准。
 The product targets Metalio E-INK4 Plus (ESP32-S31). Root/main CMakeLists.txt define the build; app_registry.c and app_desc_t define pages.
 
-最近静态核对：2026-11-04（Asia/Shanghai），范围为当前工作区的构建与页面入口、主要服务边界及持久化接口，不代表全功能重新验收。[功能全景](development/FEATURES.md)维护当前能力与证据边界，[开发入口](development/INDEX.md)维护资料权威。
-Last statically checked on 2026-11-04 (Asia/Shanghai) for current build/page entries, major service boundaries and persistence interfaces, not complete functional reacceptance. The feature inventory owns current capability/evidence scope; the development index owns document authority.
+首次静态盘点基线：2026-11-04（Asia/Shanghai），范围为当前工作区的构建与页面入口、主要服务边界及持久化接口，不代表全功能重新验收。[功能全景](development/FEATURES.md)维护当前能力与证据边界，[开发入口](development/INDEX.md)维护资料权威。
+Initial static inventory on 2026-11-04 (Asia/Shanghai) for current build/page entries, major service boundaries and persistence interfaces, not complete functional reacceptance. The feature inventory owns current capability/evidence scope; the development index owns document authority.
+
+2026-11-17在 `2e2b9b9` 与文档工作区局部复核构建/注册入口和存储所有权；未重新执行产品测试、构建或设备验收。各模块历史验证仍以[功能全景](development/FEATURES.md)的日期、快照和覆盖为限。
+A scoped static review on 2026-11-17 covered build/registry and persistence ownership at `2e2b9b9` plus documentation edits. No new product execution; feature evidence retains its original snapshot and coverage.
 
 ## 系统与主路径 / System And Main Flows
 
@@ -20,11 +23,14 @@ Last statically checked on 2026-11-04 (Asia/Shanghai) for current build/page ent
 - 页面退出、锁屏、USB 导出和关机先取消或等待持有资源的服务。`app_lifecycle` 协调天气、自动升级、校时、存储任务与无线交还；`storage_jobs` 统一文件消费者的交还，调用方仍负责画面和硬件恢复。/ Exit/lock/USB/off cancel or join owners; lifecycle coordinates weather/OTA/time/storage/radios, while callers retain painting and hardware recovery.
 - `memory_manager` 集中内部 RAM / PSRAM 准入、固定分配账本、压力监测和清理请求；`app_loop` 在 UI 安全边界交给 `app_lifecycle` 回收预绘和字体缓存。阅读预绘已迁移，OTA 共用容量检查；`memory_inventory` 在 UI 安全边界合并常驻字体、显示缓冲、UI 字形、文件结果及传输缓冲，未覆盖用量保留为“未追踪/外部”；见[内存管理契约](development/designs/MEMORY_MANAGEMENT.md)。/ `memory_manager` owns pool admission, a fixed ledger, pressure monitoring and cleanup requests. At UI safety boundaries, the loop delegates prefetch/font eviction to lifecycle. Prefetch is migrated and OTA shares admission checks; `memory_inventory` merges resident fonts, display buffers, UI glyphs, file results and transfer buffers at UI safety boundaries, leaving uncovered usage untracked/external. See the memory contract.
 - 天气只经 `https://mogo.mantake.shop` 的组件 GET 接口获取数据；OTA 仅请求官方服务器的 HTTPS 清单，失败后提示错误，镜像仍按允许来源校验。浏览器传书由设备的 AP/STA 会话服务，不与天气共享后台所有权。/ Weather uses the official component GET API; OTA requests only the official server's HTTPS manifest, reports failures and validates images against the allowed origins. Browser transfer owns its separate AP/STA service session.
+- CloudZao 独立接收任务拥有 HTTPS 和 TF 句柄，只借用已就绪的纯联网 STA；未配置接入 ID 时隐藏入口，卡与电源交接要求任务先归还句柄。/ The CloudZao receive worker owns its HTTPS and TF handles and borrows only ready network-only STA. Without an integration ID its entry is hidden; card and power handoff must first reclaim the worker's handles.
 
 - 日历锁屏由 `main/time/calendar` 只读离线历法、`main/ui/ui_calendar` 纯绘制和 `main/lock/lock_calendar` 时间适配组成；`sleep` 负责系统字体借用与既有显示/认证出口。锁屏时读取北京时间，不额外唤醒或分配帧；密码图缓存身份包含绘制日期与子样式，保存使用已绘制身份以避开午夜竞争。数据及衬线数字由固定许可源生成，维护入口见 [CALENDAR](development/guides/CALENDAR.md)。/ Calendar locks separate the offline model, pure drawing and clock bridge; sleep retains font/display/auth ownership. Capture Beijing time on lock without another wake or frame; cache identity includes the drawn date/variant and avoids midnight write races. See the calendar contract for generated data and digits.
 
-蓝牙设置的子视图、可见设备快照与布局由 `main/apps/settings_bluetooth.c` 持有，`app_device_settings` 保留导航与页面回调。绘图与命中共用快照，异步采样和报告消费仅在交互／tick中进行；协议与持久化仍在 `ble_page_turner`，协议栈启停仍由 `app_loop` 协调。见[蓝牙设置契约](development/guides/BLUETOOTH.md)。
-The Bluetooth helper owns subviews, visible peer snapshots and layout; Device Settings retains navigation and page callbacks. Rendering/hits share snapshots, while actions/ticks sample state and consume reports. BLE retains protocol/storage and the app loop coordinates stack lifecycle.
+蓝牙设置的子视图、可见设备快照与布局由 `main/apps/settings_bluetooth.c` 持有，`app_device_settings` 保留导航与页面回调。绘图与命中共用快照，异步采样和报告消费仅在交互／tick中进行；协议与持久化仍在 `ble_page_turner`，`app_loop` 按用户设置同步协议栈，无线独占由驱动启动边界协调。见[蓝牙设置契约](development/guides/BLUETOOTH.md)。
+The Bluetooth helper owns subviews, visible peer snapshots and layout; Device Settings retains navigation and page callbacks. Rendering/hits share snapshots, while actions/ticks sample state and consume reports. BLE retains protocol and storage. The app loop syncs the stack to the user setting; driver startup boundaries coordinate radio exclusion.
+
+电量学习由 `components/device_power/battery_calibration.c` 持有纯计算与记录校验，Metalio后端负责本机NVS双槽和原子电量检查点；设置页只查询/发命令，`main/power`交接锁屏边界。该数据不进入普通配置备份，不依赖TF日志，也不新增采样任务或唤醒。/ Battery learning owns pure computation and record validation in `components/device_power/battery_calibration.c`; the Metalio backend owns local NVS dual slots and atomic SOC checkpoints. Settings queries/issues commands and `main/power` hands off lock boundaries. Ordinary backups exclude this data; there is no card-log dependency, sampling task or additional wake.
 
 ## 存储与外部边界 / Storage And External Boundaries
 
@@ -33,10 +39,15 @@ The Bluetooth helper owns subviews, visible peer snapshots and layout; Device Se
 | 系统与阅读偏好 / System and reader settings | `main/settings` 持有 NVS 与备份协议；原键、备份文件名及旧格式兼容独立于源码目录。票根背景使用独立 `ticket_bg` 键，v37 备份追加校验尾块，旧备份回落透明；壁纸显示方式使用 `wall_mode`，锁屏图缓存身份包含壁纸与显示方式。`lock_face` 单字节原子编码主样式及日历子样式，缺省读取旧 `lock_ui`；备份 profile 位6记录壁纸显示方式，旧固件忽略该位。/ Settings owns NVS/backup contracts; keys, filenames and compatibility do not follow source moves. Ticket backgrounds use `ticket_bg` and a checked v37 tail, defaulting legacy backups to transparent; wallpaper fit uses `wall_mode`, and lock-art identities include both wallpaper and fit. The backup profile bit 6 records wallpaper fit while older firmware ignores it. A single atomic `lock_face` byte packs the active style/calendar variant, falling back to legacy `lock_ui` when absent. |
 | WiFi 凭据 / WiFi credentials | `wifi_transfer` 在 `rp_wifi/profiles` 的版本化 blob 保存最多八组，缺少新键时兼容旧 `credentials`；最近选择的网络为默认，公开快照不含密码。现有 TF 备份只导出默认网络；单网络恢复保留其他项，空记录清空全部。/ A versioned blob holds eight profiles with legacy fallback only when the new key is absent. The latest selection is preferred and public snapshots exclude passwords. Existing TF backups export only that network; restoring one retains others, while an empty record clears all. |
 | 首页布局与天气 / Home and weather | `read_pico/home_regions` 一次保存上下布局及迷你书库模式，保留旧两位编码并扩展v2字节，沿用v33起的校验尾块；`kiiko_weather` 独立保存城市、偏好和有期限的缓存，不纳入设置/书籍备份。/ Atomic Home layout and mini-library mode share the checked backup tail introduced in v33, with legacy and v2 byte encodings; standalone weather state/cache does not. |
+| 分类与上次选择 / Categories and selection | `book_collection` 持有内部 FAT 的身份双副本；上次选择另在 settings 的 NVS 身份 blob，两者不纳入配置备份。/ Internal dual files and a separate identity-checked NVS selection are excluded from backup. |
 | 阅读手账与打卡 / Journal and streak | UI任务服务将当月逐书明细、跨月七日时长/此前连续天数和共享插画写入内置卷双快照；KJR2兼容读取KJR1，非格式化挂载、不依赖TF卡；不纳入设置/书籍备份，未知历史不补造。/ The UI-thread service owns internal dual snapshots of monthly rows, cross-month seven-day totals/preceding run and scenes; KJR2 reads KJR1 without formatting or SD dependency. Excluded from backups, with no invented history. |
 | 书籍、字体、图片与缓存 / Content and caches | TF/内部书籍库由 `book_store` 与媒体/USB 服务交接；`.readpico` 缓存、进度、书签及资源借用保留既有标识。/ Content stores coordinate with media/USB; retain cache/progress/bookmark identities and borrowing contracts. |
+| 阅读背景 / Reading backgrounds | `ui_reader_background` 拥有唯一内存成品和TF四个方向槽，事件准备时读取/重建，绘制只混合成品；公共 `image_decode` 只解码/缩放，不持有背景缓存。/ `ui_reader_background` owns one RAM result and four orientation slots on SD, prepared during events and only blended during painting; shared `image_decode` only decodes/scales and owns no background cache. |
 | 恢复与升级 / Resume and updates | `main/boot` 保存恢复检查点；OTA 模块校验清单、镜像和槽位，Flash 写入与显示供电保护互斥。/ Boot owns resume checkpoints; OTA validates feeds/images/slots and coordinates flash writes with display guards. |
 | 网站与平台 / Website and platform | 后端凭据、供应商许可、管理员发布、官网部署不由固件构建证明；不把草稿提交当成上线。/ Firmware builds do not establish credentials, provider permissions, administrator publication or deployment. |
+
+完整数据位置、导出/恢复支持与布局迁移风险见[持久化与备份](development/guides/PERSISTENCE.md)；本节只维护所有权。
+See the persistence matrix for actual paths, backup support and layout risks; this section owns module boundaries.
 
 ## 目录职责 / Ownership
 
@@ -50,7 +61,7 @@ The Bluetooth helper owns subviews, visible peer snapshots and layout; Device Se
 | `main/image/` | 通用图像探测、JPEG/PNG/静态 WebP 解码、裁剪与缩放，包含硬件 JPEG 适配。不得依赖书籍、UI、字体或页面。/ Generic image probing, JPEG/PNG/static WebP decoding, crop/scale and hardware JPEG adaptation; no book, UI, font or page dependencies. |
 | `main/ui/` | 公共绘制、控件、交互反馈及题头样式；绘制接口不承担页面状态转换。/ Shared drawing, controls, feedback and heading styles; paint APIs do not own page transitions. |
 | `main/font/` | 字体来源、加载、字形缓存与渲染。系统/阅读字体的选择策略在 services。/ Font sources, loading, glyph caches and rendering; services owns system/reader face policy. |
-| `main/display/` | 统一刷新意图、波形目录、显示出口与几何、导航/阅读波形及灰阶归一；契约见 [DISPLAY_REFRESH.md](development/designs/DISPLAY_REFRESH.md)。/ Central refresh intents, waveform catalog, physical exits/geometry and navigation/reader/normalization waveforms; see the refresh contract. |
+| `main/display/` | 统一刷新意图、波形目录、显示出口与几何、屏幕偏移及触点逆变换、导航/阅读波形及灰阶归一；契约见 [DISPLAY_REFRESH.md](development/designs/DISPLAY_REFRESH.md)。/ Central refresh intents, waveform catalog, physical exits/geometry, screen-offset/touch conversion and navigation/reader/normalization waveforms; see the refresh contract. |
 | `main/lock/` | 自动锁屏判定、锁屏图缓存、时钟分钟身份与密码验证；睡眠交接由 power 负责，时钟绘制由 ui 负责。/ Idle-lock decisions, art caches, clock minute identity and PIN verification; power owns sleep handoff and ui owns clock painting. |
 | `main/power/` | 锁屏进睡、唤醒、关机及 S31 CACHE_L1 恢复。/ Lock-to-sleep, wake, power-off and S31 CACHE_L1 restore. |
 | `main/ota/` | TF/联网升级、发布清单、下载校验与升级任务。/ Card/online upgrades, release manifests, download verification and update workers. |
@@ -77,6 +88,18 @@ After frontlight and radios stop, board sleep cuts the P14 Bluetooth/amplifier s
 网络承载由 `main/services/network_service` 统一管理，日期、天气与 OTA 通过租约使用用户选择的 Wi-Fi、4G 或自动路由；租约期间不能关闭对应无线。`main/services/cellular` 负责运行时 NT26 探测、固定内置 SIM、注册/IP 就绪及休眠交接；未检测到模块时隐藏移动网络入口，固件与 OTA 身份不拆分。见 [NETWORK.md](development/guides/NETWORK.md)。
 `main/services/network_service` owns Wi-Fi/cellular/Auto routing and radio-protecting leases for time, weather and OTA. `main/services/cellular` owns runtime NT26 detection, internal-SIM configuration, registration/IP readiness and sleep handoff. Hide mobile controls when hardware is absent and retain one firmware/OTA identity.
 
+### 自有组件入口 / First-party Component Entries
+
+| 路径 / Path | 职责 / Role |
+| --- | --- |
+| `components/board_support/` | 板级 BSP：I2C、EPD 板定义与扫描时序、TF 卡、蜂鸣器、flash HPM。/ Board BSP. |
+| `components/book_search/` | 离线拼音/首字母/英文书名匹配，设备和网页共用；字表由工具生成。/ Shared offline pinyin, initials and English matching with a generated table. |
+| `components/device_power/` | 电量、充电、RTC 与电源键接口；S31 选 Metalio 后端，旧 CW32 线格式在 `pmu_protocol.h`。/ Battery, charging, RTC and power keys; S31 selects Metalio, with the legacy CW32 wire format in `pmu_protocol.h`. |
+| `components/wifi_transfer/` | 热点与已有 WiFi 传书、配网和校时会话。/ AP/STA book transfer, provisioning and time-sync sessions. |
+| `components/epdiy/` | 上游裁剪 fork（LCD 路径）。改动清单在其 LICENSE。不要为注释去改它。/ Trimmed upstream fork. Leave it alone for comment work. |
+| `components/cst836u/` `sc7a20h/` `fca9555/` | 当前触摸、加速度计及扩展口驱动；旧名称包含 FT6336U/TCA9555 适配。/ Current touch, accelerometer and expander drivers, including FT6336U/TCA9555 adaptations under legacy names. |
+| `components/e0470_epaper_waveform/` | 面板波形与裁剪。`waveforms/*.h` 是数据表。/ Panel waveforms. |
+
 ## 依赖规则 / Dependency rules
 
 - 阅读正文由 `app_book` 统一计算信息栏显隐和用户边距，排版、分页、预绘与触摸共用 `body_rect`；上下保留9px基础间距，`reader_area` 清理范围包含留白。显隐改变按当前文字锚点重排，失败回滚；返回和休眠恢复沿用当前显隐设置，无独立全屏状态。/ `app_book` owns one body rectangle for layout, pagination, prefetch and input, with 9px top/bottom base gaps plus user margins and clearing that includes those gaps. Visibility changes reflow around the current text anchor with rollback, and returns/resume use current bar preferences without separate full-screen state.
@@ -99,8 +122,8 @@ After frontlight and radios stop, board sleep cuts the P14 Bluetooth/amplifier s
   The first complete scan migrates direct folders, including empty ones, with bounded unique aliases and retained provenance; normal later discoveries default unclassified. Explicit rescans reload the index and import missing folder categories and their unclassified books only after a complete scan, preserving manual assignments, names and previous unclassifications in existing folders. Settings persist the last stable category ID per fully verified card/builtin identity in one NVS key; the page restores it on initial binding or falls back to all. Pages/sorts remain boot-local, and selection stays outside cross-device settings backups. Category UI owns command state and pure rendering; the page checks USB/library identity before committing. Picker covers share the single queue and acknowledge only successful grouped presentation; exits/lock/media loss cancel uncommitted work.
 - `book_selection_ui.h` 共享多选控件、分页和底部操作的绘制/命中几何，不持有状态。书架多选使用独立内容布局并关闭底部导航命中及固定导航保护，退出后恢复普通布局；分类选书复用同一底栏。禁用文字只将4位读回值中的字迹转灰，不覆盖白底。
   `book_selection_ui.h` shares selection/pager/footer painting and hit bounds without state ownership. Shelf selection uses separate content geometry, disables navigation targets and fixed-navigation protection, then restores normal browsing on exit; category picking shares the footer. Disabled text tints only ink from 4-bit readback and preserves white pixels.
-- `book_category_ops` / `book_path_state` 仅保留旧 `.mogo-category-op` 物理整理日志的兼容恢复及故障测试，新归类不调用其移动/改名/删除接口。旧日志恢复仍要求TF挂载、USB未导出、HTTP/封面工作者交还；恢复原始路径记录与手账后才清源，坏日志阻断进一步旧整理及开书。该兼容层与新索引均不构成真实介质断电或设备行为验收；书签格式及现有读取/备份布局不变。
-  `book_category_ops` / `book_path_state` remain for legacy physical-journal recovery and regressions only; logical classification never calls their move/rename/remove APIs. Recovery still requires mounted TF, USB inactive and returned HTTP/cover ownership, relocating raw state/journal before clearing source keys; ambiguous intent blocks further legacy writes/opens. Neither layer's host evidence proves device/power-loss behavior. Bookmark and existing backup layouts remain unchanged.
+- `book_category_ops` / `book_path_state` 仅保留旧 `.mogo-category-op` 物理整理日志的兼容恢复及故障测试，新归类不调用其移动/改名/删除接口。旧日志恢复仍要求TF挂载、USB未导出、HTTP/封面工作者交还；恢复原始路径记录与手账后才清源，坏日志阻断进一步旧整理及开书。该兼容层与新索引均不构成真实介质断电或设备行为验收；书签记录格式不变，v48 配置备份由分类模块导入校验后的书库快照，不经旧物理整理路径。
+  `book_category_ops` / `book_path_state` remain for legacy physical-journal recovery and regressions only; logical classification never calls their move/rename/remove APIs. Recovery still requires mounted TF, USB inactive and returned HTTP/cover ownership, relocating raw state/journal before clearing source keys; ambiguous intent blocks further legacy writes/opens. Neither layer's host evidence proves device/power-loss behavior. Bookmark records retain their layout; v48 imports checked collection snapshots through the collection owner, not the legacy move path.
 - `book_shelf_covers` 独占书架封面像素、任务代次、整组显示标记和预热进度；页面只通过 API 修改，同步只读借用槽位。普通离页取消任务并保留缓存；开书、换模式或介质失效先取消再释放。只有成功的整页或封面批次输出才能确认已显示，失败输出保留标记。它复用全局 `book_cover_jobs` 单队列，不提供多页面并行解码；导航、几何、设置、转换绘制和装饰缓存仍由页面负责。
   `book_shelf_covers` owns shelf pixels, job generations, grouped presentation markers and warm-up progress. Pages mutate through the API and borrow slots synchronously for reading. Ordinary exits cancel jobs while retaining artwork; opening a book, changing mode or losing media cancels before release. Only successful page or cover-batch output acknowledges artwork, so failures retain dirty markers. The module shares the single global `book_cover_jobs` queue rather than decoding multiple pages concurrently; pages still own navigation, geometry, settings, conversion, painting and decorative caches.
 - `ui_reader_settings` 接收只读值快照，负责阅读设置控件、翻页模式示意和完成键的绘制；字号几何同时用于绘制与命中。页面保留面板壳、返回键反馈、设置读取/保存、点击处理、重排和刷新调度。模块不直接依赖页面、book 或系统设置，不持有快照、字体或帧缓冲；通用开关由字体与按键面板复用。
@@ -141,8 +164,8 @@ idf.py --preview build
 结构检查覆盖根目录归属、跨目录头文件依赖、私有头搜索路径、产品源文件登记和既有测试入口；阅读回归执行真实模块及对应宿主替身，并保留 ASan/UBSan。构建和宿主测试不能替代设备显示、睡眠、触摸与存储验收。
 Structural checks cover root ownership, header boundaries and private search paths, product source registration and existing test entry points. Reader regressions run real modules with host doubles and ASan/UBSan. Builds and host tests do not replace device display, sleep, input or storage acceptance.
 
-GitHub 构建入口为 `.github/workflows/build.yml`，正式标签的同源固件、交付物与 OTA 草稿入口为 `.github/workflows/ota-submit.yml`。发布授权、Release 命名、不可覆盖附件和官网/TF/OTA 一致性以 AGENTS 为准；本地治理不触发这些操作。
-GitHub build and official-tag artifacts/OTA drafts enter through the build and OTA workflows. AGENTS governs publication authority, naming, immutable assets and website/TF/OTA consistency; local governance triggers none of them.
+GitHub 构建入口为 `.github/workflows/build.yml`，正式标签的同源固件、交付物与 OTA 草稿入口为 `.github/workflows/ota-submit.yml`。发布授权、Release 命名、不可覆盖附件和官网/TF/OTA 一致性以[正式发布契约](development/guides/RELEASE.md)为准；本地治理不触发这些操作。
+GitHub build and official-tag artifacts/OTA drafts enter through the build and OTA workflows. The release contract governs publication authority, naming, immutable assets and website/TF/OTA consistency; local governance triggers none of them.
 
 旧移植评估、rc68/rc69 和旧官网维护资料保留当时事实，不覆盖当前 S31 源码。本 checkout 不含旧 `flash/` 站点目录；仍在仓库的说明书输入和生成器不代表站点可直接构建或已经部署。具体能力、证据缺口与适用测试见功能全景。
 Historical port/S3/site documents do not override current S31 code. This checkout lacks the old flash-site directory; retained manual inputs/generators do not establish a buildable or deployed site. See the feature inventory for capability/evidence gaps.
@@ -164,4 +187,7 @@ Third-party components retain licenses and needed tests/examples. Directory size
 时钟锁屏的RTC只读锚点与成功呈现身份由 `lock_clock` 持有；`sleep` 在同一等待会话调用分钟更新，不恢复触摸/前光/网络、不重建关机截止时间。只有清醒绘屏期间临时恢复按键快采，睡前暂停并保留事件。时钟不读写磁盘锁屏帧；PIN等待和取消都重建当前白底时钟，不额外分配原图整帧。行为与生成入口见[简约时钟锁屏](development/guides/LOCK_CLOCK.md)。
 The clock owns read-only RTC anchors and successful-paint identities. Sleep updates it inside the same deadline/session without resuming peripherals or radios. Awake scans temporarily sample keys and retain events before sleeping. Clock art bypasses disk caches; PIN waits rebuild the current face without an extra original-frame copy.
 
-锁屏样式选择由 `ui/ui_lock_style` 拥有交互、布局与内置缩图，`services/lock_style_images` 拥有单个可取消文件任务、目录、LRU和TF缩略缓存；`image`解码器只接收取消回调。普通离页保留有界小图，介质/USB交接推进失效代次，UI取回目录后校验并退役变化源；当前可见批次结束只请求一次整屏定稿。文件任务纳入 `storage_jobs_quiesce`，UI绘图不读文件。具体边界见[锁屏选择器](development/guides/LOCK_STYLE_PICKER.md)。
+壁纸的双页签选择由 `ui/ui_lock_style` 拥有交互、布局与内置缩图，`services/lock_style_images` 拥有单个可取消文件任务、目录、LRU和TF缩略缓存；`image`解码器只接收取消回调。普通离页保留有界小图，介质/USB交接推进失效代次，UI取回目录后校验并退役变化源；当前可见批次结束只请求一次整屏定稿。文件任务纳入 `storage_jobs_quiesce`，UI绘图不读文件。具体边界见[锁屏选择器](development/guides/LOCK_STYLE_PICKER.md)。
+
+独立关机图片由 `services/shutdown_wallpaper` 独占异步解码和TF双槽缓存，`settings` 仅提交 `off_art` 配置，`ui_power_shutdown_prepare` 在事件路径读TF成品缓存，或调用票根、拼贴、独立日历版式生成画面，`sleep` 与 `app_loop` 拥有推屏、断电及失败恢复。标准竖屏缓存通过逻辑像素输出，UI的 `render` 不访问文件。任务纳入存储交还；v47备份不携带像素。立即关机跳过锁屏，定时浅睡到期先切换关机画面，失败恢复原锁屏且保留PIN门控；此恢复路径允许临时整帧副本，不改变时钟正常分钟更新和PIN等待的无副本契约。
+The shutdown service owns asynchronous decoding and dual SD slots; settings owns configuration commits, event-only preparation loads custom art or generates ticket/collage/calendar faces, and sleep/the loop own presentation, power-off and recovery. Canonical art uses logical pixel output; UI render remains file-free. Storage handoffs join the worker and v47 backups exclude pixels. Immediate-off bypasses lock art, timed expiry switches art before off, and failed handoff restores the protected lock. Only this recovery path may retain a temporary frame; ordinary clock/PIN updates keep their no-copy contract.

@@ -21,6 +21,7 @@
 
 #include "device_power.h"
 #include "battery_log.h"
+#include "battery_calibration.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -76,12 +77,9 @@
 #define CX_CHG_STAT_CC 1
 #define CX_CHG_STAT_CV 2
 #define CX_CHG_STAT_TOPOFF 3
-// 原厂板级默认快速充电 1000 mA（MetalioPower_Init 的 kDefaultIchgMa），输入限流同值，
-// 充电截止 4.4 V。不写这些寄存器时芯片停在上次遗留值，换电池/掉电后可能回落到默认档。
-// Vendor board default fast charge is 1000 mA (MetalioPower_Init's kDefaultIchgMa), the
-// input limit follows it and VREG is 4.4 V. Without these writes the chip keeps whatever
-// an earlier firmware left behind and can fall back to its power-on defaults.
-#define CX_CHG_ICHG_MA 1000
+#define CX_CHG_DEFAULT_CURRENT DEVICE_POWER_CHARGE_1A
+#define CX_CHG_NVS_NAMESPACE "charger"
+#define CX_CHG_NVS_CURRENT "current_ma"
 #define CX_CHG_VREG_MV 4400
 
 #define PCF_REG_SECONDS 0x02
@@ -230,11 +228,11 @@ static esp_err_t cx_unlock_private(void) {
 }
 
 // 照搬原厂 hw_init_defaults()：关 DPDM 探测和看门狗，预充/终止用原厂码值，VREG 4.4 V，
-// 充电与输入限流 1 A，充电期间由轮询服务按原厂 VBAT/VREG 策略控制终止，最后开 EN_CHG。
+// 充电与输入限流使用所选档位，充电期间由轮询服务按原厂 VBAT/VREG 策略控制终止，最后开 EN_CHG。
 // Mirrors the vendor hw_init_defaults(): DPDM probing and the watchdog stay off, precharge and
-// termination keep the vendor codes, VREG is 4.4 V, charge and input limit are 1 A, termination
+// termination keep the vendor codes, VREG is 4.4 V, charge and input limits use the selected profile, termination
 // follows the vendor VBAT/VREG policy through polling, then EN_CHG is set.
-static esp_err_t cx_charger_setup(void) {
+static esp_err_t cx_charger_setup(device_power_charge_current_t current) {
     if (s_cx == NULL) return ESP_ERR_INVALID_STATE;
     uint8_t part = 0;
     esp_err_t err = dev_read(s_cx, CX_REG_PART_INFO, &part, 1);
@@ -251,7 +249,7 @@ static esp_err_t cx_charger_setup(void) {
     if (err == ESP_OK) err = cx_update_bits(CX_REG_ITERM_LO, 0x1F, 3, 0x06);
     if (err == ESP_OK) err = cx_update_bits(CX_REG_ITERM_HI, 0x01, 0, 0x00);
     if (err == ESP_OK) err = cx_set_vreg_mv(CX_CHG_VREG_MV);
-    if (err == ESP_OK) err = cx_set_ichg_ma(CX_CHG_ICHG_MA);
+    if (err == ESP_OK) err = cx_set_ichg_ma(current);
     if (err != ESP_OK) goto failed;
 
     // 私有区三个值只由原厂驱动写入，含义未公开，照抄。
@@ -304,6 +302,50 @@ failed:
 static bool s_charger_configured, s_charger_uv_shutdown;
 static int64_t s_charger_next_us, s_charger_resume_us;
 static void batt_log_undervoltage(int64_t now, uint16_t mv, bool have_i, int16_t ma, uint8_t status);
+
+static device_power_charge_current_t s_charge_current;
+
+static bool charge_current_valid(unsigned current) {
+    return current == DEVICE_POWER_CHARGE_1A || current == DEVICE_POWER_CHARGE_1_5A;
+}
+
+static device_power_charge_current_t charge_current_load(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(CX_CHG_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return CX_CHG_DEFAULT_CURRENT;
+    uint16_t current = 0;
+    const esp_err_t err = nvs_get_u16(nvs, CX_CHG_NVS_CURRENT, &current);
+    nvs_close(nvs);
+    return err == ESP_OK && charge_current_valid(current) ? current : CX_CHG_DEFAULT_CURRENT;
+}
+
+unsigned device_power_charge_current(void) {
+    return s_charger_configured ? s_charge_current : 0;
+}
+
+esp_err_t device_power_set_charge_current(device_power_charge_current_t current) {
+    if (!charge_current_valid(current)) return ESP_ERR_INVALID_ARG;
+    if (!s_charger_configured) return ESP_ERR_INVALID_STATE;
+    if (current == s_charge_current) return ESP_OK;
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(CX_CHG_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = cx_set_ichg_ma(current);
+    if (err == ESP_OK) err = nvs_set_u16(nvs, CX_CHG_NVS_CURRENT, current);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err == ESP_OK) {
+        s_charge_current = current;
+    } else if (cx_set_ichg_ma(s_charge_current) != ESP_OK) {
+        // 档位可能只写了一半；恢复失败时尽力停充，不再报告已应用。
+        // A partial register update is possible; if rollback fails, attempt to stop charging and report no profile.
+        (void)cx_update_bits(CX_REG_CHG_CTRL0, 0x01, 2, 1);
+        (void)cx_update_bits(CX_REG_CHG_CTRL1, 0x01, 5, 0);
+        s_charger_configured = false;
+        s_snap.config_ok = false;
+    }
+    return err;
+}
 
 // 主机停止维护前恢复硬件终止，不能把补充充电的暂时停充阶段留给断电后的芯片。
 // Restore hardware termination before host maintenance stops; never leave a recharge disable pending after power-off.
@@ -402,7 +444,7 @@ static esp_err_t bq_read_current(int16_t* ma) {
 #define BATT_LOW_STEP_INTERVAL_MS 10000  // 低电量保留快速跟随。 / Keep faster tracking at low levels.
 #define BATT_LOW_PERMILLE 140            // 目标不高于 14% 时加快跟随。 / Track faster when the target is at/below 14%.
 #define BATT_RESTORE_TOL_PERMILLE 150    // 开机恢复容差。 / Boot-restore tolerance.
-#define BATT_STATE_VERSION 2            // 中低段重标后不恢复旧百分比。 / Reject saved percentages from the previous curve.
+#define BATT_STATE_VERSION 3            // 中低段重标后不恢复旧百分比。 / Reject saved percentages from the previous curve.
 #define BATT_DONE_MIN_MV 4300            // 判满电压门槛，防状态位误判。 / Voltage gate for the done snap.
 // 涓流判满：原厂在充电期间关掉终止，STATUS1 停在恒压码 2，top-off 码 3 不会出现，
 // done 路径可能永不触发；高电压下持续近零电流即视为充满。
@@ -422,24 +464,28 @@ static esp_err_t bq_read_current(int16_t* ma) {
 #define BATT_LOG_PATH "/sdcard/batt.log"
 
 // 4.4 V 高压电池补偿/EMA 电压 → 显示千分比，mV 降序；不是静置 OCV 实测。
-// 4380 mV 满电平台及 3950 mV 以上基准保留。2026-11-11 连续放电日志在
-// 3950→3300 mV 间累计放出 1358437.917 µAh，按剩余积分归一到既有 629→0‰，
-// 替代无数据的低段直线。保留 3300 mV 的显示余量；不推断绝对容量或实际断电点。
+// 4380 mV 满电平台及 4100 mV / 790‰ 基准保留。2026-11-18 提供的连续日志在
+// 4100→3300 mV 间累计放出 1669952.231 µAh，按剩余积分归一到既有 790→0‰。
+// 保留 3300 mV 的显示余量；不推断绝对容量或把末行当成物理断电点。
 // 来源、公式与限制见本组件 README；曲线调整须同时递增 BATT_STATE_VERSION。
 // Compensated/EMA voltage -> displayed permille for the 4.4 V LiHV pack, descending
 // in mV; this is not measured rested OCV. Keep the 4380 mV full plateau and anchors
-// at/above 3950 mV. The continuous discharge supplied on 2026-11-11 delivered
-// 1358437.917 uAh between 3950 and 3300 mV; normalize remaining charge to the existing
-// 629->0 permille endpoints, replacing the provisional low-range line. Keep the
+// at/above 4100 mV. The continuous discharge supplied on 2026-11-18 delivered
+// 1669952.231 uAh between 4100 and 3300 mV; normalize remaining charge to the existing
+// 790->0 permille endpoints. Keep the
 // 3300 mV display reserve without inferring absolute capacity or physical cutoff.
 // See the component README for provenance and limits; bump BATT_STATE_VERSION with curve changes.
 static const int32_t s_soc_curve[][2] = {
-    {4380, 1000}, {4300, 955}, {4200, 875}, {4100, 790}, {4050, 733},
-    {4000, 695},  {3950, 629}, {3900, 558}, {3850, 504}, {3825, 461},
-    {3800, 406},  {3775, 324}, {3750, 224}, {3725, 169}, {3700, 133},
-    {3675, 104},  {3650, 57},  {3625, 40},  {3600, 33},  {3500, 18},
+    {4380, 1000}, {4300, 955}, {4200, 875}, {4100, 790}, {4050, 734},
+    {4000, 695},  {3950, 632}, {3900, 568}, {3850, 507}, {3825, 461},
+    {3800, 402},  {3775, 313}, {3750, 228}, {3725, 163}, {3700, 126},
+    {3675, 87},   {3650, 46},  {3625, 37},  {3600, 32},  {3500, 16},
     {3400, 7},    {3300, 0},
 };
+
+_Static_assert(sizeof(s_soc_curve) / sizeof(s_soc_curve[0]) == BATT_CAL_NODES,
+               "Battery calibration nodes must match the baseline");
+static batt_cal_t s_batt_cal;
 
 // 滤波状态：跨 poll 保持，首采时初始化。 / Filter state held across polls, seeded by the first sample.
 typedef struct {
@@ -474,6 +520,12 @@ static int32_t batt_curve_soc(int32_t mv) {
     return s_soc_curve[n - 1][1];
 }
 
+// 关闭学习仍使用已保存的个性曲线；无模型时与既有查表完全一致。
+// Disabled learning retains the saved custom curve; absent a model, retain the original lookup exactly.
+static int32_t batt_effective_soc(int32_t mv) {
+    return s_batt_cal.base ? batt_cal_soc(&s_batt_cal, mv) : batt_curve_soc(mv);
+}
+
 // 一步滤波：负载补偿 → EMA → 查表 → 死区/单向/限速；纯函数，便于主机对拍。
 // One filter step: load compensation -> EMA -> table -> deadband/one-direction/rate limit;
 // pure so host tests can replay it.
@@ -492,7 +544,7 @@ static void batt_filter_step(batt_filter_t* f, int64_t now_us, uint16_t raw_mv, 
         f->inited = true;
         f->charging = charging;
         f->ema_q8 = ocv * 256;
-        const int32_t table = batt_curve_soc(ocv);
+        const int32_t table = batt_effective_soc(ocv);
         // 首采恢复：保存值在表值容差内则沿用，深睡唤醒显示连续。
         // First-sample restore: keep the saved value inside tolerance, so deep-standby
         // wake keeps the display continuous.
@@ -520,7 +572,7 @@ static void batt_filter_step(batt_filter_t* f, int64_t now_us, uint16_t raw_mv, 
     } else {
         // 单向步进：放电只降不升，充电只升不降。
         // One-direction stepping: discharge only falls, charge only rises.
-        int32_t target = batt_curve_soc(f->ema_q8 / 256);
+        int32_t target = batt_effective_soc(f->ema_q8 / 256);
         if (charging) {
             if (target < f->disp_permille) target = f->disp_permille;
         } else if (target > f->disp_permille) {
@@ -578,19 +630,32 @@ static int bq_read_soc(void) {
 
 // 电量持久化到 NVS，供深睡唤醒后恢复显示。 / Persist the percent to NVS for deep-standby wake restore.
 static int32_t s_batt_persisted_permille = -1;
+static uint32_t s_batt_persisted_model, s_batt_display_model;
 // 0 未首采、1 采用、2 无记录/读取失败、3 版本不符、4 数值非法、5 超容差。
 // 0 pending, 1 accepted, 2 absent/read error, 3 version mismatch, 4 invalid, 5 outside tolerance.
 static uint8_t s_batt_restore;
 static int32_t s_batt_restore_value = -1;
 static uint32_t s_batt_restore_version;
 
+typedef struct {
+    uint32_t version;   // 曲线算法版本 / Curve algorithm revision
+    uint32_t model;     // 本次显示使用的曲线 / Curve used for this displayed value
+    uint32_t permille;  // 显示千分比 / Displayed permille
+    uint32_t checksum;  // 整体校验 / Whole-record checksum
+} batt_soc_checkpoint_t;
+
 static void batt_save(int32_t permille) {
-    if (permille < 0 || permille > 1000 || permille == s_batt_persisted_permille) return;
+    const uint32_t model = s_batt_display_model;
+    if (permille < 0 || permille > 1000 ||
+        (permille == s_batt_persisted_permille && model == s_batt_persisted_model)) return;
     nvs_handle_t nvs;
     if (nvs_open("pmu", NVS_READWRITE, &nvs) != ESP_OK) return;
-    if (nvs_set_i32(nvs, "soc", permille) == ESP_OK &&
-        nvs_set_u32(nvs, "soc_ver", BATT_STATE_VERSION) == ESP_OK && nvs_commit(nvs) == ESP_OK) {
+    batt_soc_checkpoint_t checkpoint = {.version = BATT_STATE_VERSION, .model = model,
+        .permille = (uint32_t)permille};
+    checkpoint.checksum = batt_cal_checksum(&checkpoint, offsetof(batt_soc_checkpoint_t, checksum));
+    if (nvs_set_blob(nvs, "soc_state", &checkpoint, sizeof(checkpoint)) == ESP_OK && nvs_commit(nvs) == ESP_OK) {
         s_batt_persisted_permille = permille;
+        s_batt_persisted_model = model;
     }
     nvs_close(nvs);
 }
@@ -603,6 +668,26 @@ static int32_t batt_load(void) {
     s_batt_restore_value = -1;
     s_batt_restore_version = 0;
     if (nvs_open("pmu", NVS_READONLY, &nvs) != ESP_OK) return -1;
+    batt_soc_checkpoint_t checkpoint;
+    size_t size = sizeof(checkpoint);
+    const esp_err_t checkpoint_err = nvs_get_blob(nvs, "soc_state", &checkpoint, &size);
+    if (checkpoint_err != ESP_ERR_NVS_NOT_FOUND) {
+        if (checkpoint_err == ESP_OK && size == sizeof(checkpoint)) {
+            s_batt_restore_value = (int32_t)checkpoint.permille;
+            s_batt_restore_version = checkpoint.version;
+            if (checkpoint.checksum != batt_cal_checksum(&checkpoint, offsetof(batt_soc_checkpoint_t, checksum)) ||
+                checkpoint.permille > 1000) s_batt_restore = 4;
+            else if (checkpoint.version != BATT_STATE_VERSION || checkpoint.model != batt_cal_model_id(&s_batt_cal))
+                s_batt_restore = 3;
+            else {
+                value = (int32_t)checkpoint.permille;
+                s_batt_persisted_model = checkpoint.model;
+                s_batt_restore = 0;
+            }
+        }
+        nvs_close(nvs);
+        return value;
+    }
     const bool have_version = nvs_get_u32(nvs, "soc_ver", &version) == ESP_OK;
     const bool have_value = nvs_get_i32(nvs, "soc", &value) == ESP_OK;
     if (have_version) s_batt_restore_version = version;
@@ -610,13 +695,108 @@ static int32_t batt_load(void) {
     if (!have_version || !have_value) value = -1;
     else if (version != BATT_STATE_VERSION) { s_batt_restore = 3; value = -1; }
     else if (value < 0 || value > 1000) { s_batt_restore = 4; value = -1; }
-    else s_batt_restore = 0;
+    else {
+        bool baseline = true;
+        for (int i = 0; i < BATT_CAL_NODES; ++i)
+            baseline &= s_batt_cal.record.soc[i] == (uint32_t)s_soc_curve[i][1];
+        // 仅新原子记录不存在时读取旧版本3，而且必须使用基线。
+        // Only an absent atomic checkpoint allows legacy revision-3 fallback, and only with the baseline.
+        if (!baseline) {
+            s_batt_restore = 3;
+            value = -1;
+        } else {
+            s_batt_restore = 0;
+            s_batt_persisted_model = batt_cal_model_id(&s_batt_cal);
+        }
+    }
     nvs_close(nvs);
     return value;
 }
 
+/* ---- 本机自动校准存储 / Local automatic calibration storage ---- */
+
+static bool batt_cal_read_slot(void *ctx, unsigned slot, batt_cal_record_t *record) {
+    (void)ctx;
+    nvs_handle_t nvs;
+    if (nvs_open("battcal", NVS_READONLY, &nvs) != ESP_OK) return false;
+    size_t size = sizeof(*record);
+    const bool ok = nvs_get_blob(nvs, slot ? "slot1" : "slot0", record, &size) == ESP_OK && size == sizeof(*record);
+    nvs_close(nvs);
+    return ok;
+}
+
+static bool batt_cal_write_slot(void *ctx, unsigned slot, const batt_cal_record_t *record) {
+    (void)ctx;
+    nvs_handle_t nvs;
+    if (nvs_open("battcal", NVS_READWRITE, &nvs) != ESP_OK) return false;
+    const bool ok = nvs_set_blob(nvs, slot ? "slot1" : "slot0", record, sizeof(*record)) == ESP_OK &&
+                    nvs_commit(nvs) == ESP_OK;
+    nvs_close(nvs);
+    return ok;
+}
+
+static batt_cal_reset_state_t batt_cal_read_reset(void *ctx) {
+    (void)ctx;
+    nvs_handle_t nvs;
+    const esp_err_t opened = nvs_open("battcal", NVS_READONLY, &nvs);
+    if (opened == ESP_ERR_NVS_NOT_FOUND) return BATT_CAL_RESET_NONE;
+    if (opened != ESP_OK) return BATT_CAL_RESET_UNREADABLE;
+    uint8_t state = 0;
+    const esp_err_t read = nvs_get_u8(nvs, "reset", &state);
+    nvs_close(nvs);
+    if (read == ESP_ERR_NVS_NOT_FOUND) return BATT_CAL_RESET_NONE;
+    return read == ESP_OK && state <= BATT_CAL_RESET_ON ? (batt_cal_reset_state_t)state : BATT_CAL_RESET_UNREADABLE;
+}
+
+static bool batt_cal_write_reset(void *ctx, batt_cal_reset_state_t state) {
+    (void)ctx;
+    nvs_handle_t nvs;
+    if (nvs_open("battcal", NVS_READWRITE, &nvs) != ESP_OK) return false;
+    const bool ok = nvs_set_u8(nvs, "reset", (uint8_t)state) == ESP_OK && nvs_commit(nvs) == ESP_OK;
+    nvs_close(nvs);
+    return ok;
+}
+
+static const batt_cal_storage_t s_batt_cal_storage = {
+    .read = batt_cal_read_slot, .write = batt_cal_write_slot,
+    .read_reset = batt_cal_read_reset, .write_reset = batt_cal_write_reset,
+};
+
 static void batt_save_current(void) {
+    (void)batt_cal_save(&s_batt_cal, &s_batt_cal_storage, esp_timer_get_time(), true);
     if (s_snap.flags & PMU_STATUS_BATTERY_VALID) batt_save(s_snap.soc_permille);
+}
+
+void device_power_get_batt_calibration(device_power_batt_calibration_status_t *out) {
+    if (!out) return;
+    batt_cal_status_t status;
+    batt_cal_status(&s_batt_cal, &status);
+    *out = (device_power_batt_calibration_status_t){
+        .enabled = status.enabled, .applied = status.applied, .save_error = status.save_error,
+        .sampled_bins = status.sampled_bins, .trusted_bins = status.trusted_bins, .total_bins = status.total_bins,
+    };
+}
+
+esp_err_t device_power_set_batt_calibration(bool enabled) {
+    if (!s_batt_cal.base) return ESP_ERR_INVALID_STATE;
+    const bool previous = s_batt_cal.record.enabled != 0;
+    if (previous == enabled) return ESP_OK;
+    const int64_t now = esp_timer_get_time();
+    if (s_batt_cal.reset_state != BATT_CAL_RESET_NONE &&
+        !batt_cal_save(&s_batt_cal, &s_batt_cal_storage, now, true)) return ESP_FAIL;
+    batt_cal_enable(&s_batt_cal, enabled, now);
+    if (batt_cal_save(&s_batt_cal, &s_batt_cal_storage, now, true)) return ESP_OK;
+    s_batt_cal.record.enabled = previous;
+    return ESP_FAIL;
+}
+
+esp_err_t device_power_reset_batt_calibration(void) {
+    if (!s_batt_cal.base) return ESP_ERR_INVALID_STATE;
+    return batt_cal_reset_persist(&s_batt_cal, &s_batt_cal_storage, esp_timer_get_time()) ? ESP_OK : ESP_FAIL;
+}
+
+void device_power_batt_calibration_lock(bool locked) {
+    batt_cal_lock(&s_batt_cal, locked, esp_timer_get_time());
 }
 
 /* ---- 校准日志 / Calibration log ---- */
@@ -1131,15 +1311,20 @@ static void poll_battery(void) {
         int32_t ocv_mv = (int32_t)mv;
         int32_t disp = 0;
         if (!s_batt_filter.inited && s_batt_saved_permille >= 0) {
-            const int32_t delta = s_batt_saved_permille - batt_curve_soc(batt_compensated_mv(mv, have_i, ma));
+            const int32_t delta = s_batt_saved_permille - batt_effective_soc(batt_compensated_mv(mv, have_i, ma));
             s_batt_restore = delta <= BATT_RESTORE_TOL_PERMILLE &&
                              delta >= -BATT_RESTORE_TOL_PERMILLE ? 1 : 5;
         }
+        const bool had_display = s_batt_filter.inited;
         batt_filter_step(&s_batt_filter, now, mv, have_i, ma, charging, charge_done,
                          s_batt_saved_permille, &ocv_mv, &disp);
         s_batt_saved_permille = -1;  // 恢复值只喂首采。 / The restore value feeds the first sample only.
         s_snap.battery_mv = (uint16_t)ocv_mv;
         s_snap.battery_raw = mv;
+        // 仅在产生新显示值时更新归属；重置或学习不能给保留的旧值换曲线身份。
+        // Update provenance only when publishing a new value; never relabel a held value after reset or learning.
+        if (!had_display || s_snap.soc_permille != (uint16_t)disp)
+            s_batt_display_model = batt_cal_model_id(&s_batt_cal);
         s_snap.soc_permille = (uint16_t)disp;
         s_snap.flags |= PMU_STATUS_BATTERY_VALID;
         s_snap.status_ok = true;
@@ -1161,6 +1346,14 @@ static void poll_battery(void) {
         s_snap.flags &= ~PMU_STATUS_BATTERY_VALID;
     }
 
+    // 学习直接消费本轮采样，不经过日志开关、队列或卡；欠压路径不等待保存。
+    // Learning consumes this poll directly, independent of log switches, queues and cards; undervoltage never waits for persistence.
+    batt_cal_observe(&s_batt_cal, now, have_v ? s_snap.battery_mv : 0, ma,
+                     have_v && have_i && have_chg && !s_charger_uv_shutdown,
+                     have_chg && ((charger_status & 0x07) != 0 || charging));
+    if (!s_batt_cal.locked && !s_charger_uv_shutdown)
+        (void)batt_cal_save(&s_batt_cal, &s_batt_cal_storage, now, false);
+
     if (logging) {
         if (s_batt_ic_us < 0 || sampled - s_batt_ic_us >= BATT_LOG_PERIOD_US) {
             s_batt_ic_soc = (int8_t)bq_read_soc();
@@ -1174,7 +1367,7 @@ static void poll_battery(void) {
             .charger_status = charger_status,
             .comp_mv = batt_compensated_mv(mv, have_i, ma),
             .ocv_mv = have_v ? s_snap.battery_mv : -1,
-            .curve_permille = have_v ? batt_curve_soc(s_snap.battery_mv) : -1,
+            .curve_permille = have_v ? batt_effective_soc(s_snap.battery_mv) : -1,
             .disp_permille = have_v ? s_snap.soc_permille : -1,
             .ic_soc = s_batt_ic_soc, .ic_us = s_batt_ic_us,
             .have_filter = have_v,
@@ -1224,12 +1417,13 @@ esp_err_t device_power_init(i2c_master_bus_handle_t bus_handle,
     (void)add_dev(CX25601N_ADDR, &s_cx);
     (void)add_dev(PCF8563_ADDR, &s_rtc);
 
-    // 充电芯片按原厂配置写一次（1 A 请求、4.4 V 截止）；失败不阻塞 PMU，并尽力停充。
-    // Configure the charger once with vendor defaults (1 A requested, 4.4 V regulation);
+    // 充电芯片按原厂配置写一次（恢复本机电流档位，4.4 V 截止）；失败不阻塞 PMU，并尽力停充。
+    // Configure the charger once using the saved profile and vendor 4.4 V regulation;
     // a failure never blocks the PMU and attempts to disable incomplete charging.
     s_charger_next_us = s_charger_resume_us = 0;
     s_charger_uv_shutdown = false;
-    s_charger_configured = s_cx != NULL && cx_charger_setup() == ESP_OK;
+    s_charge_current = charge_current_load();
+    s_charger_configured = s_cx != NULL && cx_charger_setup(s_charge_current) == ESP_OK;
     const bool rtc_ready = s_rtc != NULL && rtc_init() == ESP_OK;
     if (s_cx != NULL && !s_charger_configured) {
         ESP_LOGW(TAG, "CX25601N setup incomplete; charge disable attempted");
@@ -1254,6 +1448,8 @@ esp_err_t device_power_init(i2c_master_bus_handle_t bus_handle,
     }
     // 上次电量恢复值：深睡唤醒（复位重启）后显示连续。
     // Last-percent restore: keeps the display continuous after a deep-standby wake (reset boot).
+    batt_cal_init(&s_batt_cal, s_soc_curve, esp_timer_get_time());
+    (void)batt_cal_load(&s_batt_cal, &s_batt_cal_storage);
     s_batt_saved_permille = batt_load();
     s_batt_persisted_permille = s_batt_saved_permille;
 
@@ -1277,6 +1473,8 @@ esp_err_t device_power_deinit(void) {
     (void)device_power_key_sampler_enable(false);
     const esp_err_t parked = cx_charger_park();
     if (parked != ESP_OK) return parked;
+    batt_cal_lock(&s_batt_cal, true, esp_timer_get_time());
+    (void)batt_cal_save(&s_batt_cal, &s_batt_cal_storage, esp_timer_get_time(), true);
     s_charger_configured = false;
     s_charger_next_us = s_charger_resume_us = 0;
     device_power_set_batt_log(false);

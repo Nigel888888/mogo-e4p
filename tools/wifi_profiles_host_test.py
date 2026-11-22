@@ -66,13 +66,19 @@ def main():
             "ui": (["tools/transfer_ui_host_test.c", "main/ui/ui_text_edit.c", "main/ui/ui_text_input.c",
                     "main/ui/ui_keyboard.c", "main/ui/ui_ime.c", "components/book_search/book_search.c"],
                    ["tools/transfer_ui_stubs", "components/wifi_transfer/include",
-                    "components/book_search/include", "main/ui", "main/services"]),
+                    "components/book_search/include", "main", "main/ui", "main/services", "main/app"]),
         }
         for name, (sources, includes) in cases.items():
             binary = work / name
             subprocess.run(compiler + flags + ["-I" + path for path in includes] + sources +
                            ["-lm", "-o", str(binary)], cwd=ROOT, env=env, check=True)
             subprocess.run([str(binary)], cwd=ROOT, env=env, check=True)
+        sources, includes = cases["ui"]
+        binary = work / "ui-cloudzao"
+        subprocess.run(compiler + flags + ["-DCONFIG_MOGO_CLOUDZAO_TRANSFER=1"] +
+                       ["-I" + path for path in includes] + sources + ["-lm", "-o", str(binary)],
+                       cwd=ROOT, env=env, check=True)
+        subprocess.run([str(binary)], cwd=ROOT, env=env, check=True)
         subprocess.run([sys.executable, "tools/test_transfer_wifi_forget.py"], cwd=ROOT, env=env, check=True)
 
 

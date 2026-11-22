@@ -187,27 +187,6 @@ static int almanac_words(uint8_t *fb,const char *words,int x,int y,int width,int
     for(int i=0;i<=row;++i)if(rows[i][0])text(fb,x,y+i*34,px,rows[i],align,false);
     return row+1;
 }
-static void engraving(uint8_t *fb,int x,int y,const ornament_point_t (*curves)[4],unsigned count) {
-    for(unsigned i=0;i<count;++i){
-        ornament_point_t p[4];
-        for(int j=0;j<4;++j)p[j]=ornament_at(x,y,1,1,curves[i][j].x,curves[i][j].y);
-        ornament_curve(fb,p[0],p[1],p[2],p[3]);
-    }
-}
-static void blossom(uint8_t *fb,int x,int y) {
-    static const ornament_point_t petals[]={{0,-7},{7,-2},{4,6},{-4,6},{-7,-2}};
-    for(unsigned i=0;i<5;++i)epd_draw_circle(x+petals[i].x,y+petals[i].y,5,UI_GRAY_BLACK,fb);
-    epd_fill_circle(x,y,2,UI_GRAY_BLACK,fb);
-}
-static void plum_branch(uint8_t *fb,int x,int y) {
-    static const ornament_point_t curves[][4]={
-        {{-104,24},{-42,16},{17,-2},{72,-26}},{{-91,24},{-36,22},{20,1},{63,-18}},
-        {{-8,3},{-13,-7},{-18,-13},{-19,-23}},{{25,-10},{22,-20},{24,-24},{29,-31}},
-        {{-46,15},{-36,1},{-28,2},{-30,12}},{{43,-15},{48,-3},{61,-2},{60,-14}}};
-    engraving(fb,x,y,curves,sizeof(curves)/sizeof(curves[0]));
-    blossom(fb,x+72,y-26);blossom(fb,x-19,y-23);blossom(fb,x+29,y-31);
-    epd_fill_circle(x-62,y+15,3,UI_GRAY_BLACK,fb);
-}
 static void almanac_activities(uint8_t *fb,const calendar_date_t *d) {
     const char *const words[]={d->yi,d->ji};
     for(int i=0;i<2;++i){
@@ -221,15 +200,24 @@ static void almanac_activities(uint8_t *fb,const calendar_date_t *d) {
             lozenge(fb,x+side*112,537);
         }
         unsigned items=1;for(const char *p=words[i];*p;++p)if(*p==' ')++items;
-        int rows=almanac_words(fb,words[i],x,582,260,items<=4?32:26,4,0,EPD_DRAW_ALIGN_CENTER);
-        if(rows<=2)plum_branch(fb,x,680);
+        almanac_words(fb,words[i],x,582,260,items<=4?32:26,4,0,EPD_DRAW_ALIGN_CENTER);
     }
+}
+static void almanac_frame_line(uint8_t *fb,ornament_point_t a,ornament_point_t b,uint8_t gray) {
+    int dx=b.x-a.x; if(dx<0)dx=-dx;
+    int dy=b.y-a.y; if(dy<0)dy=-dy;
+    // 双像素描边让切角框在墨水屏上保持连续粗线。
+    // Two-pixel strokes keep chamfered frames visibly continuous on the panel.
+    bool vertical=dx<dy;
+    epd_draw_line(a.x,a.y,b.x,b.y,gray,fb);
+    epd_draw_line(a.x+(vertical?1:0),a.y+(vertical?0:1),
+                  b.x+(vertical?1:0),b.y+(vertical?0:1),gray,fb);
 }
 static void almanac_cut_frame(uint8_t *fb,EpdRect r,int cut,uint8_t gray) {
     int right=r.x+r.width-1,bottom=r.y+r.height-1;
     const ornament_point_t p[]={{r.x+cut,r.y},{right-cut,r.y},{right,r.y+cut},{right,bottom-cut},
         {right-cut,bottom},{r.x+cut,bottom},{r.x,bottom-cut},{r.x,r.y+cut}};
-    for(unsigned i=0;i<8;++i)epd_draw_line(p[i].x,p[i].y,p[(i+1)%8].x,p[(i+1)%8].y,gray,fb);
+    for(unsigned i=0;i<8;++i)almanac_frame_line(fb,p[i],p[(i+1)%8],gray);
 }
 static void almanac_plaque(uint8_t *fb,EpdRect r,const char *s,int px) {
     const int cut=6;

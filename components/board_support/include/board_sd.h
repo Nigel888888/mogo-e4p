@@ -40,6 +40,9 @@ esp_err_t board_sd_start_probe(void);
 /// 查询有效 CD 并锁存拔卡失效；检测通信失败保留快照。重新插入须显式 remount。
 /// / Latch removal only from valid CD; detection I/O failure preserves snapshots. Reinsertion needs explicit remount.
 esp_err_t board_sd_get_info(board_sd_info_t* info);
+/// 检查当前本机挂载；后台巡检忙时仍认可有效快照，不等待也不发起挂载。
+/// / Check the current local mount; busy health checks preserve valid snapshots. Does not wait or mount.
+bool board_sd_is_mounted(void);
 /// 更新空间快照，不重挂载、不写卡；勿在 render 中调用。
 /// Refresh allocation statistics without remounting or writing; never call from render.
 esp_err_t board_sd_refresh_space(void);

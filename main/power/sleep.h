@@ -31,8 +31,11 @@ typedef enum {
 /// 登记常开供电的触摸与加速度计，并准备 CPU 浅睡保持区。/ Bind always-on touch/accelerometer and prepare CPU light-sleep retention.
 void app_sleep_bind(cst836u_handle_t tp, sc7a20h_handle_t acc);
 
-/// light_only 为假时锁屏出图后立即断电交接；为真时按待机设置浅睡，定时档到时彻底关机。
-/// With light_only false, power down after the lock art; true follows the light-sleep setting, powering off at expiry for timed styles.
+/// 使用系统字体定稿独立关机画面，失败时不执行下电。/ Settle independent shutdown art with the system face; a failed present blocks power-off.
+bool app_shutdown_present(EpdiyHighlevelState *hl);
+
+/// light_only 为假时显示独立关机画面后断电；为真时先显示锁屏浅睡，定时到期再切换关机图。
+/// With light_only false, show independent shutdown art before power-off; otherwise show the lock until waking or timed shutdown.
 void enter_lock_and_sleep(
     EpdiyHighlevelState* hl, int64_t* ignore_until_ms, sc7a20h_handle_t acc, cst836u_handle_t touch,
     bool reader_background, bool light_only
@@ -53,6 +56,7 @@ void app_lock_wait_key_idle(int timeout_ms);
 app_wake_source_t app_light_sleep_wait(sc7a20h_handle_t acc);
 /// 锁屏浅睡按待机设置计时；超时保存锁屏并关机，失败回退原有无期限锁屏等待及故障恢复，不因超时解锁。
 /// Count the configured locked light sleep; expiry saves the art and powers off. Failure uses the existing untimed locked wait/recovery, never unlocking merely on timeout.
+/// 调用方持有整个校准锁，浅睡返回不代表实际解锁。/ The caller owns the calibration lock; return from light sleep is not an unlock.
 app_wake_source_t app_lock_sleep_wait(EpdiyHighlevelState *hl, sc7a20h_handle_t acc);
 app_wake_source_t app_last_wake_source(void);
 /// 软睡/关机前停用外设并落盘；成功不返回，交接失败恢复外设并返回错误。保留调用方的阅读/密码上下文。

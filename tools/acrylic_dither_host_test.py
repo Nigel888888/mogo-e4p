@@ -91,14 +91,16 @@ for name in ('ui_read_pixel', 'ui_acrylic_bw_rect', 'draw_frosted',
     unit += function('main/ui/ui_kit.c', name) + '\n'
 unit += '''static void draw_shelf_guard(uint8_t *fb,EpdRect r,int slot){(void)slot;ui_draw_acrylic_guard(fb,r);if(s_view==SHELF&&app_settings_main_fast_refresh())ui_acrylic_bw_rect(fb,r);}
 '''
-unit += function('main/apps/app_book.c', 'draw_shelf_furniture') + '\n'
+unit += """#define SHELF_FURNITURE_BOTTOM 226
+static EpdRect row_rect(int row){return (EpdRect){36,(s_view==SHELF?192:224)+(row/3)*282,190,260};}
+""" + function('main/apps/app_book.c', 'draw_shelf_furniture') + '\n'
 unit += r'''
 static uint8_t original[BYTES],gray[BYTES],dots[BYTES],again[BYTES];
 static bool inside(int x,int y){
     if(style!=2||s_view!=SHELF)return false;
     for(int row=0;row<3;++row){
         int top=192+row*282;
-        if(x>=20&&x<664&&y>=top+136&&y<top+226)return true;
+        if(x>=20&&x<664&&y>=top+181&&y<top+SHELF_FURNITURE_BOTTOM)return true;
     }
     return false;
 }

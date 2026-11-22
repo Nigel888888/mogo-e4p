@@ -37,7 +37,10 @@ bool display_refresh_resolve(display_refresh_intent_t intent, unsigned flags,
         case DISPLAY_REFRESH_MAIN_SCROLL:
             plan->waveform=context.main_ordinary ? DISPLAY_WAVE_MAIN_NORMAL : DISPLAY_WAVE_DEFAULT;
             plan->pad_lines=plan->pad_col_bytes=1; break;
-        case DISPLAY_REFRESH_READER_TEXT: plan->waveform=DISPLAY_WAVE_READER_TEXT; break;
+        case DISPLAY_REFRESH_READER_TEXT:
+            plan->waveform = context.reader_background ? DISPLAY_WAVE_READER_BACKGROUND : DISPLAY_WAVE_READER_TEXT;
+            if (context.reader_background) plan->coverage = DISPLAY_COVERAGE_AUTO;
+            break;
         case DISPLAY_REFRESH_READER_BODY:
             plan->waveform=reader; plan->mode=quick ? MODE_DU : MODE_GL16; break;
         case DISPLAY_REFRESH_READER_LAYOUT:

@@ -136,6 +136,11 @@ int main(void) {
     assert(callbacks == 2 && report.state == MM_CLEAN_PARTIAL && !report.released_internal && !report.released_psram);
     assert(mm_request_clean((mm_clean_reason_t)99, NULL) == ESP_ERR_INVALID_ARG);
     partial = false; extra[0] = extra[1] = 0;
+    assert(mm_check_capacity(MM_POOL_INTERNAL, totals[0], totals[0]) == MM_FAIL_NONE);
+    assert(mm_check_capacity(MM_POOL_INTERNAL, totals[0] + 1, 1) == MM_FAIL_CAPACITY);
+    largest[0] = 1024;
+    assert(mm_check_capacity(MM_POOL_INTERNAL, 4096, 1025) == MM_FAIL_FRAGMENTED);
+    largest[0] = 0;
     unsigned before = attempts;
     assert(!mm_alloc(MM_OWNER_READER, MM_POOL_PSRAM, SIZE_MAX, 16, 1));
     assert(!mm_alloc(MM_OWNER_READER, MM_POOL_PSRAM, 10, 3, 0));

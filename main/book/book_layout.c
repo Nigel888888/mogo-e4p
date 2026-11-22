@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
  *
- * 中文：借鉴阅读演示的逐码点折行，建立 PSRAM 页表并绘制章节。
- * English: Adapt the reading demo's codepoint wrapping into PSRAM chapter pagination.
+ * 中文：按词边界与标点禁则折行，建立 PSRAM 页表并绘制章节。
+ * English: Wrap at word boundaries and punctuation constraints, paginate in PSRAM and draw chapters.
  *
  * 冻结：原文由调用方持有；字体测量和绘制必须由调用方串行化。
  * Frozen: Caller owns source text and serializes all font measurement and drawing.
@@ -11,6 +11,7 @@
 #include "../diagnostics/reader_memory.h"
 #include "../diagnostics/reader_perf.h"
 #include "book_layout.h"
+#include "book_hyphen_en.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +28,7 @@ static size_t s_count;
 static size_t s_capacity;
 static book_layout_draw_cursor_t *s_idle_draw;
 static char* s_line;
-static size_t s_line_capacity;
+static size_t s_line_capacity, s_line_source_bytes;
 static EpdRect s_rect;
 static int s_px;
 static unsigned s_line_percent = 150, s_paragraph_percent = 50;
@@ -93,15 +94,13 @@ static int right_slack(void) { return s_right_slack >= 0 ? s_right_slack : s_rec
 // 块表是有序字节区间，二分查找当前行样式。/ Blocks are ordered byte ranges; binary-search the line style.
 static const blk_t* block_at(size_t off) {
     if (!s_block_count) return NULL;
-    if (off < s_blocks[0].offset) return NULL;
     size_t lo = 0, hi = s_block_count;
     while (lo + 1 < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (s_blocks[mid].offset <= off) lo = mid;
         else hi = mid;
     }
-    const blk_t *block = &s_blocks[lo];
-    return off < block->offset + block->len ? block : NULL;
+    return &s_blocks[lo];
 }
 
 // 字体 run 表由调用方借用（和块表同一份 html_text），绘制时按段换字体。
@@ -142,6 +141,9 @@ static void record_glyph(void *context, const ttf_glyph_position_t *p) {
     (void)context;
     glyph_map_t *map = s_glyph_out;
     if (!map || !map->glyphs || map->overflow) return;
+    // 行尾补出的连字符没有原文字节，也不应成为可选字形。
+    // The display-only hyphen has no source byte and is not selectable.
+    if (p->start >= s_line_source_bytes) return;
     if (map->count >= BOOK_LAYOUT_GLYPH_MAX || p->end < p->start ||
         s_glyph_base > UINT32_MAX || p->end > UINT32_MAX - s_glyph_base ||
         p->end - p->start > UINT16_MAX || p->x < 0 || p->y < 0 ||
@@ -477,9 +479,7 @@ static size_t skip_image_spacing(size_t off) {
         if (visible != off) { off = visible; continue; }
         if (!s_block_count) break;
         const blk_t* block = block_at(off);
-        // TXT blocks omit blank source lines; let take_line consume those lines as ordinary
-        // paragraph breaks instead of dereferencing a missing block or dropping the spacing.
-        if (!block || block->offset != off) break;
+        if (block->offset != off) break;
         size_t end = block->offset + block->len;
         if (block->image >= 0) {
             if (s_images_visible) break;
@@ -521,6 +521,46 @@ static bool prohibited_line_end(uint32_t cp) {
             return true;
         default: return false;
     }
+}
+
+static bool wrap_space(uint32_t cp) {
+    return cp == ' ' || cp == '\t' || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200a && cp != 0x2007) ||
+           cp == 0x205f || cp == 0x3000;
+}
+
+static uint32_t peek_codepoint(size_t off, size_t limit) {
+    if (off >= limit) return 0;
+    size_t n = codepoint_size(s_text + off, limit - off);
+    return n ? codepoint_value(s_text + off, n) : 0;
+}
+
+static bool latin_word_char(uint32_t cp) {
+    return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9') ||
+           (cp >= 0xc0 && cp <= 0x24f && cp != 0xd7 && cp != 0xf7) ||
+           (cp >= 0x300 && cp <= 0x36f) || (cp >= 0x1e00 && cp <= 0x1eff);
+}
+
+typedef enum { WRAP_FREE, WRAP_WORD, WRAP_OPEN, WRAP_CLOSE, WRAP_GLUE } wrap_class_t;
+
+static wrap_class_t wrap_class(uint32_t cp, wrap_class_t previous, size_t after, size_t limit) {
+    if (latin_word_char(cp)) return WRAP_WORD;
+    if (cp == 0xa0 || cp == 0x2007 || cp == 0x2011 || cp == 0x202f || cp == 0x2060 || cp == 0xfeff)
+        return WRAP_GLUE;
+    if (cp == '\'' || cp == '"' || cp == 0x2019 || cp == '-' || cp == 0x2010) {
+        uint32_t next = peek_codepoint(after, limit);
+        // 词内撇号与连字符不成断点；直引号仅在有开引号上下文时当作左标点。
+        // Keep internal apostrophes and hyphens; treat straight quotes as openers only in opening context.
+        if (cp != '"' && previous == WRAP_WORD && latin_word_char(next)) return WRAP_WORD;
+        if (cp == '\'' || cp == '"') {
+            bool followed_by_text = next && next != '\r' && next != '\n' &&
+                                    !wrap_space(next) && !prohibited_line_start(next);
+            return (previous == WRAP_FREE || previous == WRAP_OPEN) && followed_by_text
+                ? WRAP_OPEN : WRAP_CLOSE;
+        }
+    }
+    if (prohibited_line_start(cp)) return WRAP_CLOSE;
+    if (prohibited_line_end(cp)) return WRAP_OPEN;
+    return WRAP_FREE;
 }
 
 uint32_t book_layout_generation(void) { return s_generation; }
@@ -686,16 +726,6 @@ static int gap_for(int height, bool heading) {
     return (int)((unsigned)height * s_paragraph_percent / (heading ? 150 : 100));
 }
 
-// 章首块由页面题头接管：保留页表起点用于进度与命中测试，正文流跳过这一个块。
-// A chapter-start block is owned by the page heading: keep its page-table offset for progress
-// and hit testing, but skip the block in the body stream because the caller paints it as chrome.
-static size_t after_block(size_t off, const blk_t *block) {
-    size_t next = block ? block->offset + block->len : off;
-    if (next < s_len && s_text[next] == '\r') ++next;
-    if (next < s_len && s_text[next] == '\n') ++next;
-    return next;
-}
-
 static bool append_page(size_t off) {
     if (s_count == PAGE_MAX) return false;
     if (s_count == s_capacity) {
@@ -715,12 +745,6 @@ static bool append_page(size_t off) {
     ++s_count;
     s_page_img_start[s_count] = (uint32_t)s_image_count;
     return true;
-}
-
-static bool page_starts_chapter(size_t page) {
-    if (page >= s_count || !s_block_count) return false;
-    const blk_t *block = block_at(s_pages[page]);
-    return block && block->offset == s_pages[page] && block->chapter_start;
 }
 
 // 段首的全角/半角空白不参与排版，缩进由阅读设置决定；返回第一个可见字节。
@@ -766,6 +790,60 @@ static bool line_append(size_t at, const char *text, size_t bytes) {
     s_line[at + bytes] = 0;
     return true;
 }
+static bool english_letter(unsigned char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+}
+
+// 仅处理简单英文字词。跨行的词用原词匹配规则，不把上次的折行当成词首。
+// Match plain English words only, using the original word even on a continuation line.
+static bool english_hyphen_at(size_t from, size_t line_start, size_t fitted_end, size_t limit,
+                              int px, int available, int64_t width, size_t* split, int64_t* split_width) {
+    if (fitted_end - from < 2 || !english_letter((unsigned char)s_text[from])) return false;
+    size_t start = from;
+    if (start == line_start) {
+        while (start && english_letter((unsigned char)s_text[start - 1])) {
+            if (from - start >= BOOK_HYPHEN_EN_MAX) return false;
+            --start;
+        }
+    }
+    if (start) {
+        size_t prev = start - 1;
+        while (prev && ((unsigned char)s_text[prev] & 0xc0) == 0x80) --prev;
+        uint32_t cp = peek_codepoint(prev, start);
+        if (latin_word_char(cp) || cp == '-' || cp == '@' || cp == '/' || cp == '.' ||
+            (cp >= 0x80 && !wrap_space(cp) && !prohibited_line_start(cp) && !prohibited_line_end(cp)))
+            return false;
+    }
+    size_t stop = start;
+    while (stop < limit && english_letter((unsigned char)s_text[stop])) {
+        if (stop - start >= BOOK_HYPHEN_EN_MAX) return false;
+        ++stop;
+    }
+    if (stop < fitted_end) return false;
+    uint32_t after = peek_codepoint(stop, limit);
+    size_t after_size = codepoint_size(s_text + stop, limit - stop);
+    wrap_class_t next = wrap_class(after, WRAP_WORD, stop + after_size, limit);
+    if (next == WRAP_WORD || next == WRAP_GLUE || after == '@' || after == '/' ||
+        (after == '.' && latin_word_char(peek_codepoint(stop + after_size, limit)))) return false;
+    uint64_t breaks = book_hyphen_en_breaks(s_text + start, stop - start);
+    if (!breaks) return false;
+    *split = from;
+    for (size_t at = from; at < fitted_end; ++at) {
+        char letter[2] = {s_text[at], 0};
+        slot_select_for(at);
+        width += ttf_text_width_px(px, letter) + (at > line_start ? s_tracking_px : 0);
+        size_t before = at + 1;
+        if (before - from < 2 || !(breaks & (UINT64_C(1) << (before - start)))) continue;
+        int hyphen = ttf_text_width_px(px, "-");
+        int64_t candidate = width + s_tracking_px + hyphen;
+        if (hyphen > 0 && candidate >= 0 && candidate <= available) {
+            *split = before;
+            *split_width = candidate;
+        }
+    }
+    return *split > from;
+}
+
 static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* next,
                       bool* paragraph_end, int* px, bool* heading,
                       int* line_width, int* indent, uint8_t* align,
@@ -821,93 +899,119 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
     }
     int available = advance_limit - *indent;
     size_t end = visible_off;
-    size_t last_start = visible_off;
-    uint32_t last_cp = 0;
     int64_t width = 0;
-    int64_t last_width = 0;
     int glyph_count = 0;
+    wrap_class_t previous = WRAP_FREE;
+    bool in_space = false, emergency_tail = false;
+    size_t word_fragment = visible_off;
+    int64_t word_prefix_width = 0;
+    // 只记最近的合法断点。尾随标点串全部放得下才提交，否则退回正文前的断点。
+    // Keep the latest legal break. A closing run must fit in full, or we rewind before its anchor.
+    size_t wrap_end = visible_off, wrap_next = visible_off, hyphen_end = visible_off;
+    int64_t wrap_width = 0, hyphen_width = 0;
+    int hang = !*heading && !*align && hang_margin > 4 ? *px / 3 : 0;
+    if (hang > hang_margin - 4) hang = hang_margin > 4 ? hang_margin - 4 : 0;
     s_line[0] = 0;
     *paragraph_end = false;
     while (end < limit && s_text[end] != '\r' && s_text[end] != '\n') {
-        size_t n = codepoint_size(s_text + end, s_len - end);
+        size_t n = codepoint_size(s_text + end, limit - end);
         if (!n) return false;
         uint32_t cp = codepoint_value(s_text + end, n);
-        // 字体逐字取整后累加 advance；单字测量避免反复扫描整行前缀。
-        // Font advances are rounded per glyph and summed; measure each glyph once instead of every prefix.
+        bool space = wrap_space(cp);
+        wrap_class_t current = wrap_class(cp, in_space ? WRAP_FREE : previous, end + n, limit);
+        if (current == WRAP_WORD && previous != WRAP_WORD) {
+            word_fragment = end;
+            word_prefix_width = width;
+        }
+        if (end > visible_off && !in_space && previous != WRAP_OPEN && previous != WRAP_GLUE) {
+            if (space) {
+                // 软折行省略分隔空白，显示终点和下行原文偏移分别记录。
+                // Omit separators at a soft wrap; track the visible end and next source offset separately.
+                size_t after = end + n;
+                uint32_t following = peek_codepoint(after, limit);
+                while (wrap_space(following)) {
+                    after += codepoint_size(s_text + after, limit - after);
+                    following = peek_codepoint(after, limit);
+                }
+                wrap_class_t following_class = wrap_class(following, WRAP_FREE,
+                    after + codepoint_size(s_text + after, limit - after), limit);
+                if (following_class != WRAP_CLOSE && following_class != WRAP_GLUE) {
+                    wrap_end = end;
+                    wrap_next = after;
+                    wrap_width = width;
+                }
+            } else if (!space && current != WRAP_CLOSE && current != WRAP_GLUE &&
+                       !(previous == WRAP_WORD && current == WRAP_WORD)) {
+                wrap_end = wrap_next = end;
+                wrap_width = width;
+            }
+        }
+        // 每字按自己的字体 run 测宽，不因回退重复测量整行前缀。
+        // Measure each glyph in its own font run without remeasuring whole prefixes on rewind.
         char glyph[5];
         memcpy(glyph, s_text + end, n);
         glyph[n] = 0;
-        // 每个字都按自己那一段的字体量宽：行宽、字距和对齐算法一个字没改。
-        // Every glyph is measured in its own span's face; width, tracking and alignment math
-        // are untouched.
         slot_select_for(end);
         int64_t candidate = width + ttf_text_width_px(*px, glyph) +
                             (end > visible_off && !*heading ? s_tracking_px : 0);
         if (candidate < 0) return false;
-        if (candidate > available) {
+        if (candidate > available || width > available) {
             if (end == visible_off) return false;
-            // 优先让行尾正文对齐，再允许右标点小幅悬挂到留白；超出安全宽度才回退前一字。
-            // Align the text edge first, hang a closing mark slightly into the margin, then roll back only if needed.
-            if (prohibited_line_start(cp)) {
-                // 竖排传 0：列底没有可悬挂的留白，标点一律回退到下一列。
-                // Vertical setting passes 0: a column has no bottom slack to hang into, so the
-                // mark always rolls back to the next column.
-                int hang = hang_margin > 4 ? *px / 3 : 0;
-                if (hang > hang_margin - 4) hang = hang_margin - 4;
-                if (hang < 0) hang = 0;
-                int squeeze = glyph_count > 1 ? (glyph_count - 1) * 3 : 0;
-                if (candidate <= (int64_t)available + hang + squeeze) {
-                    if (!line_append(end - visible_off, glyph, n)) return false;
-                    width = candidate;
-                    end += n;
+            // 只在可实际压缩的横排正文使用字距预算。竖排与题头不能依靠它。
+            // Only fitted horizontal body lines have a compression budget, not columns or headings.
+            int64_t squeeze = !s_vertical && !*heading && !*align && glyph_count >= 2
+                ? (int64_t)(glyph_count - 1) * 3 : 0;
+            if (current != WRAP_CLOSE || candidate > (int64_t)available + hang + squeeze) {
+                size_t split;
+                int64_t split_width = 0;
+                if (!s_vertical && !*heading && !*align && word_fragment >= wrap_end &&
+                    previous == WRAP_WORD && (current == WRAP_WORD || current == WRAP_CLOSE) &&
+                    english_hyphen_at(word_fragment, visible_off, end, limit, *px, available,
+                                      word_prefix_width, &split, &split_width)) {
+                    end = split;
+                    width = split_width;
+                    if (!line_append(end - visible_off, "-", 1)) return false;
                     break;
                 }
-                if (last_start > visible_off) {
-                    end = last_start;
+                if (wrap_end > visible_off || hyphen_end > visible_off) {
+                    // 整词移不走时，优先在已有连字符后断开，不在词内任意截断。
+                    // When a word cannot move intact, prefer its existing hyphen to an arbitrary glyph break.
+                    bool legal_break = wrap_end > visible_off;
+                    end = legal_break ? wrap_end : hyphen_end;
+                    width = legal_break ? wrap_width : hyphen_width;
                     s_line[end - visible_off] = 0;
-                    width = last_width;
-                    break;
+                    *next = legal_break ? wrap_next : end;
+                    goto line_ready;
                 }
-                // 极窄行容不下两个字时才保留悬挂，避免出现以标点开头的死循环。
-                // Only a one-glyph-wide line may hang punctuation to avoid a non-progressing wrap.
-                if (candidate <= (int64_t)available + *px * 2) {
-                    if (!line_append(end - visible_off, glyph, n)) return false;
-                    width = candidate;
-                    end += n;
-                    break;
-                }
+                // 超长词按字兜底；极窄行最多额外容纳少量相连标点，确保可以前进。
+                // Fall back to glyph breaks for overlong words; very narrow lines may carry a small punctuation tail.
+                if (!(current == WRAP_CLOSE && (glyph_count == 1 || emergency_tail)) &&
+                    !(previous == WRAP_OPEN && glyph_count == 1 && !space)) break;
+                if (candidate > (int64_t)available + (int64_t)*px * 2) break;
+                emergency_tail = true;
             }
-            // 若最后一个字是左括号，将它回退到下一行；极窄行则让括号和首字成组悬挂。
-            // Move a trailing opener to the next line; on a one-glyph line keep the pair together.
-            if (prohibited_line_end(last_cp)) {
-                if (last_start > visible_off) {
-                    end = last_start;
-                    s_line[end - visible_off] = 0;
-                    width = last_width;
-                } else if (candidate <= (int64_t)available + *px * 2) {
-                    if (!line_append(end - visible_off, glyph, n)) return false;
-                    width = candidate;
-                    end += n;
-                }
-            }
-            break;
         }
-        last_width = width;
         width = candidate;
         ++glyph_count;
-        last_start = end;
-        last_cp = cp;
+        previous = current;
+        in_space = space;
         if (!line_append(end - visible_off, glyph, n)) return false;
         end += n;
+        if (current == WRAP_WORD && (cp == '-' || cp == 0x2010)) {
+            hyphen_end = end;
+            hyphen_width = width;
+        }
     }
+    *next = end;
+line_ready:
+    s_line_source_bytes = end - visible_off;
     line_runs_build(block, visible_off, end);
     *line_width = (int)width;
-    *next = end;
     if (line_start) *line_start = visible_off;
     if (line_end) *line_end = end;
-    if (end < s_len && (s_text[end] == '\r' || s_text[end] == '\n')) {
-        *next = end + 1;
-        if (s_text[end] == '\r' && *next < s_len && s_text[*next] == '\n') (*next)++;
+    if (*next < s_len && (s_text[*next] == '\r' || s_text[*next] == '\n')) {
+        size_t newline = (*next)++;
+        if (s_text[newline] == '\r' && *next < s_len && s_text[*next] == '\n') (*next)++;
         *paragraph_end = !block || !block->line_break_after;
     }
     return *next > off;
@@ -938,14 +1042,6 @@ static bool build_vertical(size_t len) {
         size_t visible_off = skip_image_spacing(off);
         if (visible_off != off) { off = visible_off; continue; }
         const blk_t* block = block_at(off);
-        if (block && block->offset == off && block->chapter_start) {
-            // 竖排同样让章首单独占一页，并让开右侧题头列。
-            // Vertical layout follows the same page break and reserves the heading columns.
-            if (s_pages[s_count - 1] != off && !append_page(off)) return false;
-            used = s_chapter_lead_width < (unsigned)s_rect.width ? s_chapter_lead_width : 0;
-            off = after_block(off, block);
-            continue;
-        }
         if (block && block->image >= 0 && off == block->offset) {
             int img_w = 0, img_h = 0;
             // 首页题头占的就是顶部这一条，插图不能在题头上开画。
@@ -1015,21 +1111,13 @@ bool book_layout_build_blocks(const char* utf8, size_t len, const blk_t* blocks,
         size_t expected = 0;
         for (size_t i = 0; i < count; ++i) {
             const blk_t* b = &blocks[i];
-            if (b->offset > len) return false;
-            while (expected < b->offset && expected < len &&
-                   (utf8[expected] == '\r' || utf8[expected] == '\n')) ++expected;
             if (b->offset != expected || b->offset >= len || !b->len || b->len > len - b->offset ||
                 ((unsigned char)utf8[b->offset] & 0xc0) == 0x80) return false;
             size_t end = b->offset + b->len;
             if (i + 1 < count) {
-                if (end >= len) return false;
-                expected = end;
-                while (expected < len && (utf8[expected] == '\r' || utf8[expected] == '\n')) ++expected;
-                if (expected != blocks[i + 1].offset) return false;
-            } else {
-                while (end < len && (utf8[end] == '\r' || utf8[end] == '\n')) ++end;
-                if (end != len) return false;
-            }
+                if (end >= len || utf8[end] != '\n') return false;
+                expected = end + 1;
+            } else if (end != len) return false;
         }
     }
     s_blocks = blocks;
@@ -1068,16 +1156,6 @@ bool book_layout_build_blocks(const char* utf8, size_t len, const blk_t* blocks,
         size_t visible = skip_image_spacing(off);
         if (visible != off) { off = visible; continue; }
         const blk_t* block = block_at(off);
-        if (block && block->offset == off && block->chapter_start) {
-            // 章首不允许和上一章共页；若页表已经因行满落在这里，只复用现有页。
-            // A chapter start may not share a page with the preceding chapter. If wrapping has
-            // already opened a page at this offset, reuse it instead of appending a duplicate.
-            if (s_pages[s_count - 1] != off && !append_page(off)) goto fail;
-            used = s_lead_height;
-            pending_gap = 0;
-            off = after_block(off, block);
-            continue;
-        }
         if (block && block->image >= 0 && off == block->offset) {
             used += pending_gap;
             pending_gap = 0;
@@ -1154,22 +1232,6 @@ size_t book_layout_page_start_offset(size_t page) {
     return page < s_count ? s_pages[page] : s_len;
 }
 
-bool book_layout_page_chapter_title(size_t page, char *buf, size_t cap) {
-    if (!buf || !cap) return false;
-    buf[0] = 0;
-    if (page >= s_count || !s_block_count || !s_text) return false;
-    const blk_t *block = block_at(s_pages[page]);
-    if (!block || block->offset != s_pages[page] || !block->chapter_start ||
-        block->image >= 0 || !block->len) return false;
-    size_t n = block->len;
-    if (n >= cap) n = cap - 1;
-    while (n && ((unsigned char)s_text[block->offset + n] & 0xc0) == 0x80) --n;
-    if (!n) return false;
-    memcpy(buf, s_text + block->offset, n);
-    buf[n] = 0;
-    return true;
-}
-
 size_t book_layout_page_for_offset(size_t off) {
     size_t lo = 0, hi = s_count;
     while (lo + 1 < hi) {
@@ -1244,8 +1306,7 @@ static void draw_vertical_column(uint8_t* fb, EpdRect rect, int left, int pitch,
 static void draw_vertical_page(uint8_t* fb, size_t page, EpdRect rect) {
     size_t off = s_pages[page];
     size_t end = page + 1 < s_count ? s_pages[page + 1] : s_len;
-    int64_t used = (page == 0 || page_starts_chapter(page)) &&
-                   s_chapter_lead_width < (unsigned)rect.width
+    int64_t used = page == 0 && s_chapter_lead_width < (unsigned)rect.width
         ? (int64_t)s_chapter_lead_width : 0;
     uint32_t img_at = s_page_img_start ? s_page_img_start[page] : 0;
     const uint32_t img_end = s_page_img_start ? s_page_img_start[page + 1] : 0;
@@ -1255,12 +1316,6 @@ static void draw_vertical_page(uint8_t* fb, size_t page, EpdRect rect) {
     while (off < end) {
         size_t visible = skip_image_spacing(off);
         if (visible != off) { off = visible; continue; }
-        const blk_t* chapter_block = block_at(off);
-        if (chapter_block && chapter_block->offset == off && chapter_block->chapter_start) {
-            used = s_chapter_lead_width < (unsigned)rect.width ? s_chapter_lead_width : 0;
-            off = after_block(off, chapter_block);
-            continue;
-        }
         const blk_t* image_block = block_at(off);
         if (image_block && image_block->image >= 0 && off == image_block->offset) {
             // 插图独占一页，位置由调用方按整页图绘制；记录只用于识别这一页。
@@ -1347,7 +1402,7 @@ static void draw_page_impl(uint8_t* fb, size_t page, EpdRect rect, int px) {
     if (s_vertical) { draw_vertical_page(fb, page, rect); return; }
     size_t off = s_pages[page];
     size_t end = page + 1 < s_count ? s_pages[page + 1] : s_len;
-    int64_t used = (page == 0 || page_starts_chapter(page)) ? s_lead_height : 0;
+    int64_t used = page == 0 ? s_lead_height : 0;
     int64_t pending_gap = 0;
     // 本页插图按出现顺序排在池里，游标走到哪个块就用哪条记录，不必再查表。
     // This page's images sit in the pool in encounter order, so the walk just consumes them in
@@ -1361,11 +1416,6 @@ static void draw_page_impl(uint8_t* fb, size_t page, EpdRect rect, int px) {
     while (off < end) {
         size_t visible = skip_image_spacing(off);
         if (visible != off) { off = visible; continue; }
-        const blk_t* chapter_block = block_at(off);
-        if (chapter_block && chapter_block->offset == off && chapter_block->chapter_start) {
-            off = after_block(off, chapter_block);
-            continue;
-        }
         const blk_t* image_block = block_at(off);
         if (image_block && image_block->image >= 0 && off == image_block->offset) {
             while (img_at < img_end && s_images[img_at].image != image_block->image) ++img_at;
@@ -1437,7 +1487,7 @@ static void draw_page_impl(uint8_t* fb, size_t page, EpdRect rect, int px) {
                 // Justify complete body lines; a hanging closer may use a small part of the right margin.
                 int slack = right_slack();
                 int hang = slack > 4 ? line_px / 3 : 0;
-                if (hang > slack - 4) hang = slack - 4;
+                if (hang > slack - 4) hang = slack > 4 ? slack - 4 : 0;
                 justify_target = line_width > available ? available + hang : available;
             }
             // 位置上移或页底裁剪可能落进字格，画线后补回这一行，避免盖浅原有笔画；不重复记字形。

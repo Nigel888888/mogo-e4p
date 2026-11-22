@@ -72,7 +72,7 @@ static bool avatar_content_crop(const uint8_t *gray, unsigned width, unsigned he
 }
 
 static bool image_pixels(uint8_t *fb, uint8_t *pixels, const char *path, EpdRect area, int radius,
-                         ui_wallpaper_mode_t mode) {
+                         ui_wallpaper_mode_t mode, bool wallpaper) {
     if ((!fb && !pixels) || !path || strncmp(path, "/sdcard/", 8) ||
         area.width <= 0 || area.height <= 0 ||
         area.x < 0 || area.y < 0 ||
@@ -175,7 +175,8 @@ static bool image_pixels(uint8_t *fb, uint8_t *pixels, const char *path, EpdRect
                 crop_x + (int)((int64_t)(x - draw_x) * crop_w / draw_w);
             uint8_t value = source_row[source_x];
             if (pixels) pixels[(size_t)(y-area.y)*area.width + x-area.x] = value;
-            else epd_draw_pixel(x, y, ui_image_dither_gray(value, x, y), fb);
+            else epd_draw_pixel(x, y, ui_image_dither_gray(wallpaper ? ui_image_wallpaper_tone(value) : value,
+                                                          x, y), fb);
         }
     }
     free(source_x_map);
@@ -189,12 +190,12 @@ bool ui_wallpaper_draw(uint8_t *fb, const char *path, EpdRect area) {
 }
 
 bool ui_wallpaper_draw_mode(uint8_t *fb, const char *path, EpdRect area, ui_wallpaper_mode_t mode) {
-    return image_pixels(fb, NULL, path, area, 0, mode);
+    return image_pixels(fb, NULL, path, area, 0, mode, true);
 }
 
 bool ui_wallpaper_draw_rounded(uint8_t *fb, const char *path, EpdRect area, int radius) {
     if (radius < 0 || radius > area.width / 2 || radius > area.height / 2) return false;
-    return image_pixels(fb, NULL, path, area, radius, UI_WALLPAPER_MODE_CROP);
+    return image_pixels(fb, NULL, path, area, radius, UI_WALLPAPER_MODE_CROP, false);
 }
 
 void ui_wallpaper_draw_avatar(uint8_t *fb, const uint8_t *pixels, EpdRect area, int radius) {
@@ -211,7 +212,7 @@ void ui_wallpaper_draw_avatar(uint8_t *fb, const uint8_t *pixels, EpdRect area, 
 #define WALL_LOCK_CACHE UI_WALLPAPER_CACHE_PARENT "/locks/wallpaper.bin"
 #define WALL_LOCK_BYTES (684u*1216u/2u)
 #define WALL_LOCK_MAGIC UINT32_C(0x574c4b31)
-#define WALL_LOCK_VERSION 2u
+#define WALL_LOCK_VERSION 4u
 bool ui_wallpaper_prepare_lock_mode(uint8_t *fb,const char *path,ui_wallpaper_mode_t mode);
 // 只缓存最终16级抖动画布到卡；借用锁屏画布，不常驻第二份整帧。
 // Persist final 16-level dithered art on SD, borrowing the lock canvas instead of retaining another frame.
@@ -305,7 +306,7 @@ bool ui_wallpaper_prepare_avatar(const char *path,uint8_t *pixels,int side) {
     wallpaper_cache_t h,after;char cache_path[160],after_path[160];
     if(!pixels||!avatar_cache_header(path,side,&h,cache_path))return false;
     if(ui_wallpaper_avatar_cached(path,pixels,side))return true;
-    if(!image_pixels(NULL,pixels,path,(EpdRect){0,0,side,side},1,UI_WALLPAPER_MODE_CROP))return false;
+    if(!image_pixels(NULL,pixels,path,(EpdRect){0,0,side,side},1,UI_WALLPAPER_MODE_CROP,false))return false;
     // 文件在解码期间变化或卡不可写时直接使用当前像素，不存过期/半写的文件。
     // Use decoded pixels without saving stale or partial files if the source changes or storage is unwritable.
     if(!avatar_cache_header(path,side,&after,after_path)||after.key!=h.key||

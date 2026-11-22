@@ -22,5 +22,7 @@ typedef uint32_t (*book_mini_random_fn)(void *ctx);
 /// 输入已去重且可见的目录；保留随机幸存项和焦点，换批尽量避开旧批。/ Accept a distinct visible catalog; preserve surviving random items/focus and maximize novelty on reshuffle.
 void book_mini_library_update(book_mini_library_t *model, const book_shelf_entry_t *entries, size_t count,
                               bool reshuffle, book_mini_random_fn random, void *ctx);
+/// 仅重排最近阅读，随机书组与焦点不变。/ Reorder recent reads without changing the random deck or its focus.
+void book_mini_library_update_recent(book_mini_library_t *model, const book_shelf_entry_t *entries, size_t count);
 /// 失卡时原地去掉卡上条目，不读文件。/ Remove card-backed items in place on media loss without IO.
 void book_mini_library_drop_card(book_mini_library_t *model);

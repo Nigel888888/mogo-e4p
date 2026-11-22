@@ -76,6 +76,10 @@ int main(int argc,char **argv){
     clock_ms=1794239999000LL;variant=APP_CALENDAR_ALMANAC;
     assert(!lock_calendar_draw(NULL));assert(lock_calendar_draw(fb));uint64_t key=lock_calendar_key();
     assert((key&UINT64_C(0xffffffff00000000))==UINT64_C(0x43414c0400000000));
+    uint64_t standby_frame=lock_calendar_frame_key();
+    assert(lock_calendar_draw_variant(fb,true)&&lock_calendar_frame_key()==standby_frame);
+    assert(lock_calendar_draw_variant(fb,false)&&lock_calendar_frame_key()==standby_frame);
+    assert(!lock_calendar_draw_variant(NULL,true));
     assert(key==lock_calendar_frame_key());clock_ms+=1000;
     assert(key!=lock_calendar_key()&&key==lock_calendar_frame_key());
     assert(lock_calendar_draw(fb)&&lock_calendar_key()==lock_calendar_frame_key());

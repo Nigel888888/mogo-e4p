@@ -20,6 +20,7 @@ for retired in ("HOME_COMPONENT", "HOME_GOAL", "HOME_TIME", "ui_home_clock",
 
 unit = r'''
 #include <assert.h>
+#include "''' + str(ROOT/'main/image/image_decode.h') + r'''"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,7 +46,7 @@ enum EpdFontFlags {EPD_DRAW_ALIGN_LEFT, EPD_DRAW_ALIGN_CENTER, EPD_DRAW_ALIGN_RI
 typedef enum {APP_REDRAW_NONE, APP_REDRAW_AREA, APP_REDRAW_PAGE, APP_REDRAW_FULL} app_redraw_t;
 typedef struct {int x,y,width,height;} EpdRect;
 typedef struct {bool touched;} touch_t;
-typedef struct {bool consumed;touch_t *touch;uint8_t *fb;void *hl;int64_t now_ms;void *request_app;bool request_menu;} app_ctx_t;
+typedef struct {bool consumed;touch_t *touch;uint8_t *fb;void *hl;int64_t now_ms,last_input_ms;void *request_app;bool request_menu;} app_ctx_t;
 enum {UI_GESTURE_PRESS, UI_GESTURE_MOVE, UI_GESTURE_TAP, UI_GESTURE_LONG_PRESS,
       UI_GESTURE_SWIPE_L, UI_GESTURE_SWIPE_R, UI_GESTURE_SWIPE_U, UI_GESTURE_CANCEL};
 typedef struct {int type,x0,y0,x,y;} ui_gesture_event_t;
@@ -62,6 +63,9 @@ static char s_avatar_path[288],s_excerpt[128];
 static uint8_t s_avatar[3600];
 static EpdRect s_pressed,s_area,last_area;
 static int64_t s_clock_minute=-2,minute;
+#define HOME_BACKGROUND_QUIET_MS 1500
+static int64_t s_background_after_ms;
+static int64_t esp_timer_get_time(void){return 0;}
 static unsigned s_cover_generation;
 static int s_cover_next,cover_calls,scan_calls,nav=-1,open_calls,library_calls,weather_requests;
 static bool library_city;
@@ -206,7 +210,7 @@ unit += "\n" + function("ui_contrast_gray", ROOT / "main/ui/ui_kit.c")
 unit += "\n" + function("ui_inset_rect", ROOT / "main/ui/ui_kit.c")
 unit += doubles() + ui_doubles()
 for name in ("home_cover_generation_begin", "mini_frame", "mini_cancel", "home_region", "continue_card_rect", "continue_card_hit_rect", "continue_card_pressed",
-             "control_feedback_area", "home_frame", "draw_cover", "render_reading", "render_widget", "redraw_widgets", "mini_scan_cancel", "mini_select", "mini_presented", "render_root", "render", "present", "on_tick",
+             "control_feedback_area", "home_frame", "draw_cover", "render_reading", "render_widget", "redraw_widgets", "mini_select", "mini_presented", "render_root", "render", "present", "on_tick",
              "hit", "control", "on_gesture", "main_page_visible"):
     unit += "\n" + function(name, HOME)
 unit += r'''
@@ -294,7 +298,7 @@ static void cover_feedback(app_ctx_t *ctx){
 }
 
 static void mini_interaction(void){
- app_ctx_t ctx={.fb=framebuffer,.now_ms=100};slots[0]=APP_HOME_WIDGET_MINI_LIBRARY;slots[1]=APP_HOME_WIDGET_EMPTY;
+ app_ctx_t ctx={.fb=framebuffer,.now_ms=2000};slots[0]=APP_HOME_WIDGET_MINI_LIBRARY;slots[1]=APP_HOME_WIDGET_EMPTY;
  mini_view.count=5;for(unsigned i=0;i<5;++i)snprintf(mini_books[i].path,sizeof(mini_books[i].path),"/book%u.epub",i);
  ui_gesture_event_t e={.type=UI_GESTURE_TAP,.x0=342,.y0=350};
  mini_hit=(ui_mini_hit_t){UI_MINI_SELECT,3};
@@ -343,7 +347,10 @@ static void mini_interaction(void){
  assert(on_gesture(&ctx,&e)==APP_REDRAW_NONE&&open_calls==opens+1&&nav==1);
  mini_view.count=0;assert(on_gesture(&ctx,&e)==APP_REDRAW_NONE&&open_calls==opens+1);
  mini_generation_needed=true;s_cover_next=1;s_clock_minute=minute;s_streak_pending=false;
- unsigned generations=mini_generations,polls=mini_polls;assert(on_tick(&ctx)==APP_REDRAW_NONE);assert(mini_generations==generations+1&&mini_polls==polls+1);
+ unsigned generations=mini_generations,polls=mini_polls;
+ ctx.last_input_ms=ctx.now_ms-HOME_BACKGROUND_QUIET_MS+1;
+ assert(on_tick(&ctx)==APP_REDRAW_NONE&&mini_polls==polls);
+ ++ctx.now_ms;assert(on_tick(&ctx)==APP_REDRAW_NONE);assert(mini_generations==generations+1&&mini_polls==polls+1);
  slots[0]=APP_HOME_WIDGET_READING;polls=mini_polls;assert(on_tick(&ctx)==APP_REDRAW_NONE&&mini_polls==polls);
  slots[0]=APP_HOME_WIDGET_EMPTY;slots[1]=APP_HOME_WIDGET_MINI_LIBRARY;s_mini_motion=MINI_SETTLE;
  assert(redraw_widgets(APP_HOME_WIDGET_MINI_LIBRARY)==APP_REDRAW_AREA);memcpy(before,framebuffer,sizeof(before));
@@ -355,7 +362,7 @@ static void mini_interaction(void){
 }
 int main(void){
     mini_interaction();
-    app_ctx_t ctx={.fb=framebuffer};touch_t touch={0};ctx.touch=&touch;
+    app_ctx_t ctx={.fb=framebuffer,.now_ms=2000};touch_t touch={0};ctx.touch=&touch;
     cover_feedback(&ctx);
     draws=pages=fulls=open_calls=library_calls=0;
     unsigned layouts=0;
@@ -387,7 +394,6 @@ int main(void){
     slots[0]=APP_HOME_WIDGET_READING;slots[1]=APP_HOME_WIDGET_EMPTY;
     ui_gesture_event_t ev={UI_GESTURE_TAP,540,118,540,118};nav=-1;ctx.request_menu=false;
     assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&nav==-1&&!ctx.request_menu);
-    // 头像现在打开完整功能菜单，不再直接切到设置页。/ Avatar opens the full function menu instead of jumping to Settings.
     ev.x0=618;assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&nav==-1&&ctx.request_menu);
     ctx.request_menu=false;
     ev.x0=400;ev.y0=1150;on_gesture(&ctx,&ev);assert(nav==2);
@@ -442,9 +448,14 @@ int main(void){
         }
         memcpy(before,framebuffer,sizeof(before));
         ev=(ui_gesture_event_t){UI_GESTURE_TAP,632,region.y+446,0,0};
+        ctx.last_input_ms=ctx.now_ms;
         assert(on_gesture(&ctx,&ev)==APP_REDRAW_AREA&&weather_requests==requests_before+1);
         present(&ctx,APP_REDRAW_AREA);isolated(region);
-        poll_changed=true;assert(on_tick(&ctx)==APP_REDRAW_AREA&&s_widget_dirty==(1u<<slot));poll_changed=false;
+        poll_changed=true;
+        ctx.now_ms+=HOME_BACKGROUND_QUIET_MS-1;
+        assert(on_tick(&ctx)==APP_REDRAW_NONE);
+        ++ctx.now_ms;
+        assert(on_tick(&ctx)==APP_REDRAW_AREA&&s_widget_dirty==(1u<<slot));poll_changed=false;
         memcpy(before,framebuffer,sizeof(before));present(&ctx,APP_REDRAW_AREA);isolated(region);
         int library_before=library_calls;ev=(ui_gesture_event_t){UI_GESTURE_TAP,80,region.y+42,0,0};
         assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&library_calls==library_before+1&&library_city);

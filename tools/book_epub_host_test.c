@@ -67,7 +67,6 @@ int main(int argc, char **argv) {
         if (strstr(argv[a], "good_chapter_breaks_")) {
             bool auxiliary = strstr(argv[a], "auxiliary") != NULL;
             bool named = strstr(argv[a], "named") != NULL;
-            bool plain = strstr(argv[a], "plain") != NULL;
             assert(book_epub_chapter_count(book) == 1);
             assert(book_epub_navigation_count(book) == 2);
             char title[160];
@@ -79,9 +78,7 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < text.count; ++i) {
                 const blk_t *block = &text.blocks[i];
                 if (block->chapter_start) {
-                    assert(!block->linked && !block->auxiliary);
-                    if (plain) assert(block->heading_level == 0 && block->align == 1);
-                    else assert(block->heading_level == 1);
+                    assert(!block->linked && !block->auxiliary && block->heading_level == 1);
                     const char *expected = marked ? (named ? "归来" : "第2章 第二站") : (named ? "出发" : "第一章 起点");
                     assert(block->len == strlen(expected));
                     assert(!memcmp(text.utf8 + block->offset, expected, block->len));

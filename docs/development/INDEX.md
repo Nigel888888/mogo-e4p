@@ -11,6 +11,8 @@ This page owns navigation, authority and scope, not per-task summaries. Use the 
 | [AGENTS](../../AGENTS.md)、[贡献指南](../../CONTRIBUTING.md) | 产品硬约束、页面契约、许可和操作授权边界。/ Product constraints, page contracts, licenses and authorization boundaries. |
 | [中文提交规范](../COMMIT_CONVENTION.md) | 未来提交唯一格式依据；保留原路径与旧 Git 历史。/ Sole format authority for future commits, retaining its path and existing history. |
 | [架构](../ARCHITECTURE.md)、[功能全景](FEATURES.md) | 稳定依赖与所有权，以及有入口依据的产品能力。/ Stable dependencies/ownership and entry-backed capabilities. |
+| [持久化与备份](guides/PERSISTENCE.md) | 数据位置、支持导出/恢复的字段、全擦除和布局迁移风险；安装前核对。/ Storage, backup coverage and destructive-operation risks. |
+| [正式发布](guides/RELEASE.md)、[说明书维护](guides/MANUAL.md) | 同源交付契约与保留的手册输入/生成前提；不代表发布或部署。/ Release delivery rules and manual source/generation requirements. |
 | [交接协议](../HANDOFF.md) | 只定义共享协议；当前机器账本仍为被忽略的 `docs/HANDOFF.local.md`。/ Shared protocol only; the live machine ledger remains ignored. |
 | [分类索引](CATALOG.md)、[工具入口](../../tools/README.md) | 自动生成的资料导航与可复跑工具，不证明运行结果。/ Generated navigation and repeatable tooling, not execution evidence. |
 
@@ -21,7 +23,8 @@ This page owns navigation, authority and scope, not per-task summaries. Use the 
 - [显示刷新契约](designs/DISPLAY_REFRESH.md)：显示意图、波形出口与失败恢复。/ Refresh intents, waveform exits and failure recovery.
 - [简约时钟锁屏](guides/LOCK_CLOCK.md)：极简24小时制、浅睡分钟刷新、RTC与密码/定时关机边界。/ Minimal clock, light-sleep minute updates, RTC and PIN/shutdown boundaries.
 - [日历锁屏](guides/CALENDAR.md)：两款样式、北京时间、离线数据、v38备份和生成许可。/ Two faces, Beijing time, offline data, v38 backup and asset generation.
-- [锁屏样式选择器](guides/LOCK_STYLE_PICKER.md)：六类缩图、同页选择、异步图片加载、缓存与取消边界。/ Six preview tiles, inline choices, asynchronous images, cache and cancellation boundaries.
+- [壁纸](guides/LOCK_STYLE_PICKER.md)：六类锁屏、独立关机壁纸、异步图片加载、TF双槽及取消边界。/ Six lock styles, independent shutdown art, asynchronous images, SD dual slots and cancellation boundaries.
+- [CloudZao 传输](guides/CLOUDZAO_TRANSFER.md)：直连收件、发版接入配置与 TF 交还。/ Direct reception, release configuration and TF handoff.
 - [组件与天气](guides/WEATHER.md)：首页布局、选城、网络生命周期与缓存。/ Home layout, city selection, networking and cache.
 - [迷你书库](guides/MINI_LIBRARY.md)：扇页选书、随机/最近模式、封面缓存与动画清理。/ Fan-deck selection, random/recent modes, cover caching and motion cleanup.
 - [阅读手账](guides/READING_JOURNAL.md)：当月逐日统计、日历、六图轮换与本机存储边界。/ Monthly daily records, calendar, six-scene rotation and local persistence limits.
@@ -44,9 +47,8 @@ This page owns navigation, authority and scope, not per-task summaries. Use the 
 
 - 提交策略为 `adapt`，复用现有中文规范；过程可见性为 `local`。普通计划、草稿、审查、图片和验收证据留在 `docs/local/tidy/`，不新增共享逐任务账本。/ Adapt the existing Chinese convention and keep ordinary work records local.
 - 本机记录在 `docs/local/tidy/changes/`，本机导航由 `sync` 生成于 `docs/local/tidy/INDEX.md`；这些路径不作为共享文档的链接目标。/ Local records/navigation are generated locally, not shared-link dependencies.
-- GitNexus 计划保持 `docs/plans/*gitnexus-plan*.md` 的原路径、正文和既有可见性。工具要求计划入库时，先确认与本地政策的例外，不复制、改名或强制暂存。/ Preserve fixed GitNexus plan paths/content/visibility and resolve policy exceptions before tracked-plan execution.
+- GitNexus 已按项目配置停用；源码和测试为分析依据，无实际 post-commit hook，不要求安装 CLI、运行 impact/detect_changes 或刷新图谱。保留历史状态，不改其他项目或全局工具。/ GitNexus is disabled; source/tests remain authoritative, with no active local post-commit hook or graph requirement.
 - 提交前核对实际 diff、清理本任务调试残留、维护相关长期说明与功能状态、运行 `sync` 和 `check`；仅暂存本任务内容后再检查 `check --staged`。本地记录仍需人工确认。/ Review the real diff, clean task-owned debug leftovers and maintain documentation before separate workspace/index checks; local records still require manual review.
-- 提交后刷新 `analyze --index-only` 并核对 HEAD、新鲜度与不完整原因，回执写入本机 `docs/local/tidy/COMMITS.md`。脏工作区默认延迟刷新；工作区索引需单独确认，不能冒充提交快照。/ Verify post-commit index identity/freshness and keep receipts local; dirty-worktree indexing requires explicit confirmation and is not a commit snapshot.
 - 不自动提交、推送、安装 hook、发布、上传文档或操作硬件。/ No automatic commits, pushes, hook installation, publication, document uploads or hardware operations.
 
 ## 覆盖与排除 / Coverage And Exclusions
@@ -56,3 +58,6 @@ The shared catalog covers docs, the tool guide, selected first-party component R
 
 忽略目录、本机交接、夜间试验、构建产物、供应商源码和工具自己的 `.claude/`、`.zcode/`、`.playwright-mcp/` 不纳入共享过程资料。第三方许可由 [LICENSE](../../LICENSE) 和[第三方声明](../../THIRD_PARTY_NOTICES.md)负责；目录分类不替代许可核验。
 Ignored/local work, night trials, builds, vendor sources and tool working directories are excluded from shared process material. Root licensing and third-party notices remain authoritative; classification is not license verification.
+
+文档检查覆盖根 README 三语言、AGENTS/贡献说明、现行 docs Markdown、模块 README 和两份手册 JSON；排除历史资料、本机过程、旧计划与按版本存档的 CHANGELOG。引用检查不请求外部 URL，也不验证手册生成或产品行为。suite 注册来自 Python runner，需静态核对 `SUITES`，不套用 JSON registry 合约。
+Document checks cover maintained entry points, guides, module READMEs and both manual inputs. History, local work, old plans and the versioned changelog are excluded. External routes, generation and product behavior need separate evidence; runner suites use Python registration.

@@ -21,9 +21,9 @@ curve=re.search(r'^static const int32_t s_soc_curve\[.*?\};',source,re.M|re.S).g
 typedef=re.search(r'typedef struct \{[^}]*\} batt_filter_t;',source,re.S).group(0)
 with tempfile.TemporaryDirectory() as tmp:
     p=Path(tmp)
-    code='#include <assert.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n'
+    code='#include <assert.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n#include "battery_calibration.h"\nstatic batt_cal_t s_batt_cal;\n'
     code+=defines+'\n'+curve+'\n'+typedef+'\n'
-    code+='\n'.join(extract(f) for f in ['batt_compensated_mv','batt_curve_soc','batt_filter_step','batt_full_now'])
+    code+='\n'.join(extract(f) for f in ['batt_compensated_mv','batt_curve_soc','batt_effective_soc','batt_filter_step','batt_full_now'])
     code+='''
 static batt_filter_t f;
 static int32_t s_mv;
@@ -156,14 +156,14 @@ int main(void) {
  reset(); step(0, 4300, 0, false, false, false, -1); assert(s_pm==955);
  reset(); step(0, 4200, 0, false, false, false, -1); assert(s_pm==875);
  reset(); step(0, 4100, 0, false, false, false, -1); assert(s_pm==790);
- // 12) 2026-11-05 连续区间的相对容量，不把芯片 SOC 当真值。
- // Relative sampled capacity from the 2026-11-05 continuous segment, not gauge SOC truth.
+ // 12) 2026-11-05 连续区间的相对容量，容许跨轮0.4%差异，不把芯片SOC当真值。
+ // Relative sampled capacity from 2026-11-05; allow 0.4% between cycles, not gauge SOC truth.
  const int mv[] = {4100,4050,4000,3950};
  const int q[] = {326016,442395,521732,656160};
  for (unsigned i=0;i<4;i++) {
   int relative=790-(q[i]-q[0])*1000LL/2050000;
   int error=batt_curve_soc(mv[i])-relative;
-  assert(error>=-1 && error<=1);
+  assert(error>=-4 && error<=4);
  }
  // 2026-11-11 连续放电段：固定既有 3950mV/629‰ 与 3300mV/0‰，
  // 按两端之间实际采样放出量分配剩余比例；不是额定容量或芯片 SOC 真值。
@@ -178,6 +178,23 @@ int main(void) {
   int relative=(1645475LL-observed_uah[i])*629/(1645475-287037);
   int error=batt_curve_soc(observed_mv[i])-relative;
   assert(error>=-15 && error<=15);
+ }
+ // 2026-11-18 提供的格式3日志，boot=80b588bf83b795a1：4100/3300mV
+ // 累计量45538/1715490.231uAh归一到790/0‰。下列非锚点观测不参与选点，
+ // 单次放电拟合误差限1.6%，不是绝对SOC准确度；同时保留上轮日志检查。
+ // Format-3 log supplied on 2026-11-18, boot=80b588bf83b795a1: normalize
+ // 45538/1715490.231uAh at 4100/3300mV to 790/0 permille. These non-anchor
+ // observations check a 1.6% within-cycle fit, not absolute SOC accuracy;
+ // retain the previous cycle checks above as well.
+ const int recent_mv[] = {4075,4025,3975,3925,3875,3838,3812,3788,3763,3760,
+                           3738,3713,3688,3663,3639,3611,3551,3447,3344};
+ const int recent_uah[] = {94338,211014,292784,453050,572400,684356,798167,935392,
+                            1165885,1194712,1307652,1407347,1478035,1596488,
+                            1628592,1643925,1666270,1692963,1710031};
+ for (unsigned i=0;i<sizeof(recent_mv)/sizeof(recent_mv[0]);i++) {
+  int relative=(1715490LL-recent_uah[i])*790/(1715490-45538);
+  int error=batt_curve_soc(recent_mv[i])-relative;
+  assert(error>=-16 && error<=16);
  }
  // 低压段必须提前反映余量，不再到 3.6V 仍显示 14%。
  // Reflect the remaining charge before the low-voltage tail, rather than 14% at 3.6V.
@@ -208,6 +225,11 @@ int main(void) {
  assert(batt_compensated_mv(4000,true,INT16_MIN)==4150);
  assert(batt_compensated_mv(4000,true,INT16_MAX)==3850);
  assert(batt_compensated_mv(4000,false,INT16_MIN)==4000);
+ // 个性曲线经过同一限速器，重置模型不直接改显示。/ Custom targets use the same limiter; resetting the model never snaps the display.
+ batt_cal_init(&s_batt_cal,s_soc_curve,0);s_batt_cal.record.soc[5]=650;
+ reset();step(0,4000,0,true,false,false,-1);assert(s_pm==650);
+ batt_cal_reset(&s_batt_cal,0);step(60000000,4000,0,true,false,false,-1);assert(s_pm==650);
+ step(120000000,4000,100,true,true,false,-1);assert(s_pm<=660);
  puts("PASS: battery filter noise immunity, monotonic one-direction stepping, rate limit, charge-done snap, boot restore tolerance, EMA convergence, load compensation, taper-full and the full-charge plateau");
 }
 '''
@@ -215,5 +237,6 @@ int main(void) {
     (p/'toolchain').mkdir()
     env,_=toolchain(p/'toolchain')
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
-                    str(p/'test.c'),'-o',str(p/'test')],env=env,check=True)
+                    '-I'+str(root/'components/device_power'), str(p/'test.c'),
+                    str(root/'components/device_power/battery_calibration.c'),'-o',str(p/'test')],env=env,check=True)
     subprocess.run([str(p/'test')],env=env,check=True)

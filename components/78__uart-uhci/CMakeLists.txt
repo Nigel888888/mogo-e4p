@@ -10,4 +10,6 @@ idf_component_register(
         esp_driver_dma
         esp_hal_uart
         esp_hw_support
+    PRIV_REQUIRES
+        esp_psram
 )

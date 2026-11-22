@@ -87,6 +87,18 @@ int main(void) {
     // 已失败空槽在同一页不反复排队。/ Failed empty slots do not requeue on the same page.
     book_shelf_covers_prepare(&state, 2, 2, true, false, 100, 0, 5000);
     assert(!book_shelf_covers_pending(&state));
+    // 开书暂停任务后留住完成结果和未完成槽；回同页只在新代次补齐。
+    // Opening pauses jobs but retains collected and pending slots; the same page resumes only pending work.
+    reset(&state); page(&state, 6, 2, 100);
+    q.fast = false; ready = 1; assert(book_shelf_covers_collect(&state, 0, &q));
+    retained = book_shelf_covers_slot(&state, 0)->gray;
+    book_shelf_covers_cancel(&state); before = begins;
+    page(&state, 6, 2, 110);
+    assert(begins == before && book_shelf_covers_slot(&state, 0)->gray == retained);
+    assert(book_shelf_covers_pending(&state) == 2);
+    ready = 2; assert(book_shelf_covers_collect(&state, 1, &q));
+    assert(begins == before + 1 && !book_shelf_covers_pending(&state));
+    assert(book_shelf_covers_slot(&state, 0)->gray == retained);
     reset(&state); page(&state, 9, 4, 100);
     ready = 15; q.fast = true;
     assert(book_shelf_covers_collect(&state, 0, &q));

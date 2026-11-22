@@ -79,11 +79,15 @@ int main(int argc,char **argv){
  book_fast_cover_key_t changed=key;changed.contrast=110;assert(!book_cover_fast_cache_read(path,"name","author",changed,out,&edge));
  changed=key;changed.phase=3;assert(!book_cover_fast_cache_read(path,"name","author",changed,out,&edge));
  changed=key;changed.width=120;changed.height=156;assert(!book_cover_fast_cache_read(path,"name","author",changed,out,&edge));
- assert(!book_cover_fast_cache_read(path,"name","other author",key,out,&edge));
+ assert(book_cover_fast_cache_read(path,"name","other author",key,out,&edge)&&edge);
  char cache[120];fast_cover_header_t h;assert(fast_cover_key(path,"name","author",key,cache,&h));
  assert(COVER_CACHE_SCHEMA>1);
  FILE *f=fopen(cache,"r+b");fast_cover_header_t old;assert(f&&fread(&old,1,sizeof(old),f)==sizeof(old));
  old.source.schema=COVER_CACHE_SCHEMA-1;rewind(f);assert(fwrite(&old,1,sizeof(old),f)==sizeof(old));fclose(f);
+ assert(!book_cover_fast_cache_read(path,"name","author",key,out,&edge)&&!load_shelf_cover_fast(0,0)&&!live);
+ book_cover_fast_cache_write(path,"name","author",key,bits,true);
+ f=fopen(cache,"r+b");assert(f&&fread(&old,1,sizeof(old),f)==sizeof(old));
+ --old.revision;rewind(f);assert(fwrite(&old,1,sizeof(old),f)==sizeof(old));fclose(f);
  assert(!book_cover_fast_cache_read(path,"name","author",key,out,&edge)&&!load_shelf_cover_fast(0,0)&&!live);
  book_cover_fast_cache_write(path,"name","author",key,bits,true);
  uint8_t stale[4494];memset(stale,0,sizeof(stale));

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "book_layout.h"
+#include "book_hyphen_en.h"
 #include "reader_session_layout.h"
 #include "ttf_font.h"
 esp_err_t book_open(const char *path) { assert(path && path[0]); return ESP_OK; }
@@ -252,6 +253,118 @@ static void session_layout_lifecycle(void) {
     drawn[0] = 0;
     puts("session layout: 100 cycles retain page offsets/text, reject other sessions, restore failed candidates and detach before chapter cleanup");
 }
+// 每页只铺一行，同时检查绘制结果和分页保留的原文字节锚点。
+// Use one line per page to check rendered text as well as each original byte anchor.
+static void expect_wrap(const char *text, int width, const char *const *lines, size_t count) {
+    EpdRect rect = book_layout_vertical() ? (EpdRect){0, 0, 15, width} : (EpdRect){0, 0, width, 15};
+    uint8_t fb = 0;
+    assert(book_layout_build(text, strlen(text), rect, 10));
+    assert(book_layout_page_count() == count);
+    const char *source = text;
+    for (size_t page = 0; page < count; ++page) {
+        assert(book_layout_page_start_offset(page) == (size_t)(source - text));
+        drawn[0] = 0;
+        book_layout_draw_page(&fb, page, rect, 10);
+        assert(!strcmp(drawn, lines[page]));
+        assert(!strncmp(source, drawn, strlen(drawn)));
+        source += strlen(drawn);
+        source += strspn(source, " \t\r\n");
+    }
+    assert(!*source);
+}
+
+static uint8_t wrap_fixture_font(void *ctx, const char *family, size_t len) {
+    (void)ctx;
+    return len == 1 && family[0] == 'A' ? 1 : 0;
+}
+
+static void word_and_punctuation_wrap(void) {
+    book_layout_set_spacing(150, 50);
+    book_layout_set_typography(0);
+    book_layout_set_first_line_indent(0);
+    book_layout_set_right_slack(40);
+    expect_wrap("Read chapter next", 80, (const char *[]) {"Read", "chapter", "next"}, 3);
+    expect_wrap("Read    \r\nchapter", 70, (const char *[]) {"Read", "chapter"}, 2);
+    expect_wrap("A can't we’re", 60, (const char *[]) {"A", "can't", "we’re"}, 3);
+    expect_wrap("A well-known", 100, (const char *[]) {"A", "well-known"}, 2);
+    expect_wrap("alpha-beta", 70, (const char *[]) {"alpha-", "beta"}, 2);
+    expect_wrap("A éclair", 55, (const char *[]) {"A", "éclair"}, 2);
+    expect_wrap("Say \"Hello,\"", 80, (const char *[]) {"Say", "\"Hello,\""}, 2);
+    expect_wrap("甲乙chapter丙", 70, (const char *[]) {"甲乙", "chapter", "丙"}, 3);
+    expect_wrap("abcdefghij", 40, (const char *[]) {"abcd", "efgh", "ij"}, 3);
+    // 一个标点能悬挂，但两个不行时，须把末字和整串一起挪到下一页。
+    // If one mark fits but the whole suffix does not, move the last glyph with all of the marks.
+    expect_wrap("甲乙丙丁。”", 40, (const char *[]) {"甲乙丙", "丁。”"}, 2);
+    expect_wrap("甲乙丙丁。’”", 40, (const char *[]) {"甲乙丙", "丁。’”"}, 2);
+    expect_wrap("甲乙丙丁。\"", 40, (const char *[]) {"甲乙丙", "丁。\""}, 2);
+    expect_wrap("甲乙丙丁。” 戊", 49, (const char *[]) {"甲乙丙丁。”", "戊"}, 2);
+    book_layout_set_right_slack(0);
+    expect_wrap("甲乙丙丁。”", 50, (const char *[]) {"甲乙丙丁。”"}, 1);
+    assert(fitted_target == 50);
+    book_layout_set_vertical(true);
+    expect_wrap("甲乙丁。”", 30, (const char *[]) {"甲乙", "丁。”"}, 2);
+    book_layout_set_vertical(false);
+
+    // 内联标签不提供额外断点，分页和前台绘制使用同一原文偏移。
+    // Inline styling is not a word boundary; pagination and drawing use the same source offset.
+    const char html[] = "<p>Read cha<span style='font-family:A'>pter</span></p>";
+    html_font_map_t fonts = {.resolve = wrap_fixture_font};
+    html_text_t chapter = {0};
+    EpdRect rect = {0, 0, 80, 15};
+    uint8_t fb = 0;
+    assert(html_to_blocks_with_css_target(html, strlen(html), NULL, 0, &fonts, NULL, 0, NULL,
+                                          &chapter) == ESP_OK && chapter.run_count > 0);
+    test_slot_ready_mask |= 2u;
+    test_slot_advance[1] = 1;
+    book_layout_set_runs(chapter.runs, chapter.run_count);
+    assert(book_layout_build_blocks(chapter.utf8, chapter.len, chapter.blocks, chapter.count, rect, 10));
+    assert(book_layout_page_count() == 2 && book_layout_page_start_offset(1) == strlen("Read "));
+    drawn[0] = 0;
+    book_layout_draw_page(&fb, 1, rect, 10);
+    assert(!strcmp(drawn, "chapter"));
+    book_layout_free();
+    book_layout_set_runs(NULL, 0);
+    html_text_free(&chapter);
+    puts("PASS: word boundaries, UTF-8 anchors, styled words, overlong fallback and grouped punctuation");
+}
+
+static void english_hyphenation(void) {
+    assert(book_hyphen_en_breaks("brilliance", 10) & (UINT64_C(1) << 4));
+    assert(book_hyphen_en_breaks("Table", 5) == (UINT64_C(1) << 2));
+    assert(!book_hyphen_en_breaks("project", 7));
+    assert(!book_hyphen_en_breaks("BRILLIANCE", 10));
+    assert(!book_hyphen_en_breaks("brilli4nce", 10));
+    expect_wrap("Read BRILLIANCE", 90, (const char *[]) {"Read", "BRILLIANC", "E"}, 3);
+    expect_wrap("A project", 80, (const char *[]) {"A", "project"}, 2);
+    expect_wrap("甲乙丙丁？”", 40, (const char *[]) {"甲乙丙", "丁？”"}, 2);
+
+    const char text[] = "into brilliance";
+    EpdRect rect = {0, 0, 90, 15};
+    uint8_t fb = 0;
+    book_layout_enable_selection(true);
+    assert(book_layout_build(text, strlen(text), rect, 10));
+    size_t split = strlen("into bril");
+    assert(book_layout_page_count() == 2 && book_layout_page_start_offset(1) == split);
+    drawn[0] = 0;
+    book_layout_draw_page(&fb, 0, rect, 10);
+    assert(!strcmp(drawn, "into bril-"));
+    size_t count = 0;
+    const book_layout_glyph_t *glyphs = book_layout_glyphs(0, &count);
+    assert(glyphs && count == split && glyphs[count - 1].start == split - 1);
+    assert(book_layout_page_for_offset(split) == 1);
+    drawn[0] = 0;
+    book_layout_draw_cursor_t cursor = {0};
+    int result;
+    do { result = book_layout_draw_slice(&fb, 1, rect, 10, &cursor); } while (result == 0);
+    assert(result == 1 && !strcmp(drawn, "liance"));
+    book_layout_adopt_page(1);
+    glyphs = book_layout_glyphs(1, &count);
+    assert(glyphs && count == strlen("liance") && glyphs[0].start == split);
+    book_layout_free();
+    book_layout_enable_selection(false);
+    puts("PASS: English pattern breaks, physical hyphen width, original anchors and selection offsets");
+}
+
 static void uniform_book_styles(void) {
     const char *plain = "alpha\nbeta\ngamma";
     const char *spaced = " \r\n\t\n\xE3\x80\x80\r\nalpha\r\n\r\n \t\r\nbeta\n\xC2\xA0\n\ngamma\r\n \n";
@@ -304,7 +417,15 @@ static void uniform_book_styles(void) {
         drawn[0] = 0;
         for (size_t page = 0; page < book_layout_page_count(); ++page)
             book_layout_draw_page(&fb, page, rect, 10);
-        assert(!strcmp(drawn, long_line));
+        // 软折行可省略分隔空格或显示连字符，原文字母必须完整。
+        // Wrapping may omit separators or add a visible hyphen, but must keep every source letter.
+        const char *original = long_line;
+        for (const char *out = drawn; *out; ++out) {
+            if (*out == ' ' || *out == '-') continue;
+            original += strspn(original, " ");
+            assert(*out == *original++);
+        }
+        assert(!*original);
     }
     book_layout_set_vertical(false);
     const char *markup = "<h2>Title</h2><p style='text-align:right;margin-top:2em;margin-bottom:3em'>alpha</p>"
@@ -406,7 +527,7 @@ int main(void) {
     const char mixed[] = "Wi甲iiW";
     assert(book_layout_build(mixed, strlen(mixed), r, 10));
     assert(book_layout_page_count() == 2);
-    assert(book_layout_page_start_offset(1) == 7);
+    assert(book_layout_page_start_offset(1) == strlen("Wi甲"));
     drawn[0] = 0;
     book_layout_draw_page(&fb, 0, r, 10);
     book_layout_draw_page(&fb, 1, r, 10);
@@ -495,21 +616,15 @@ int main(void) {
     };
     EpdRect chapter_rect = {0, 0, 300, 120};
     assert(book_layout_build_blocks(chapters, strlen(chapters), chapter_blocks, 4, chapter_rect, 10));
-    // 已确认的章首必须独占新页，且正文绘制跳过交给页面题头的标题块。
-    // Verified chapter starts own a new page, and body drawing skips the title blocks painted by chrome.
-    assert(book_layout_page_count() == 2 && book_layout_page_start_offset(0) == 0 &&
-           book_layout_page_start_offset(1) == 10);
-    assert(book_layout_page_for_offset(10) == 1 && book_layout_page_for_offset(14) == 1);
-    char page_title[16];
-    assert(book_layout_page_chapter_title(0, page_title, sizeof(page_title)) && !strcmp(page_title, "One"));
-    assert(book_layout_page_chapter_title(1, page_title, sizeof(page_title)) && !strcmp(page_title, "Two"));
+    // PR9 不包含后来追加的块级 chapter_start 强制分页；这里验证其原始流式行为。
+    // PR9 excludes the later block-level forced chapter break; verify its original flow.
+    assert(book_layout_page_count() == 1 && book_layout_page_start_offset(0) == 0);
+    assert(book_layout_page_for_offset(10) == 0 && book_layout_page_for_offset(14) == 0);
     drawn[0] = 0; book_layout_draw_page(&fb, 0, chapter_rect, 10);
-    book_layout_draw_page(&fb, 1, chapter_rect, 10);
-    assert(!strcmp(drawn, "alphabeta"));
+    assert(!strcmp(drawn, "OnealphaTwobeta"));
     book_layout_set_chapter_lead(4, 30);
     assert(book_layout_build_blocks(chapters, strlen(chapters), chapter_blocks, 4, chapter_rect, 10));
-    assert(book_layout_page_count() == 2 && book_layout_page_start_offset(0) == 4 &&
-           book_layout_page_start_offset(1) == 10);
+    assert(book_layout_page_count() == 1 && book_layout_page_start_offset(0) == 4);
     book_layout_set_chapter_lead(0, 0);
     const char illustrated[] = "IMG\nAA\nIMG\nBB";
     blk_t illustrated_blocks[] = {
@@ -1046,11 +1161,7 @@ int main(void) {
     book_layout_set_images_visible(true);
     composed.blocks[3].chapter_start=true;
     assert(book_layout_build_blocks(composed.utf8,composed.len,composed.blocks,composed.count,mixed_box,10));
-    assert(book_layout_page_count()==2 &&
-           book_layout_page_start_offset(1) == composed.blocks[3].offset);
-    assert(book_layout_page_chapter_title(1, page_title, sizeof(page_title)) && !strcmp(page_title, "乙"));
-    drawn[0]=0; for (size_t i=0; i<2; ++i) book_layout_draw_page(&fb, i, mixed_box, 10);
-    assert(!strcmp(drawn, "甲"));
+    assert(book_layout_page_count()==1);
     html_text_free(&composed);
     const char *large="<img src='big.png'/>";
     assert(html_to_blocks(large,strlen(large),&composed)==ESP_OK);
@@ -1311,5 +1422,7 @@ int main(void) {
     assert(book_layout_build(overflow,2049,(EpdRect){0,0,600,1000},10));drawn[0]=0;
     book_layout_draw_page(&fb,0,(EpdRect){0,0,600,1000},10);assert(!book_layout_glyphs(0,&glyph_count));
     book_layout_free();test_zero_width=false;book_layout_enable_selection(false);
+    word_and_punctuation_wrap();
+    english_hyphenation();
     puts("book_layout_host_test: PASS; idle rows/columns equal full rendering, stale cursor rejected and large chapter supported");
 }

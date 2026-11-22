@@ -171,6 +171,16 @@ esp_err_t device_power_refresh(void);
 /// 轮询电量、充电状态与待处理电源键，供页面 tick 使用。
 /// / Poll battery, charging state and pending power keys for page ticks.
 esp_err_t device_power_poll(void);
+typedef enum {
+    DEVICE_POWER_CHARGE_1A = 1000,
+    DEVICE_POWER_CHARGE_1_5A = 1500,
+} device_power_charge_current_t;
+
+/// 返回当前已应用的标称档位，0 表示充电芯片未配置。/ Return the applied nominal profile, or 0 if the charger is unconfigured.
+unsigned device_power_charge_current(void);
+/// 主循环应用并保存充电档位。/ Apply and persist the charger profile from the main loop.
+esp_err_t device_power_set_charge_current(device_power_charge_current_t current);
+
 /// 只读 UTC RTC；不校准系统时间、不改快照或寄存器。/ Read UTC RTC without changing system time, snapshots or registers.
 esp_err_t device_power_read_rtc(uint32_t *utc_seconds);
 
@@ -182,6 +192,23 @@ bool device_power_key_sampler_start(void);
 bool device_power_key_sampler_enable(bool enabled);
 /// 锁屏绘屏后暂停快采并保留待处理唤醒；等待在途读取完成。/ Join and pause after a locked display scan, preserving pending wake input.
 void device_power_key_sampler_pause_for_sleep(void);
+
+typedef struct {
+    bool enabled;          ///< 自动学习开关 / Automatic learning enabled
+    bool applied;          ///< 正在使用个性曲线 / A custom curve is active
+    bool save_error;       ///< 最近保存失败 / Most recent save failed
+    uint8_t sampled_bins;  ///< 已有样本的电压区间数 / Voltage intervals with samples
+    uint8_t trusted_bins;  ///< 重复样本一致的区间数 / Intervals with agreeing repeated samples
+    uint8_t total_bins;    ///< 固定电压区间总数 / Total fixed voltage intervals
+} device_power_batt_calibration_status_t;
+/// 主循环只读查询；关闭学习仍使用已有曲线。/ Loop-only pure query; disabling learning retains the active curve.
+void device_power_get_batt_calibration(device_power_batt_calibration_status_t *out);
+/// 主循环切换并保存本机开关；失败返回错误，不进普通配置备份。/ Loop-only toggle and persist the local preference; failures return errors, excluded from ordinary backup.
+esp_err_t device_power_set_batt_calibration(bool enabled);
+/// 主循环确认后重置并保存两槽；不强制跳变当前显示。/ Loop-only confirmed reset of both slots without snapping the displayed percentage.
+esp_err_t device_power_reset_batt_calibration(void);
+/// 主循环锁屏/唤醒边界；只中断学习，不新增采样或写卡。/ Loop-only lock/wake boundary; interrupt learning without new sampling or card writes.
+void device_power_batt_calibration_lock(bool locked);
 
 /// 校准日志默认关闭；格式 3 记录采样、区间统计和检查点，异步写串口和 TF。
 /// Calibration logging defaults off; format 3 samples, window statistics and checkpoints asynchronously reach serial/TF.

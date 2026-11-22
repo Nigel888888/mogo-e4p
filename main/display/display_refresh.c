@@ -11,12 +11,17 @@ enum EpdDrawError display_refresh_area(EpdiyHighlevelState *hl, display_refresh_
     if (!display_refresh_resolve(intent, flags, display_refresh_context(), &plan)) return EPD_DRAW_INVALID_CROP;
     const EpdWaveform *wave = display_waveform_get(plan.waveform);
     if (!wave) return EPD_DRAW_NO_PHASES_AVAILABLE;
+    if (intent == DISPLAY_REFRESH_READER_TEXT)
+        return update_display_area_reader_turn(hl,wave,plan.mode,area,plan.coverage == DISPLAY_COVERAGE_AUTO);
     if (plan.coverage == DISPLAY_COVERAGE_FULL)
         return update_display_area_full_with(hl,wave,plan.mode,area);
     if (plan.coverage == DISPLAY_COVERAGE_AUTO)
         return update_display_area_with(hl,wave,plan.mode,area);
     if (plan.pad_lines || plan.pad_col_bytes)
         return update_display_area_diff_padded(hl,wave,plan.mode,area,plan.pad_lines,plan.pad_col_bytes);
+    if (plan.mode == MODE_GL16 && (intent == DISPLAY_REFRESH_DETAIL ||
+        intent == DISPLAY_REFRESH_MAIN_CLOCK || intent == DISPLAY_REFRESH_MAIN_DETAIL))
+        return update_display_area_stable_diff(hl,wave,plan.mode,area);
     return update_display_area_diff_with(hl,wave,plan.mode,area);
 }
 

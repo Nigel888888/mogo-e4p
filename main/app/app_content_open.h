@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "app.h"
+
 bool app_book_request_open(const char *path);
 bool app_book_request_open_from_home(const char *path);
 /// 一次性深睡恢复；保持保存的正文位置，显隐沿用当前设置。/ One-shot deep-sleep resume with saved position and current bar settings.
@@ -24,6 +26,10 @@ bool app_image_request_open(const char *path);
 void app_files_request_folder(int folder);
 void app_book_request_manage(void);
 bool app_book_reader_body_visible(void);
+/// 阅读态保留按键映射、进度与弹层处理。/ Reading retains its own key mapping, progress and sheets.
+bool app_book_reader_keys_active(void);
+/// 主循环确认 AI 键短按后交给阅读态处理。/ Handle an AI-key short press confirmed by the loop.
+app_redraw_t app_book_up_key_action(app_ctx_t *ctx);
 /// 模式/对比度变化时释放旧格式封面；绘制前由主循环一次调用。/ Drop obsolete cover formats once on mode/contrast changes, before drawing.
 void app_book_cover_mode_changed(void);
 void app_home_cover_mode_changed(void);

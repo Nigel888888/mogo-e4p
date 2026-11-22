@@ -15,8 +15,8 @@ Current code and file-header Frozen decisions define behavior. README covers the
 
 ## 构建环境 / Build environment
 
-使用 ESP-IDF v6.1，产品仅接受 esp32s31；preview 目标必须传 --preview。先激活对应 IDF 环境，确认 idf.py 的版本。
-Use ESP-IDF v6.1 and esp32s31 only; the preview target requires --preview. Activate the matching IDF environment and confirm idf.py's version.
+使用 ESP-IDF v6.1，产品仅接受 esp32s31；preview 目标必须传 --preview。先按下方本机环境硬约束激活对应 IDF 环境并核对 Python、IDF 路径/版本；以下命令只在该检查通过后执行。
+Use ESP-IDF v6.1 and esp32s31 only; the preview target requires --preview. First pass the fixed environment checks below; run these commands only afterwards.
 
 ```sh
 idf.py --version
@@ -30,7 +30,7 @@ idf.py --preview build
   sdkconfig and build are ignored. Existing local values persist, so verify generated configuration after changing defaults.
 - 日常本地测试沿用当前正式版本号，通过测试日期和说明区分；构建默认版本与 PICO_PROJECT_VER 的覆盖逻辑见根 CMakeLists.txt。
   Local tests retain the current published version and use dates/notes for identification; root CMakeLists.txt defines the fallback and PICO_PROJECT_VER override.
-- 本地包不得覆盖已发布的固定下载文件；创建新 OTA 版本标签前先提交准确的更新日志，详见 AGENTS.md。
+- 本地包不得覆盖已发布的固定下载文件；创建新 OTA 版本标签前先提交准确的更新日志，详见[正式发布契约](development/guides/RELEASE.md)。
   Local bundles must not overwrite immutable published downloads. Commit accurate notes before new OTA tags as required by AGENTS.md.
 
 GitHub CI 先构建以准备锁定的 IDF 组件，再用 Clang 执行宿主回归，保留 ASan/UBSan。已有 OTA 标签可通过 `Build and submit OTA firmware` 的手动入口输入原标签重试；构建与提交记录使用该标签的源码提交，不移动标签。失败时保留宿主测试日志附件。
@@ -46,6 +46,30 @@ idf.py --preview -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci" set-targ
 idf.py --preview -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci" build
 python3 tools/run_reader_baseline.py
 ```
+
+### 本机环境硬约束 / Local environment hard rules
+
+以下是本机已验证的工具链事实，不得每次新会话重新试错。/ The following are verified local toolchain facts; do not rediscover them by trial and error in each new session.
+
+- macOS 宿主测试禁止直接使用 `/usr/bin/clang`、系统 `cc` 或系统 `gcc`。该 ASan 运行时已复现初始化卡住；看到测试进程停在 ASan 初始化时，先终止进程，不采样固件代码、不重复等待，也不把它判断为固件死循环。/ macOS host tests must not use `/usr/bin/clang`, the system `cc`, or the system `gcc`. Its ASan runtime has been reproduced hanging during initialization; when a test stops there, terminate it first, do not sample firmware code or wait through repeated retries, and do not classify it as a firmware loop.
+- macOS 宿主测试先使用 Command Line Tools 工具链，并在测试前做一次不超过 10 秒的 ASan/UBSan 编译及运行探针：`DEVELOPER_DIR=/Library/Developer/CommandLineTools`、`CC=/Library/Developer/CommandLineTools/usr/bin/clang`、`CXX=/Library/Developer/CommandLineTools/usr/bin/clang++`，SDK 使用 `xcrun --show-sdk-path` 的结果。优先通过 `python3 tools/run_reader_baseline.py <suite...>` 运行，它会把同一编译器传给直接调用 `cc`/`gcc`/`clang` 的子脚本；不要裸跑会绕过该选择的 shell 入口。/ On macOS, use the Command Line Tools toolchain and run one ASan/UBSan compile-and-execute probe capped at 10 seconds before host tests: set `DEVELOPER_DIR=/Library/Developer/CommandLineTools`, `CC=/Library/Developer/CommandLineTools/usr/bin/clang`, and `CXX=/Library/Developer/CommandLineTools/usr/bin/clang++`, with the SDK from `xcrun --show-sdk-path`. Prefer `python3 tools/run_reader_baseline.py <suite...>`; it passes the same compiler to child scripts that invoke `cc`/`gcc`/`clang` directly. Do not use shell entry points that bypass this selection.
+- 探针或单个宿主套件超过 30 秒没有输出即停止该套件并保留日志；不得为了“先跑完”全局设置 `*_NO_SANITIZE=1` 或删除 ASan/UBSan。只有该套件已有明确的 macOS 运行时豁免时，才按其文档使用局部豁免并在结果中注明。/ Stop a probe or host suite after 30 seconds without output and retain its log; do not globally set `*_NO_SANITIZE=1` or remove ASan/UBSan just to make a run finish. Use a local exception only when that suite documents a specific macOS runtime exemption, and record it in the result.
+- 本机 ESP-IDF 固定为 `/Users/chopper1026/esp/esp-idf` 的 v6.1，Python 固定为 `/Users/chopper1026/.espressif/python_env/idf6.1_py3.13_env` 的 Python 3.13。构建前必须先执行并验证以下环境；不得先裸跑 `idf.py`，不得使用缺失的 Python 3.12 环境，也不得改用系统 Python/其他 IDF 版本反复重试：/ The local ESP-IDF is fixed to v6.1 at `/Users/chopper1026/esp/esp-idf`, with Python 3.13 at `/Users/chopper1026/.espressif/python_env/idf6.1_py3.13_env`. Before building, establish and verify the following environment; never run a bare `idf.py` first, use the missing Python 3.12 environment, or retry with system Python/another IDF version:
+
+  ```sh
+  export IDF_PATH=/Users/chopper1026/esp/esp-idf
+  export IDF_TOOLS_PATH=/Users/chopper1026/.espressif
+  export IDF_PYTHON_ENV_PATH=/Users/chopper1026/.espressif/python_env/idf6.1_py3.13_env
+  export PATH="$IDF_PYTHON_ENV_PATH/bin:$PATH"
+  . "$IDF_PATH/export.sh"
+  python -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
+  idf.py --version                 # 必须为 ESP-IDF v6.1.x / must be ESP-IDF v6.1.x
+  test "$(command -v idf.py)" = "$IDF_PATH/tools/idf.py"
+  ```
+
+  若 `export.sh` 首次尝试指向不存在的 Python 环境，立即停止并按上面显式设置 `IDF_PYTHON_ENV_PATH` 后重试一次；不要继续盲目执行构建。所有 S31 构建仍必须带 `--preview`。/ If `export.sh` initially points at a missing Python environment, stop immediately, set `IDF_PYTHON_ENV_PATH` explicitly as above, and retry once; do not blindly retry the build. Every S31 build must still include `--preview`.
+- 构建环境未通过上述版本、路径和目标检查时，不运行完整宿主回归、不启动冷构建、不刷机；报告缺失项后先修复环境。/ If the version, path, or target checks above fail, do not run the full host regression, start a cold build, or flash; report the missing check and fix the environment first.
+
 
 ## 改动入口 / Where to work
 

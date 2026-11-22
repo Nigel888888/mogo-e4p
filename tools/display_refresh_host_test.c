@@ -30,6 +30,12 @@ static enum EpdDrawError record(EpdiyHighlevelState *h, const EpdWaveform *w, in
 #define AREA(name,k) enum EpdDrawError name(EpdiyHighlevelState *h, const EpdWaveform *w, enum EpdDrawMode m, EpdRect a) {return record(h,w,m,a,k);}
 AREA(update_display_area_with, DISPLAY_COVERAGE_AUTO)
 AREA(update_display_area_diff_with, DISPLAY_COVERAGE_DIFF)
+AREA(update_display_area_stable_diff, 6)
+enum EpdDrawError update_display_area_reader_turn(EpdiyHighlevelState *h, const EpdWaveform *w,
+    enum EpdDrawMode m, EpdRect a, bool full_body) {
+    assert(full_body == !!(context_bits & 4));
+    return record(h,w,m,a,7);
+}
 AREA(update_display_area_full_with, DISPLAY_COVERAGE_FULL)
 enum EpdDrawError update_display_area_diff_padded(EpdiyHighlevelState *h,const EpdWaveform *w,enum EpdDrawMode m,EpdRect a,int r,int c) {
     pad_rows=r;pad_cols=c;return record(h,w,m,a,3);
@@ -74,6 +80,9 @@ int main(void) {
         if(i==DISPLAY_REFRESH_MAIN_CLOCK&&(context_bits&2)) {want.waveform=DISPLAY_WAVE_MAIN_BW;want.mode=MODE_DU;}
         if(i==DISPLAY_REFRESH_MAIN_DETAIL&&(context_bits&1))want.waveform=DISPLAY_WAVE_MAIN_NORMAL;
         if(i==DISPLAY_REFRESH_MAIN_SCROLL&&(context_bits&1))want.waveform=DISPLAY_WAVE_MAIN_NORMAL;
+        if(i==DISPLAY_REFRESH_READER_TEXT&&(context_bits&4)) {
+            want.waveform=DISPLAY_WAVE_READER_BACKGROUND; want.coverage=DISPLAY_COVERAGE_AUTO;
+        }
         if(i==DISPLAY_REFRESH_READER_BODY||i==DISPLAY_REFRESH_READER_LAYOUT) {
             want.waveform=(i==DISPLAY_REFRESH_READER_BODY&&(f&2))?DISPLAY_WAVE_READER_IMAGE:(context_bits&4)?DISPLAY_WAVE_READER_BACKGROUND:DISPLAY_WAVE_READER_INK;
             if(f&1)want.mode=MODE_DU;
@@ -85,7 +94,9 @@ int main(void) {
         if(valid) {
             assert(got.waveform==want.waveform&&got.mode==want.mode&&got.coverage==want.coverage);
             assert(got.pad_lines==want.pad_lines&&got.pad_col_bytes==want.pad_col_bytes);
-            assert(selected==want.waveform&&mode==want.mode&&kind==(want.pad_lines?3:(int)want.coverage));
+            bool stable=want.mode==MODE_GL16 && (i==DISPLAY_REFRESH_DETAIL ||
+                i==DISPLAY_REFRESH_MAIN_CLOCK || i==DISPLAY_REFRESH_MAIN_DETAIL);
+            assert(selected==want.waveform&&mode==want.mode&&kind==(i==DISPLAY_REFRESH_READER_TEXT?7:stable?6:want.pad_lines?3:(int)want.coverage));
             assert(!memcmp(&bounds,&area,sizeof(area))&&pad_rows==want.pad_lines&&pad_cols==want.pad_col_bytes);
         }
         reset();bool screen=valid&&want.coverage!=DISPLAY_COVERAGE_FULL&&!want.pad_lines;

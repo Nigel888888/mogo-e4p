@@ -36,6 +36,11 @@ idf.py --preview build
 
 CI 只证明能编译；真机时序与行为仍须设备验证。/ CI proves compilation; device timing and behavior still need hardware validation.
 
+### 本机环境硬约束 / Local environment hard rules
+
+所有本机构建与宿主测试先遵循[上手指南的固定环境与探针规则](docs/ONBOARDING.md#本机环境硬约束--local-environment-hard-rules)：固定 ESP-IDF v6.1 / Python 3.13 路径与 S31 preview 检查，不得裸跑 idf.py 或改用其他环境试错。macOS 禁用系统 clang/cc/gcc，使用 CLT、限时 sanitizer 探针与项目 runner；无输出超过 30 秒即停止并保留日志，不全局禁用 sanitizer。环境检查失败不得完整回归、冷构建或刷机。
+Use the fixed environment and bounded sanitizer probe in [onboarding](docs/ONBOARDING.md#本机环境硬约束--local-environment-hard-rules). Do not bypass version/path/target checks, use system compilers or globally disable sanitizers; stop silent suites and retain logs. Failed setup blocks full regression, cold builds and flashing.
+
 ### 版本号与本地测试 / Versions and local tests
 
 用户 2026-11-05 要求放宽脚本时限，取代此前两分钟总预算；本仓库必须优先使用项目级 [mogo-e4p-flash skill](.agents/skills/mogo-e4p-flash/SKILL.md) 和 `python3 tools/flash_fast.py flash --yes`。脚本默认及上限改为 180 秒，可用 `--timeout 1..180` 缩短本次时限。刷机阶段不重复全量测试、索引或全片备份，不使用固定活动槽地址，不自动退回整机擦写；新功能在开发构建阶段先用 `prepare --build-dir` 准备当前产品构建。冷构建、设备异常或兼容性检查失败时及时停止说明，不刷旧包或虚报成功；超过时限的准备/恢复需另行说明并获授权。skill 仅放在本仓库 `.agents/skills/`，不安装到全局。设计/测试工具不代表刷机授权。
@@ -50,70 +55,15 @@ Per the user's 2026-10-06 decision, local tests retain the current published fir
 本地包放在被忽略的构建目录，禁止用同版本的测试二进制覆盖 `flash/` 中已经发布的固定版本下载文件。联网 OTA 需要不同版本号的专项测试时，先获得用户对该测试版本的明确授权。
 Keep local bundles in ignored build directories; never replace immutable published downloads in `flash/` with a same-version test image. Use a different version for an OTA-specific test only when explicitly authorized by the user.
 
-### OTA 版本更新日志 / OTA release notes
+### 正式发布 / Official releases
 
-每次用户要求创建 OTA 版本标签时，基于上一个对应发布版本到本次提交的实际差异，先整理准确的中文更新日志，写入 `docs/ota-release-notes/<版本号>.txt` 并与代码一起提交，然后再创建版本标签。日志以 UTF-8 编码，去除首尾空白后不得为空或超过 383 字节；不要虚构功能、修复或验证结果。标签构建自动读取对应文件，随固件提交到平台草稿；发布仍须管理员审核。已存在的版本或标签不得覆盖或重新指向。
-
-For each OTA version tag, summarize actual changes since the appropriate previous release in `docs/ota-release-notes/<version>.txt`, commit it before tagging, and keep the nonempty UTF-8 text within 383 bytes. Never invent changes or verification. The workflow submits it with the firmware draft; an administrator still reviews and publishes. Do not overwrite existing versions or move tags.
-
-### 正式版发布 / Official releases
-
-用户 2026-11-03 确认：今后提到「发布版本」，均指发布到本仓库当前 `origin` 远端，替代此前固定的旧发布仓库；发布前核对 `git remote get-url origin`，当前为 `chopper1026/mogo-e4p`。推送代码，创建并推送对应版本的 Git tag，触发 OTA 网站的固件草稿构建与提交，并在同一远端创建 GitHub Release。附上经验证的 TF/OTA 应用 Bin、完整 USB 刷机包、SHA-256 校验值和简要更新日志；所有附件与 OTA 提交必须来自同一次正式构建。OTA 草稿仍须管理员审核发布，不得把草稿提交成功视为已经上线。
-Per the user's 2026-11-03 decision, "publish a version" means publishing to this repository's current `origin`, replacing the previously fixed legacy release repository. Check `git remote get-url origin` before publishing; it currently points to `chopper1026/mogo-e4p`. Push the code and a matching Git tag to trigger the OTA website's draft build/submission, and create a GitHub Release in the same remote repository. Attach the verified TF/OTA application Bin, complete USB flash bundle, SHA-256 checksums and brief release notes; all attachments and the OTA submission must come from the same official build. OTA drafts still require administrator review and publication; successful submission does not mean they are live.
-
-用户 2026-11-04 确认 GitHub Release 的展示与命名规范如下；`<版本号>` 不含 `v`，Git tag 仍使用 `v<版本号>`（例如 `v1.0.3`）。
-Per the user's 2026-11-04 decision, use the following GitHub Release presentation and naming rules. `<version>` excludes `v`; Git tags remain `v<version>` (for example, `v1.0.3`).
-
-| 项目 / Item | 格式 / Format | 1.0.3 示例 / Example |
-| --- | --- | --- |
-| Release 标题 / Release title | `mogo E4p <版本号>` / `mogo E4p <version>` | `mogo E4p 1.0.3` |
-| TF/OTA 应用镜像 / TF/OTA application | `mogo-e4p-update-<版本号>.bin` / `mogo-e4p-update-<version>.bin` | `mogo-e4p-update-1.0.3.bin` |
-| USB 单文件整机镜像 / Single-file USB image | `mogo-e4p-<版本号>-full.bin` / `mogo-e4p-<version>-full.bin` | `mogo-e4p-1.0.3-full.bin` |
-| 完整 USB 刷机包 / Complete USB bundle | `mogo-e4p-<版本号>-usb.zip` / `mogo-e4p-<version>-usb.zip` | `mogo-e4p-1.0.3-usb.zip` |
-
-Release 说明按更新日志、下载、验证组织，下载文件名与实际附件、包外 `README.txt`、`SHA256SUMS` 保持一致，保留 `release-provenance.json` 构建来源。保留当前目标硬件与刷写方式说明，不再添加「不适用于旧ESP32-S3设备」一句。以上仅调整 GitHub Release 的标题、下载文件名及说明，不改变固件界面品牌、目标硬件、构建部件名、备份文件名、内部协议或官网/OTA 地址；未经用户明确要求，不更名或替换已经发布的附件。
-Organize Release descriptions as updates, downloads and verification. Keep download names consistent across assets, the outer `README.txt` and `SHA256SUMS`, and retain build provenance in `release-provenance.json`. Describe the current target hardware and flashing methods without adding the old ESP32-S3 exclusion sentence. These rules affect only GitHub Release titles, download filenames and descriptions, not firmware UI branding, hardware targets, build component names, backup filenames, internal protocols or website/OTA URLs. Do not rename or replace published assets without an explicit user request.
-
-GitHub Release 与官网刷机、TF 下载和联网 OTA 同步发布。保留官网现有刷机清单、固件及版本下载地址；OTA 清单继续使用固件允许的官方 HTTPS 域名。核对三种交付的版本、大小、校验值和基础包兼容性，避免影响正在刷机或升级的用户。本地测试仍只生成本地包，不创建正式 Release。
-Publish GitHub Releases alongside the web flasher, TF downloads and online OTA. Preserve existing website manifests, firmware and versioned download URLs; keep OTA URLs on the official HTTPS origin accepted by the firmware. Verify matching versions, sizes, checksums and base-layout compatibility across the deliveries so ongoing flashes and updates remain valid. Local tests remain local bundles without official Releases.
+正式标签前必须提交准确的中文 OTA 日志；发布须核对当前 origin，并同步 GitHub Release、官网刷机、TF 下载与 OTA 草稿的同源产物。命名、383 字节日志上限、不可覆盖已发布附件和管理员审核边界，完整遵循[正式发布契约](docs/development/guides/RELEASE.md)。调用治理不授予发布权限。
+Follow the [release contract](docs/development/guides/RELEASE.md) for notes before tags, current origin, naming, immutable artifacts, delivery consistency and administrator review. Governance grants no publication authority.
 
 ## 目录职责 / Layout
 
-| 路径 / Path | 职责 / Role |
-| --- | --- |
-| `main/app_main.c` | 开机装配：板级 init、读设置、定 VCOM、开机图、字体，然后交给 `app_loop`。/ Boot wiring, then `app_loop`. |
-| `main/app/app.h` | `app_desc_t` / `app_ctx_t` / `app_redraw_t` 契约。/ Page contract. |
-| `main/app/app_loop.c` | 与页面无关的事件循环：触摸去抖、三键与菜单把手、切页、刷屏、锁屏、SD 字体延迟加载。/ Shared event loop. |
-| `main/app/app_registry.c` | 菜单顺序。加页只改这张表。/ Menu table. |
-| `main/app/app_content_open.h` `app_transfer_mode.h` `app_device_settings_mode.h` | 跨页面请求契约，由目标页面消费。/ Cross-page request contracts consumed by target pages. |
-| `main/app/app_config.h` | 均衡 / ALL_DU 刷新档位。/ Refresh profile. |
-| `main/ui/` | `ui_kit` 排版常量与绘制原语；`ui_menu` 两层菜单。页面互不引用。/ Shared drawing; pages do not include each other. |
-| `main/font/` | stb_truetype 字形缓存。`fallback.h` 是生成位图，勿手改。/ Glyph cache. Do not edit `fallback.h` by hand. |
-| `main/image/` | 公共图像探测、解码与缩放，不依赖书籍、页面或字库。/ Shared image probing, decoding and scaling without book, page or font dependencies. |
-| `main/services/` | 跨页 USB 存储、字体上下文、文件任务交还与触摸震动。/ Cross-page USB storage, font contexts, file-worker handoff and touch haptics. |
-| `main/factory/` | 设备功能自检、出厂 VCOM 标定与 EPD 测试图案。/ Device self-test, factory VCOM and EPD test patterns. |
-| `main/boot/` | 启动保护与恢复检查点。/ Boot protection and resume checkpoints. |
-| `main/display/` | 显示出口、几何、波形与灰阶归一。/ Display entry points, geometry, waveforms and gray normalization. |
-| `main/lock/` | 自动锁屏判定、密码与锁屏图缓存。/ Idle-lock decisions, PIN and lock-frame caches. |
-| `main/power/` | 睡眠、唤醒、关机与缓存恢复。/ Sleep, wake, power-off and cache restore. |
-| `main/settings/` | NVS 设置与备份恢复。/ NVS settings and backup/restore. |
-| `main/ota/` | TF/联网升级、清单与下载校验。/ Card/online upgrades, manifests and download verification. |
-| `main/time/` | 时间服务与校时策略。/ Time services and sync policy. |
-| `main/diagnostics/` | 阅读计时与资源诊断。/ Reader timing and resource diagnostics. |
-| `main/platform/` | S31 输入适配。/ S31 input adaptation. |
-| `main/assets/` | 内置资源与生成数据。/ Bundled resources and generated assets. |
-| `components/board_support/` | 板级 BSP：I2C、EPD 板定义与扫描时序、TF 卡、蜂鸣器、flash HPM。/ Board BSP. |
-| `components/book_search/` | 离线拼音/首字母/英文书名匹配，设备和网页共用；字表由工具生成。/ Shared offline pinyin, initials and English matching with a generated table. |
-| `components/device_power/` | 电量、充电、RTC 与电源键接口；S31 选 Metalio 后端，旧 CW32 线格式在 `pmu_protocol.h`。/ Battery, charging, RTC and power keys; S31 selects Metalio, with the legacy CW32 wire format in `pmu_protocol.h`. |
-| `components/wifi_transfer/` | 热点与已有 WiFi 传书、配网和校时会话。/ AP/STA book transfer, provisioning and time-sync sessions. |
-| `components/epdiy/` | 上游裁剪 fork（LCD 路径）。改动清单在其 LICENSE。不要为注释去改它。/ Trimmed upstream fork. Leave it alone for comment work. |
-| `components/cst836u/` `sc7a20h/` `fca9555/` | 当前触摸、加速度计及扩展口驱动；旧名称包含 FT6336U/TCA9555 适配。/ Current touch, accelerometer and expander drivers, including FT6336U/TCA9555 adaptations under legacy names. |
-| `components/e0470_epaper_waveform/` | 面板波形与裁剪。`waveforms/*.h` 是数据表。/ Panel waveforms. |
-| `docs/CHANGELOG.md` | 按版本简述对用户可见的功能变化与修复。/ Brief user-visible changes and fixes by version. |
-
-main 根目录仅保留启动入口与构建配置，新增功能文件按上表职责归类。/ Keep only boot assembly and build configuration at the main root; group new feature files by the ownership table above.
-
-功能操作见三份 README；页面契约以本文及 `main/app/app.h` 为准。/ See the READMEs for feature usage; this file and `main/app/app.h` define the page contract.
+目录与所有权以[架构说明](docs/ARCHITECTURE.md#目录职责--ownership)为权威；`main/` 根目录只保留启动入口与构建配置，新增功能按职责归类。页面互不引用，公共图像模块不依赖书籍、页面或字库。现用旧芯片命名包含当前板兼容接口，不据名称删除。生成字库/波形与第三方 epdiy 不为整理而手改。
+The [architecture ownership table](docs/ARCHITECTURE.md#目录职责--ownership) governs placement. Keep only boot/build wiring at the main root, preserve page/image dependency boundaries and active legacy-named adapters, and do not hand-edit generated/vendor data for cleanup.
 
 ### 文档交付边界 / Documentation delivery boundary
 
@@ -179,6 +129,8 @@ Defined in [`main/app/app.h`](main/app/app.h). The loop presents via `app_presen
 - `normalize_hold_gray()` 可选：归一属性按当前画面判断，只有显示阅读背景正文时返回 true。不要用全局背景设置代替这个判断。快捷栏收起整屏归一与阅读呈现共用此属性。/ Optional: derive normalization attributes from the visible frame, returning true only for reading text over a background. Never substitute the global background setting. Whole-screen quick-layer close normalization and reader presentation share this property.
 - `on_key()` 默认只收 `UI_KEY_1`；`owns_keys` 页面在菜单关闭时接收三键。主页面左右键循环切换四个主页，中键长按全刷；书架中键短按切换分页控制并沿左右箭头轮廓描边，可通过导航随时打断。系统子页左返回、中首页、右返回；阅读正文三键短按可自定义，两套推荐默认上一页/工具栏/下一页；触摸开启时底部上滑固定呼出工具栏，三键短按和中键长按不强制工具栏映射；中键长按可自定义，默认返回首页；中键双击可自定义，默认不操作；用户2026-11-14取消独立全屏模式，由状态栏、页眉、页脚分别控制显隐；隐藏栏回收正文空间，隐藏页脚同时隐藏进度，三栏全关即纯正文；新开书与恢复沿用当前显隐，翻页只收起工具栏与滑块。/ Normally KEY1 only; `owns_keys` pages receive all three outside the menu. Root pages use left/right to cycle and a middle hold for full refresh; shelf middle short press toggles paging controls. Product system pages use Back/Home/Back; reader short actions are configurable, defaulting to previous/tools/next; with touch enabled, bottom-edge swipes open the toolbar without a required short/hold mapping; middle holds and middle double presses are configurable (the double press defaults to no action); the user retired independent full screen on 2026-11-14: status/header/footer switches control visibility and reclaim body space; footer progress hides with its bar, and disabling all three yields text-only reading; opening/resuming uses current settings and turns dismiss only tools/sliders.
 
+- 按键控制的「返回主页」「手动全刷」「前光开关」在普通页面对绑定手势优先；未绑定全局动作时沿用页面原行为。系统覆盖层及独占流程不执行全局快捷动作，阅读保留原开书返回来源。/ Mapped Home, full refresh and frontlight take precedence for that gesture on ordinary pages. Other mappings retain native page behavior outside reading. System overlays and exclusive flows do not dispatch global shortcuts; the reader retains its opening return target.
+
 标志：
 
 - `holds_pmu`：长时间独占 PMU（自检）。主循环的锁屏按键轮询让路。/ Page owns the PMU; lock-key poll yields.
@@ -206,7 +158,7 @@ Defined in [`main/app/app.h`](main/app/app.h). The loop presents via `app_presen
 | ALL_DU | 实验档：整机都走 DU，只看速度。 | Experimental profile: everything is DU. |
 | 锁屏 | 电源键短按后的锁页。浅睡按键或拿起回原页。 | Lock face after a short power-key press. |
 | 软睡 | `SOFT_SLEEP`：PMU 拉低 EN，再短按开机，不是硬复位。 | Soft sleep: PMU drops EN; a short press powers on without a hard reset. |
-| VCOM | 面板公共电压（绝对值 mV）。出厂写入 PMU，主机只读。 | Panel common voltage (absolute mV). Factory-written in the PMU; host is read-only. |
+| VCOM | 面板公共电压（绝对值 mV）。S31 出厂标定保存在 ESP NVS `panel/vcom`，产品页只读。 | Panel common voltage (absolute mV). S31 factory calibration is stored in ESP NVS `panel/vcom`; product pages are read-only. |
 
 注释里不要再展开这些词。/ Do not re-explain these terms in comments.
 
@@ -219,8 +171,8 @@ Defined in [`main/app/app.h`](main/app/app.h). The loop presents via `app_presen
 
 A `冻结 / Frozen:` block is a decision, not a hint. Change the behavior only after rewriting that block and saying why the decision changed.
 
-- 面板 VCOM 存在 PMU 里。主机开机读一次，不写 ESP NVS，产品页不提供修改入口。标定页（`vcom_setup.c`）是未标定时的出厂拦住路径。/ VCOM lives in the PMU. Host reads once. No NVS copy. No product UI to edit it. `vcom_setup.c` is the factory gate when unset.
-- 不要写 SY7636A 的 VCOM / VLDO / 放电 / 延时 / VCOMCTL。电源页只读。/ Do not write SY7636A VCOM / VLDO / discharge / delay / VCOMCTL. Power page is read-only.
+- S31 面板 VCOM 标定保存在 ESP NVS `panel/vcom`，由 `device_power_metalio.c` 启动时读取；仅出厂标定页（`main/factory/vcom_setup.c`）可通过后端接口保存，未标定时拦住开机，产品页不提供修改入口。/ S31 VCOM calibration lives in ESP NVS `panel/vcom` and is loaded by `device_power_metalio.c` at startup. Only factory calibration (`main/factory/vcom_setup.c`) may save it through the backend API; unset calibration gates boot, and product pages provide no editing entry.
+- 旧 SY7636A 路径禁止写 VCOM / VLDO / 放电 / 延时 / VCOMCTL，电源页只读；此约束不替代 S31 板级正常上电时应用已保存 VCOM 的流程。/ The legacy SY7636A path must not write VCOM / VLDO / discharge / delay / VCOMCTL; the power page is read-only. This does not replace the S31 board path that applies saved VCOM during normal panel power-on.
 - S31 使用 flash 80 MHz、Octal PSRAM 200 MHz；旧 S3 的 Zbit HPM 覆盖不参与 S31 构建。/ S31 uses 80 MHz flash and 200 MHz octal PSRAM; the legacy S3 Zbit HPM override is outside the S31 build.
 - 不要改 `components/epdiy/**` 来“整理注释”。/ Do not touch `components/epdiy/**` for comment cleanup.
 - 不要手改 `main/font/fallback.h`、`main/font/stb_truetype.h`、`components/e0470_epaper_waveform/waveforms/*.h`。/ Do not hand-edit generated or vendored tables.
@@ -261,63 +213,20 @@ Every comment is bilingual. Comments only; no logic changes.
 - 大 `.c` 用 `/* ---- 区块名 / Section ---- */` 分区。/ Large `.c` files use section banners.
 - 术语见表，不在注释里重复解释。/ Use the glossary; do not redefine terms.
 
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
-
-This project is indexed by GitNexus as **mogo-e4p** (16298 symbols, 32232 relationships, 517 execution flows).
-
-> Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
-
-## Always Do
-
-- **MUST run impact before editing.** Use `impact({target: "symbolName", direction: "upstream"})` or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .`; report callers, processes, and risk. Never substitute grep for graph analysis.
-- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .`.
-- MUST warn on HIGH/CRITICAL `risk` pre-edit; never use `riskSharedAxes` to waive a HIGH/CRITICAL `risk` warning. Compare File/symbol: MCP File omits axes; Graph-RAG expands File.
-- **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
-- **MUST use `query({search_query: "concept"})` for concepts/flows, `context({name: "symbolName"})` for a named symbol, or `impact` for blast radius, on read-only callers, dependencies, imports, or execution flow.** Graph first; text search only for empty/`UNKNOWN`/literals.
-- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
-
-## Never Do
-
-- NEVER edit a function, class, or method before MCP/CLI impact analysis.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis, and never read `UNKNOWN` as an all-clear — it means the walk could not answer, which is the one verdict that requires confirming by other means.
-- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit before MCP/CLI graph change analysis.
-
-## Resources
-
-| Resource | Use for |
-| --- | --- |
-| `gitnexus://repo/mogo-e4p/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/mogo-e4p/clusters` | All functional areas |
-| `gitnexus://repo/mogo-e4p/processes` | All execution flows |
-| `gitnexus://repo/mogo-e4p/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-| --- | --- |
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
-
 <!-- tidy:start -->
 ## 项目开发治理
 
 先读取 `.tidy.json` 与 `docs/development/INDEX.md`。提交信息遵守 `docs/COMMIT_CONVENTION.md`。
-使用 `$tidy` 执行提交前文档/架构/功能检查和提交后 GitNexus 刷新。
+使用 `$tidy` 执行提交前文档/架构/功能检查；GitNexus 是否参与由项目配置决定。
 tidy 更新后使用 `$tidy-rebuild` 评估并对齐现有治理；制定或维护自动化发版流程使用 `$tidy-release`。
 本次记录放 `docs/local/tidy/changes/`；过程材料遵守已确认的可见性，不取消既有忽略边界。
 普通计划、设计草稿、图片、过程决策和验收摘要放 `docs/local/tidy/` 对应分类；工具固定路径优先，稳定共享文档另按项目政策维护。
 GitNexus 计划保留 `docs/plans/*gitnexus-plan*.md` 原路径与正文，tidy 只建索引，不搬迁、改名、复制或用符号链接替代。
 本地过程策略与 `gitnexus-work` 的计划入库要求冲突时，先确认可见性与当前提交授权；不强制入库或擅自改变忽略规则。
 提交前按规范归类全部实际变化并维护统一入口；仅暂存本任务内容。
+现行操作说明与源码/配置对齐；变动涉及多语言、手册或备份边界时同步核对其权威入口。功能实现与验证证据分开维护，局部结果不追认为全量验收。
+已配置 document_checks 时，check 同时核对文档引用；语义、测试执行与设备验收仍须各自证据。
 每次提交前检查并清理本任务的临时日志、断点、测试入口及调试桩；保留正式日志/回归测试，清理后验证并运行 check --staged。
-提交成功后刷新 `gitnexus analyze --index-only`，核对新鲜度并更新本地回执；失败如实报告。
+GitNexus 已停用：tidy 仍执行文档、架构、功能和暂存快照检查，不运行 GitNexus；需要时按项目决定重新启用。
 不因治理流程获得 push、历史改写、发布或硬件操作授权。现有规则冲突先询问用户。
 <!-- tidy:end -->

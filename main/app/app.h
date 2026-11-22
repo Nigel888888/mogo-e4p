@@ -69,9 +69,15 @@ typedef struct {
     /// 输入适配器借用的设备上下文，页面不得释放。/ Borrowed input context; pages must not free it.
     void *touch_context;
     int64_t now_ms;
+    /// 主循环给页面轮询的最近输入时刻。/ Latest input timestamp supplied to page polling.
+    int64_t last_input_ms;
     /// 去抖后的触摸快照：空槽已清零，抬手后保留最后一次坐标。
     /// / Debounced touch: empty slots cleared; last coords kept after lift.
     const app_touch_t* touch;
+    /// 最近一次成功采样仍有物理接触（含留白和三键）。/ The latest valid sample has contact, including strips and panel keys.
+    bool physical_touch_active;
+    /// 偏移落屏时刻；不回放该毫秒及之前采集的屏内接触。/ Offset commit time; do not replay screen contacts sampled at or before it.
+    int64_t screen_touch_cutoff_ms;
     /// 借用的加速度计句柄，主循环装配填入；为空表示板上无传感器。
     /// / Borrowed accelerometer handle filled by the loop; NULL when the board has none.
     struct sc7a20h_dev_t* acc;
@@ -115,6 +121,8 @@ struct app_desc_s {
     bool defer_middle_short;
     /// 可选：按当前页面决定右下角菜单把手是否响应。/ Decide whether the bottom-right menu handle is active.
     bool (*menu_handle_enabled)(app_ctx_t* ctx);
+    /// 页内弹窗独占页面输入时暂停快捷栏与全局键，不影响电源键。/ A page modal suppresses quick settings and global keys, not the power key.
+    bool (*modal_input_owned)(app_ctx_t* ctx);
     /// 可选：当前确实显示主页面，允许本地测试优化底栏切页；阅读/子页面返回 false。
     /// Optional: true only for a main-tab view eligible for local transition testing; reader/subviews return false.
     bool (*main_page_visible)(app_ctx_t* ctx);
@@ -153,6 +161,9 @@ struct app_desc_s {
     bool (*present)(app_ctx_t* ctx, app_redraw_t redraw);
     /// 可选：启用本次接触的长按拖动释放事件。/ Enable long-drag release events for a new contact.
     bool (*gesture_long_drag)(app_ctx_t* ctx);
+    /// 可选：单指手势中检查每个接触采样（含容差内和回放），返回 false 即取消。
+    /// Optional per-sample check during a single-finger gesture (including slop/replay); false cancels it.
+    bool (*gesture_contact_allowed)(const app_ctx_t* ctx);
     /// 可选：屏蔽屏幕触摸，底部三键继续分发；主循环在摄取每帧前查询。
     /// Optional: suppress screen touch while retaining panel keys; queried before ingesting each frame.
     bool (*screen_touch_disabled)(app_ctx_t* ctx);

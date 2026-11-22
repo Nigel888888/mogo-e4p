@@ -6,6 +6,7 @@
  * English: Media detection, file-consumer invalidation and font recovery extracted from the loop; scheduling and repainting remain in the loop.
  */
 #include "app_media.h"
+#include "cloudzao_service.h"
 #include "board_sd.h"
 #include "app_font_context.h"
 #include "ttf_font.h"
@@ -73,6 +74,9 @@ bool app_media_poll(app_ctx_t* ctx, const app_desc_t* current,
     if (gained && current->on_media_ready) current->on_media_ready(ctx);
     if (!lost) return false;
     *invalidated = true;
+#ifdef CONFIG_MOGO_CLOUDZAO_TRANSFER
+    cloudzao_media_lost();
+#endif
     if (current->on_media_lost) current->on_media_lost(ctx);
     if (ttf_font_ready() && !ttf_font_is_builtin()) ttf_font_open_builtin();
     ui_text_set_system_font(false);

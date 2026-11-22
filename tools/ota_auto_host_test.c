@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include "../main/ota/ota_online.h"
+#include "memory_peak.h"
 
 enum { NVS_READONLY, NVS_READWRITE };
 enum { WIFI_TRANSFER_STOPPED, WIFI_TRANSFER_READY, WIFI_TRANSFER_STARTING };
@@ -14,8 +15,9 @@ enum { WIFI_TRANSFER_MODE_AP, WIFI_TRANSFER_MODE_STA };
 typedef int nvs_handle_t;
 typedef struct { int state, mode; bool network_ready; } wifi_transfer_status_t;
 typedef struct { int percent; bool charging; } pmu_snapshot_t;
-static bool enabled, credentials, busy, start_ok;
-static int checks, cancels, saves;
+static bool enabled, credentials, busy;
+static esp_err_t start_error;
+static int checks, cancels, saves, cancel_signals;
 static uint64_t stored;
 static int64_t mono;
 static time_t wall;
@@ -36,16 +38,17 @@ static int nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
 static void nvs_close(nvs_handle_t h) { (void)h; }
 bool pico_online_busy(void) { return busy; }
 void pico_online_get_status(pico_update_status_t *out) { *out = update; }
-esp_err_t pico_online_check(void) { ++checks; if (!start_ok) return -1; busy = true; update.state = PICO_UPDATE_CHECKING; return ESP_OK; }
+esp_err_t pico_online_check_auto(void) { ++checks; if (start_error) return start_error; busy = true; update.state = PICO_UPDATE_CHECKING; return ESP_OK; }
+void pico_online_request_cancel(void) { ++cancel_signals; }
 void pico_online_cancel_join(void) { ++cancels; busy = false; update.state = PICO_UPDATE_CANCELLED; }
 #define time(...) wall
 #include "../main/ota/ota_auto.c"
 
 static void reset(void) {
-    s_loaded = s_checking = s_pending = s_attempted = false;
+    s_loaded = s_checking = s_pending = s_attempted = s_cancelling = false;
     s_last_attempt = 0; s_next_us = 15000000; s_attempt_us = 0;
-    enabled = credentials = start_ok = true; busy = false;
-    checks = cancels = saves = 0; stored = 0; mono = 15000000; wall = 1800000000;
+    enabled = credentials = true; busy = false; start_error = ESP_OK;
+    checks = cancels = saves = cancel_signals = 0; stored = 0; mono = 15000000; wall = 1800000000;
     battery = (pmu_snapshot_t){80, false}; network = (wifi_transfer_status_t){0};
     update = (pico_update_status_t){0};
 }
@@ -67,7 +70,10 @@ int main(void) {
     network = (wifi_transfer_status_t){WIFI_TRANSFER_READY, WIFI_TRANSFER_MODE_STA, true}; credentials = false;
     battery.percent = 9; pico_ota_auto_poll(true); assert(!checks);
     battery.charging = true; pico_ota_auto_poll(true); assert(checks == 1);
-    enabled = false; pico_ota_auto_poll(false); assert(cancels == 1 && !busy && !pico_ota_auto_pending());
+    enabled = false; pico_ota_auto_poll(false);
+    assert(cancel_signals == 1 && !cancels && busy && !pico_ota_auto_pending());
+    pico_ota_auto_poll(false); assert(cancel_signals == 1);
+    finish(PICO_UPDATE_AVAILABLE); assert(!pico_ota_auto_pending());
     enabled = true; pico_ota_auto_poll(true); assert(checks == 1);
 
     reset(); busy = true; pico_ota_auto_poll(true); pico_ota_auto_cancel(); assert(!checks && !cancels && busy);
@@ -75,7 +81,17 @@ int main(void) {
     reset(); pico_ota_auto_poll(true); busy = false; update.state = PICO_UPDATE_AVAILABLE;
     pico_ota_auto_cancel(); assert(!cancels && pico_ota_auto_pending());
 
-    reset(); start_ok = false; pico_ota_auto_poll(true); assert(checks == 1 && saves == 1);
+    reset(); start_error = MEMORY_PEAK_BUSY_OWNER_BASE + MEMORY_PEAK_WEATHER;
+    pico_ota_auto_poll(true); assert(checks == 1 && !saves && !s_attempted);
+    mono += AUTO_DEFER_US - 1; pico_ota_auto_poll(true); assert(checks == 1);
+    ++mono; start_error = MEMORY_PEAK_FRAGMENT;
+    pico_ota_auto_poll(true); assert(checks == 2 && !saves && !busy);
+    mono += AUTO_DEFER_US; start_error = ESP_OK;
+    pico_ota_auto_poll(true); assert(checks == 3 && saves == 1 && busy);
+    pico_ota_auto_request_cancel(); assert(cancel_signals == 1 && !cancels && busy);
+    pico_ota_auto_cancel(); assert(cancels == 1 && !busy);
+
+    reset(); start_error = -1; pico_ota_auto_poll(true); assert(checks == 1 && saves == 1);
     for (int i = 0; i < 100; ++i) pico_ota_auto_poll(true);
     assert(checks == 1); mono += AUTO_INTERVAL_US; wall += AUTO_INTERVAL_S;
     pico_ota_auto_poll(true); assert(checks == 2);

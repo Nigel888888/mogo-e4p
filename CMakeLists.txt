@@ -11,8 +11,10 @@ idf_build_set_property(MINIMAL_BUILD ON)
 if(DEFINED ENV{PICO_PROJECT_VER} AND NOT "$ENV{PICO_PROJECT_VER}" STREQUAL "")
     set(PROJECT_VER "$ENV{PICO_PROJECT_VER}")
 else()
-    set(PROJECT_VER "1.1.3")
+    set(PROJECT_VER "1.1.8")
 endif()
+# 仅正式发布构建允许注入 CloudZao 接入 ID。/ Only release builds may inject the CloudZao integration ID.
+option(MOGO_PUBLIC_RELEASE "Build firmware for public distribution" OFF)
 project(Read_Pico)
 
 # 中文：检查最终链接位置，防止升级 SDK 或改动链接布局后重现缓存关闭时取指崩溃。

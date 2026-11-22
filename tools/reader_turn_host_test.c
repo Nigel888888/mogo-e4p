@@ -68,7 +68,7 @@ int main(void) {
     assert(effect.text && effect.water && effect.footer_strong);
     frame.background = true;
     effect = reader_turn_effects(&frame);
-    assert(!effect.text && effect.water && effect.footer_strong);
+    assert(effect.text && effect.water && effect.footer_strong);
     frame.images = true;
     effect = reader_turn_effects(&frame);
     assert(!effect.text && !effect.water && effect.footer_strong);

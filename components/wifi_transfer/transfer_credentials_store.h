@@ -88,6 +88,16 @@ static int profile_index(const transfer_profiles_t *profiles, const char *ssid) 
     return -1;
 }
 
+// 构造有序并集，不静默丢弃本机网络。/ Construct an ordered union without silently dropping local networks.
+static bool merge_backup_profiles(transfer_profiles_t *preferred, const transfer_profiles_t *local) {
+    for (size_t i = 0; i < local->count; ++i) {
+        if (profile_index(preferred, local->items[i].ssid) >= 0) continue;
+        if (preferred->count == WIFI_TRANSFER_SAVED_MAX) return false;
+        preferred->items[preferred->count++] = local->items[i];
+    }
+    return true;
+}
+
 static esp_err_t store_credentials(const transfer_credentials_t *next) {
     if (next && !credentials_valid(next)) return ESP_ERR_INVALID_ARG;
     transfer_profiles_t profiles = {.version = 2};

@@ -26,8 +26,6 @@ enum {SHELF,READING,TOC,READER_PANEL_NONE,READER_PANEL_TOOLS,READER_PANEL_NOTE};
 #define ESP_OK 0
 #define READER_MIDDLE_DOUBLE_MS 340
 #define READER_VOLUME_POLL_MS 30
-#define READER_UP_KEY_DEBOUNCE_MS 30
-#define READER_UP_KEY_LONG_MS 1000
 #define BOARD_VOLUME_UP 1
 static int s_view=READING,s_reader_panel=READER_PANEL_NONE,s_reader_slider=-1,s_pressed_control=-1;
 static int64_t s_stats_activity_ms,s_reader_notice_until;
@@ -35,9 +33,9 @@ static char s_reader_notice[128];
 static bool s_reader_tools_toggle,s_middle_pending;
 static int64_t s_middle_pending_ms;
 static struct {bool active;} s_dictionary_selection;
-static bool disabled,bound,fail_save,volume_enabled=true,up_pressed;
+static bool disabled,bound,fail_save,volume_enabled=true;
 static uint8_t volume_keys;
-static unsigned turns,up_reads,volume_reads,invalidations;
+static unsigned turns,volume_reads,invalidations;
 static bool app_settings_reader_touch_disabled(void){return disabled;}
 static bool app_settings_reader_touch_toggle_bound(void){return bound;}
 static bool app_settings_set_reader_touch_disabled(bool on){if(fail_save||(on&&!bound))return false;disabled=on;return true;}
@@ -57,7 +55,6 @@ static void app_settings_set_frontlight_on(bool on){(void)on;}
 static unsigned app_settings_frontlight_brightness(void){return 40;}
 static unsigned app_settings_frontlight_cct(void){return 50;}
 static int frontlight_apply(bool on,unsigned brightness,unsigned cct){(void)on;(void)brightness;(void)cct;return 0;}
-static int board_read_up_key(bool *pressed){++up_reads;*pressed=up_pressed;return ESP_OK;}
 static int board_read_volume_keys(uint8_t *keys){++volume_reads;*keys=volume_keys;return ESP_OK;}
 static bool app_settings_reader_volume_turn(void){return volume_enabled;}
 '''
@@ -71,7 +68,7 @@ static app_reader_key_action_t app_settings_reader_double_action(void){return do
 '''
 for name in ('reader_notice_tick','reader_toggle_touch','screen_touch_disabled','toggle_reader_tools_panel',
              'reader_key_action','middle_short_press','middle_pending_tick',
-             'reader_up_key_tick','reader_volume_tick'):
+             'app_book_reader_keys_active','app_book_up_key_action','reader_volume_tick'):
     unit += function(name, book) + '\n'
 unit += r'''
 int main(void){
@@ -100,12 +97,17 @@ int main(void){
  // 上键恢复在正文、工具栏和说明弹层均可用，音量键在禁触工具栏中仍可翻页。
  // Up-key recovery works in the body, toolbar and note sheet; volume turns work in locked reader sheets.
  for(int panel=READER_PANEL_NONE;panel<=READER_PANEL_NOTE;++panel){
-  disabled=true;s_reader_panel=panel;ctx.now_ms+=1000;up_pressed=true;reader_up_key_tick(&ctx);
-  ctx.now_ms+=80;up_pressed=false;assert(reader_up_key_tick(&ctx)==APP_REDRAW_PAGE&&!disabled);
+  disabled=true;s_reader_panel=panel;ctx.now_ms+=1000;
+  assert(app_book_up_key_action(&ctx)==APP_REDRAW_PAGE&&!disabled);
  }
  disabled=true;s_reader_panel=READER_PANEL_TOOLS;up_action=APP_READER_KEY_NEXT;
- ctx.now_ms+=1000;up_pressed=true;reader_up_key_tick(&ctx);ctx.now_ms+=80;up_pressed=false;
- assert(reader_up_key_tick(&ctx)==APP_REDRAW_PAGE&&turns==1);
+ ctx.now_ms+=1000;
+ assert(app_book_up_key_action(&ctx)==APP_REDRAW_PAGE&&turns==1);
+ disabled=false;s_reader_panel=READER_PANEL_TOOLS;
+ assert(app_book_up_key_action(&ctx)==APP_REDRAW_NONE&&turns==1);
+ up_action=APP_READER_KEY_REFRESH;
+ assert(app_book_up_key_action(&ctx)==APP_REDRAW_FULL);
+ s_view=SHELF;assert(app_book_up_key_action(&ctx)==APP_REDRAW_NONE);s_view=READING;
  disabled=true;s_reader_panel=READER_PANEL_TOOLS;ctx.now_ms+=1000;volume_keys=0;reader_volume_tick(&ctx);
  ctx.now_ms+=80;volume_keys=1;assert(reader_volume_tick(&ctx)==APP_REDRAW_PAGE&&turns==2);
  s_view=SHELF;unsigned before=volume_reads;ctx.now_ms+=1000;reader_volume_tick(&ctx);assert(volume_reads==before);
@@ -114,7 +116,7 @@ int main(void){
  s_view=READING;disabled=false;single_action=APP_READER_KEY_TOUCH;double_action=APP_READER_KEY_NEXT;
  middle_short_press(&ctx);ctx.now_ms+=400;assert(middle_pending_tick(&ctx)==APP_REDRAW_PAGE&&disabled);
  assert(middle_pending_tick(&ctx)==APP_REDRAW_NONE);
- assert(invalidations>=10&&up_reads>=8);
+ assert(invalidations>=10);
  puts("PASS: actual reader touch toggle prerequisites, failures, page scope, panel recovery, middle single/double/timeout, up-key and volume dispatch");
 }
 '''

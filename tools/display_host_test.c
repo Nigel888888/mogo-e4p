@@ -9,8 +9,11 @@
  */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "display.h"
+#include "display_static_black.h"
+#include "epd_output_offset.h"
 #include "app_config.h"
 #include "settings.h"
 #include "e0470_epaper_waveform.h"
@@ -30,7 +33,7 @@ int epd_width(void) {return 1216;}
 int epd_height(void) {return 684;}
 enum EpdRotation epd_get_rotation(void) {return EPD_ROT_INVERTED_PORTRAIT;}
 void* heap_caps_aligned_alloc(size_t a,size_t b,unsigned c) {(void)a;(void)b;(void)c;assert(false);return NULL;}
-void heap_caps_free(void* p) {(void)p;assert(false);}
+void heap_caps_free(void* p) {assert(p);free(p);}
 const EpdWaveform* display_main_gray_waveform(void) {return &E0470_WAVEFORM;}
 const EpdWaveform* display_main_shelf_exit_waveform(void) {return &E0470_WAVEFORM;}
 // 本组不注册灰阶内容带；若误入分区呈现，立即失败。/ This suite registers no gray bands; fail on an unexpected regional presentation.
@@ -44,10 +47,14 @@ enum EpdDrawError e0470_update_regions(EpdiyHighlevelState* hl, EpdRect area,
     (void)strong_waveform; (void)strong_mode;
     assert(false); return EPD_DRAW_OTHER_ERROR;
 }
-static const EpdWaveform soft_gray = {4};
-static const EpdWaveform reader_soft = {5};
-static const EpdWaveform reader_water = {6};
-const EpdWaveform* display_reader_text_waveform(void) {return &reader_soft;}
+static const EpdWaveform soft_gray = {.num_modes=4};
+static const EpdWaveform test_gl16;
+static bool use_join_wave, bg_join_wave;
+const char* app_settings_book_background_path(void) { return bg_join_wave ? "test" : ""; }
+const EpdWaveform* display_reader_bg_waveform(void) { return &test_gl16; }
+static const EpdWaveform reader_soft = {.num_modes=5};
+static const EpdWaveform reader_water = {.num_modes=6};
+const EpdWaveform* display_reader_text_waveform(void) {return use_join_wave ? &test_gl16 : &reader_soft;}
 const EpdWaveform* display_reader_water_waveform(void) {return &reader_water;}
 const EpdWaveform* display_main_water_waveform(void) {return &soft_gray;}
 const EpdWaveform* display_main_normal_waveform(void) { return display_main_water_waveform(); }
@@ -58,11 +65,12 @@ int epd_rotated_display_width(void) { return 684; }
 int epd_rotated_display_height(void) { return 1216; }
 
 #define FB_BYTES 128
-const EpdWaveform E0470_WAVEFORM = {0}, E0470_FOLLOW_WAVEFORM = {1}, E0470_GRAY8_WAVEFORM = {2}, E0470_FULL_WAVEFORM = {3},
-    E0470_CAPSULE_DRAG_WAVEFORM = {4}, E0470_CAPSULE_WHITE_WAVEFORM = {5},
-    E0470_CAPSULE_GRAY_WAVEFORM = {6}, E0470_APPLY_WAVEFORM = {7};
+const EpdWaveform E0470_WAVEFORM = {.num_modes=0}, E0470_FOLLOW_WAVEFORM = {.num_modes=1}, E0470_GRAY8_WAVEFORM = {.num_modes=2}, E0470_FULL_WAVEFORM = {.num_modes=3},
+    E0470_CAPSULE_DRAG_WAVEFORM = {.num_modes=4}, E0470_CAPSULE_WHITE_WAVEFORM = {.num_modes=5},
+    E0470_CAPSULE_GRAY_WAVEFORM = {.num_modes=6}, E0470_APPLY_WAVEFORM = {.num_modes=7};
 static uint8_t target[FB_BYTES], presented[FB_BYTES];
 static int clocks, powerons, clears, draws, full_draws, safe_clock, prefill, last_mode, last_scan;
+static int clears_at_draw;
 static bool white_baseline, correct_target_at_draw;
 static int scan_at_draw, prefill_at_draw;
 static enum EpdDrawError next_draw_error;
@@ -77,18 +85,113 @@ static const EpdWaveform *waveform_at_draw;
 static enum EpdDrawError water_result;
 static int water_calls;
 static EpdRect last_area;
+static uint8_t physical_offset_frame[1216 * 684];
+static int offset_scans, offset_discards;
+static bool check_static_black, check_reader_black, check_reader_background, check_joined, full_size_fb;
+static unsigned static_black_scans, forgotten_waveforms;
+static uint8_t test_gl16_lut[8][16][4];
+static const EpdWaveformPhases test_gl16_phases = {8, (const uint8_t*)test_gl16_lut, NULL};
+static const EpdWaveformPhases *test_gl16_ranges[] = {&test_gl16_phases};
+static const EpdWaveformMode test_gl16_mode = {MODE_GL16, 1, test_gl16_ranges};
+static const EpdWaveformMode *test_gl16_modes[] = {&test_gl16_mode};
+static const EpdWaveformTempInterval test_temperatures[] = {{0, 50}};
+static const EpdWaveform test_gl16 = {.num_modes=1, .num_temp_ranges=1,
+    .mode_data=test_gl16_modes, .temp_intervals=test_temperatures};
+static void physical_scan_power(void);
+
+static unsigned phase_action(const EpdWaveformPhases *p, int f, unsigned transition) {
+    return (p->luts[f * 64 + (transition >> 2)] >> (6 - 2 * (transition & 3))) & 3;
+}
+
+void epd_clear_phase_luts(void) {}
+void epd_leading_skip_discard(void) { ++offset_discards; }
+void epd_leading_skip_forget_waveform(void) { ++forgotten_waveforms; }
+enum EpdDrawError epd_draw_base(EpdRect area, const uint8_t *data, EpdRect crop,
+    enum EpdDrawMode mode, int temperature, const bool *lines,
+    const uint8_t *columns, const EpdWaveform *waveform) {
+    assert(ota_display_depth && !lines && !columns && temperature == 25);
+    assert(mode == (MODE_PACKING_1PPB_DIFFERENCE | MODE_GL16));
+    if (check_static_black || check_reader_black || check_reader_background || check_joined) {
+        physical_scan_power();
+        assert(area.width == 1216 && area.height == 684 && !memcmp(&area, &crop, sizeof(area)));
+        const EpdWaveformPhases *phase = e0470_waveform_phases(waveform, MODE_GL16);
+        assert(phase && phase->phases == test_gl16_phases.phases);
+        const bool reader = check_reader_black || check_reader_background || check_joined;
+        for (int f = 0; f < phase->phases; ++f) {
+            for (unsigned code = 0; code < 256; ++code) {
+                const unsigned expected = code == 0xff && !(check_reader_background || bg_join_wave) ? 0 :
+                    code == 0 ? (unsigned)(f >= 3 && f <= 6) : code == 0xdd && reader ? (f == 5 ? 2 : 0) :
+                    phase_action(&test_gl16_phases, f, code);
+                assert(phase_action(phase, f, code) == expected);
+            }
+        }
+        const size_t row = 1216;
+        if (reader) {
+            const unsigned hold = check_reader_background || bg_join_wave ? 0xee : 0xff;
+            assert(data[4] == hold && data[6] == hold && data[8] == (check_joined ? 0x0f : hold) && data[10] == hold);
+            assert(data[11] == 0xdd && data[20] == hold && data[23] == 0xdd && data[28] == hold);
+        }
+        if (check_joined) {
+            const unsigned hold = bg_join_wave ? 0xee : 0xff;
+            assert(data[0] == 0 && data[1] == 0xf0 && data[2] == 0x06 && data[3] == 0x60);
+            assert(data[80] == hold && data[81] == 0x5f && data[84] == 0xff);
+            assert(data[1214] == 0 && data[1215] == hold);
+            assert(data[row + 1214] == hold && data[row + 1215] == 0x0f);
+        } else if (check_reader_background) {
+            assert(data[0] == 0 && data[1] == 0xee && data[2] == 0xee && data[3] == 0xee);
+            assert(data[80] == 0xee && data[81] == 0x65);
+            assert(data[82] == 0xee && data[83] == 0x77 && data[84] == 0xff && data[86] == 0xee);
+            assert(data[1214] == 0 && data[1215] == 0xee);
+        } else if (check_reader_black) {
+            assert(data[0] == 0 && data[1] == 0xff && data[2] == 0xff && data[3] == 0xff);
+            assert(data[80] == 0xff && (data[81] == 0x5f || data[81] == 0x65));
+            assert(data[1214] == 0 && data[1215] == 0xff);
+        } else {
+            assert(data[0] == 0 && data[1] == 0xff && data[2] == 0xff);
+            assert(data[row + 2] == 0 && data[row + 3] == 0x56 && data[row + 4] == 0xff);
+            assert(data[row + 8] == 0xa9 && data[row + 9] == 0);
+        }
+        ++static_black_scans;
+        enum EpdDrawError error = next_draw_error;
+        next_draw_error = EPD_DRAW_SUCCESS;
+        return error;
+    }
+    assert(waveform == &soft_gray);
+    assert(area.width == 1216 && area.height == 684 && !memcmp(&area, &crop, sizeof(area)));
+    int x, y; epd_get_output_offset(&x, &y); assert(!x && !y);
+    ++offset_scans; assert(offset_scans == offset_discards);
+    for (size_t i = 0; i < sizeof(physical_offset_frame); ++i) {
+        assert((data[i] & 15) == physical_offset_frame[i]);
+        if (next_draw_error == EPD_DRAW_SUCCESS) physical_offset_frame[i] = data[i] >> 4;
+    }
+    enum EpdDrawError result = next_draw_error; next_draw_error = EPD_DRAW_SUCCESS;
+    return result;
+}
 
 enum EpdDrawError e0470_page_turn(EpdiyHighlevelState* hl,EpdRect area,e0470_turn_dir_t dir) {
     (void)hl;(void)area;(void)dir;
     assert(false);return EPD_DRAW_OTHER_ERROR;
 }
-enum EpdDrawError e0470_page_turn_with_waveform_compact(EpdiyHighlevelState* hl,EpdRect area,
-    e0470_turn_dir_t dir,const EpdWaveform* waveform,unsigned bands) {
+enum EpdDrawError e0470_page_turn_reader(EpdiyHighlevelState* hl,EpdRect area,
+    e0470_turn_dir_t dir,const EpdWaveform* waveform,unsigned pushes) {
     assert(ota_display_depth);
     assert(hl&&area.width>0&&dir==E0470_TURN_RTL);
-    assert(waveform==&reader_water&&bands==E0470_TURN_FAST_BANDS);
+    assert(waveform==&reader_water&&pushes==4);
     ++water_calls;assert(last_scan==BOARD_EPD_SCAN_FAST);
     return water_result;
+}
+
+enum EpdDrawError e0470_page_turn_reader_joined(EpdiyHighlevelState* hl, EpdRect body,
+    e0470_turn_dir_t dir, const EpdWaveform* wave, unsigned pushes, const EpdRect chrome[2], bool* scanned) {
+    (void)hl; (void)body; (void)dir; (void)wave; (void)pushes; (void)chrome; (void)scanned;
+    assert(false); return EPD_DRAW_OTHER_ERROR;
+}
+
+enum EpdDrawError e0470_page_turn_with_waveform_compact(EpdiyHighlevelState* hl, EpdRect area,
+    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned bands) {
+    (void)hl; (void)area; (void)dir; (void)waveform; (void)bands;
+    assert(false);
+    return EPD_DRAW_OTHER_ERROR;
 }
 
 void board_epd_set_pclk(int mhz) { ++clocks; safe_clock = mhz; }
@@ -148,6 +251,7 @@ static enum EpdDrawError draw(EpdiyHighlevelState* hl, enum EpdDrawMode mode, in
     }
     physical_scan_power();
     ++draws;
+    clears_at_draw = clears;
     full_draws += full;
     last_mode = mode;
     waveform_at_draw = hl->waveform;
@@ -159,7 +263,8 @@ static enum EpdDrawError draw(EpdiyHighlevelState* hl, enum EpdDrawMode mode, in
     enum EpdDrawError err = next_draw_error;
     if (draw_errors_remaining > 1) --draw_errors_remaining;
     else { draw_errors_remaining = 0; next_draw_error = EPD_DRAW_SUCCESS; }
-    if (err == EPD_DRAW_SUCCESS) memcpy(hl->back_fb, hl->front_fb, FB_BYTES);
+    if (err == EPD_DRAW_SUCCESS) memcpy(hl->back_fb, hl->front_fb,
+        full_size_fb ? (size_t)epd_width() * epd_height() / 2 : FB_BYTES);
     return err;
 }
 enum EpdDrawError epd_hl_update_screen(EpdiyHighlevelState* hl, enum EpdDrawMode mode, int temperature) {
@@ -180,6 +285,16 @@ enum EpdDrawError epd_hl_update_area_full(EpdiyHighlevelState* hl, enum EpdDrawM
 // The stub does not model dirty-mask dilation and treats both as ordinary differentials.
 enum EpdDrawError epd_hl_update_area_padded(EpdiyHighlevelState* hl, enum EpdDrawMode mode, int temperature, EpdRect area, int pad_lines, int pad_col_bytes) {
     (void)pad_lines; (void)pad_col_bytes;
+    if (hl->waveform == &test_gl16) {
+        assert(ota_display_depth && mode == MODE_GL16 && temperature == 25);
+        EpdRect native;
+        if (display_static_black_changed(hl, area, &native)) {
+            physical_scan_power(); ++draws;
+            const size_t off = 1216 / 2 + 1;
+            hl->back_fb[off] = (hl->back_fb[off] & 0x0f) | (hl->front_fb[off] & 0xf0);
+        }
+        return EPD_DRAW_SUCCESS;
+    }
     return epd_hl_update_area(hl, mode, temperature, area);
 }
 enum EpdDrawError epd_hl_update_screen_padded(EpdiyHighlevelState* hl, enum EpdDrawMode mode, int temperature, int pad_lines, int pad_col_bytes) {
@@ -189,7 +304,7 @@ enum EpdDrawError epd_hl_update_screen_padded(EpdiyHighlevelState* hl, enum EpdD
 // 与 highlevel.c:142 相同：白后缓冲后，强制整屏推目标前缓冲。
 // Match highlevel.c:142: whiten the back buffer, then force a full update from the target front buffer.
 enum EpdDrawError epd_hl_update_screen_from_white(EpdiyHighlevelState* hl, enum EpdDrawMode mode, int temperature) {
-    memset(hl->back_fb, 255, FB_BYTES);
+    memset(hl->back_fb, 255, full_size_fb ? (size_t)epd_width() * epd_height() / 2 : FB_BYTES);
     return epd_hl_update_screen_full(hl, mode, temperature);
 }
 
@@ -214,6 +329,196 @@ static enum EpdDrawError power_fault_present(EpdiyHighlevelState *hl, unsigned p
         case 15: return update_display_water_turn(hl, area, E0470_TURN_RTL);
         default: return display_panel_repair(hl);
     }
+}
+
+// 直接核对连续平移时的物理差分及真实提交，不依赖逻辑缓冲假装移动成功。
+// Check physical differences and real commits through repeated translations, without treating logical copies as successful movement.
+static void screen_offset_live_test(void) {
+    const size_t bytes = 1216 * 684 / 2;
+    uint8_t *front = malloc(bytes), *back = malloc(bytes), *diff = malloc(2 * bytes);
+    assert(front && back && diff);
+    memset(front, 255, bytes); memset(back, 255, bytes);
+    memset(physical_offset_frame, 15, sizeof(physical_offset_frame));
+    EpdiyHighlevelState hl = {.front_fb=front, .back_fb=back, .difference_fb=diff};
+    epd_set_output_offset(0, 0);
+    int prior_clears = clears;
+    for (size_t i = 0; i < bytes; ++i) front[i] = (uint8_t)(i * 71 + 13);
+    // 左右/上下端点、奇数像素、反向和归零；超过周期计数仍不能清屏。
+    // Cover both axis endpoints, odd pixels, reversals and zero; crossing periodic counts must not clear.
+    const int positions[][2]={{0,0},{1,0},{0,-1},{32,-32},{-32,32},{0,0}};
+    for (unsigned n = 0; n < 30; ++n) {
+        int x = positions[n % 6][0], y = positions[n % 6][1];
+        assert(update_display_screen_offset(&hl,x,y) == EPD_DRAW_SUCCESS);
+        assert(!memcmp(front,back,bytes) && clears == prior_clears && !ota_display_depth);
+        int nx,ny; epd_get_output_offset(&nx,&ny); assert(nx == y && ny == -x);
+        for (int py = 0; py < 684; ++py) for (int px = 0; px < 1216; ++px) {
+            int sx = px - y, sy = py + x; uint8_t expected = 15;
+            if (sx >= 0 && sx < 1216 && sy >= 0 && sy < 684)
+                expected = (front[sy * 608 + sx / 2] >> (4 * (sx % 2))) & 15;
+            assert(physical_offset_frame[py * 1216 + px] == expected);
+        }
+    }
+    int scans = offset_scans;
+    assert(update_display_screen_offset(&hl,0,0) == EPD_DRAW_SUCCESS && offset_scans == scans);
+    assert(update_display_screen_offset(&hl,33,0) == EPD_DRAW_INVALID_CROP && offset_scans == scans);
+    front[100] ^= 0xff;
+    next_draw_error = EPD_DRAW_OTHER_ERROR;
+    assert(update_display_screen_offset(&hl,1,0) == EPD_DRAW_OTHER_ERROR);
+    assert(front[100] != back[100] && clears == prior_clears && !ota_display_depth);
+    int x, y;
+    display_get_screen_offset(&x, &y);
+    assert(x == 0 && y == 0);
+    // 故障出口继续走既有完整恢复；旧小缓冲替身只验证恢复调用与清屏次数。
+    // Fault output retains the existing full recovery; the small-buffer shim checks its invocation and clear count only.
+    memcpy(target,front,FB_BYTES);
+    assert(update_display_screen_offset(&hl,1,0) == EPD_DRAW_SUCCESS && clears == prior_clears + 1);
+    memcpy(diff, back, bytes);
+    prior_clears = clears;
+    int before_draws = draws;
+    power_failure = true;
+    assert(update_display_screen_offset(&hl,2,3) == DISPLAY_DRAW_POWER_NOT_READY);
+    power_failure = false;
+    // 退避期间保留原坐标和后帧，且不开始清屏。/ Backoff leaves coordinates and back untouched and cannot start a clear.
+    assert(update_display_screen_offset(&hl,2,3) == DISPLAY_DRAW_POWER_NOT_READY);
+    display_get_screen_offset(&x, &y);
+    assert(x == 1 && y == 0 && !memcmp(diff, back, bytes));
+    assert(draws == before_draws && offset_scans == scans + 1 && clears == prior_clears);
+    now_us += 1001000;
+    next_draw_error = EPD_DRAW_EMPTY_LINE_QUEUE;
+    assert(update_display_screen_offset(&hl,2,3) == EPD_DRAW_EMPTY_LINE_QUEUE);
+    display_get_screen_offset(&x, &y);
+    assert(x == 1 && y == 0 && clears == prior_clears + 1 && safe_clock == DISPLAY_PCLK_SAFE_MHZ);
+    assert(update_display_screen_offset(&hl,2,3) == EPD_DRAW_SUCCESS);
+    display_get_screen_offset(&x, &y);
+    assert(x == 2 && y == 3 && clears == prior_clears + 2);
+    // 只有全刷请求、无供电故障时，换位置仍需先擦掉旧覆盖区。
+    // Even without a power fault, a requested full refresh must erase the old footprint when moving.
+    display_request_full_refresh();
+    assert(update_display_screen_offset(&hl,0,0) == EPD_DRAW_SUCCESS && clears == prior_clears + 3);
+    free(front); free(back); free(diff);
+    puts("screen offset: 30 physical translations, clipping, no-op, bounds, rollback in differential and full recovery, power backoff, retry");
+}
+
+static void test_static_black(void) {
+    const int width = 1216, height = 684;
+    const size_t pixels = (size_t)width * height, stride = width / 2;
+    uint8_t *front = malloc(pixels / 2), *back = malloc(pixels / 2), *diff = malloc(pixels);
+    assert(front && back && diff);
+    full_size_fb = true;
+    EpdiyHighlevelState hl = {.front_fb=front, .back_fb=back, .difference_fb=diff};
+    memset(back, 0xff, pixels / 2);
+    back[0] = 0x80;
+    back[stride + 1] = 0x60;
+    back[stride + 2] = 0xf0;
+    back[stride + 4] = 0x09;
+    memcpy(front, back, pixels / 2);
+    assert(update_display_full(&hl) == EPD_DRAW_SUCCESS);
+    const EpdRect area = {680, 3, 3, 6};
+    EpdRect native;
+    assert(!display_static_black_changed(&hl, area, &native));
+    assert(native.x == 3 && native.y == 1 && native.width == 6 && native.height == 3);
+    memset(test_gl16_lut, 0x55, sizeof(test_gl16_lut));
+    test_gl16_lut[0][0][0] = 0x95;
+    test_gl16_lut[0][15][3] = 0x56;
+    test_gl16_lut[0][0][3] = 0x54;
+    test_gl16_lut[7][0][3] = 0x54;
+    test_gl16_lut[5][15][0] = 0x95;
+    for (int i = 0; i < 3; ++i) {
+        front[stride + 1] ^= 0x10;
+        assert(update_display_area_stable_diff(&hl, &test_gl16, MODE_GL16, area) == EPD_DRAW_SUCCESS);
+    }
+    // 未变化或其他出口不消费补偿；区外尚未提交的目标也不算变化。
+    // No-ops and unrelated routes do not consume the pending correction; outside pending targets do not count as changes.
+    assert(update_display_area_stable_diff(&hl, &test_gl16, MODE_GL16, area) == EPD_DRAW_SUCCESS);
+    front[0] = 0xff; front[1] = 0;
+    front[stride + 1] = 0x5f; front[stride + 4] = 0xfa;
+    back[stride + 1] = 0x60;
+    check_static_black = true;
+    const int normal_draws = draws;
+    assert(update_display_area_stable_diff(&hl, &test_gl16, MODE_GL16, area) == EPD_DRAW_SUCCESS);
+    assert(static_black_scans == 1 && draws == normal_draws);
+    assert(back[0] == 0x80 && back[1] == 0xff);
+    assert(back[stride + 1] == 0x50 && back[stride + 4] == 0x0a);
+    // 复位后需要再来四次；让失败经过公共出口，并验证下一次请求转为整屏恢复。
+    // Reset requires four more changes; fail through the public exit and require full recovery on the next request.
+    check_static_black = false;
+    for (int i = 0; i < 3; ++i) {
+        front[stride + 1] ^= 0x10;
+        assert(update_display_area_stable_diff(&hl, &test_gl16, MODE_GL16, area) == EPD_DRAW_SUCCESS);
+    }
+    assert(static_black_scans == 1);
+    back[stride + 1] = 0x60; back[stride + 4] = 0x09;
+    front[stride + 1] = 0x5f;
+    next_draw_error = EPD_DRAW_OTHER_ERROR;
+    check_static_black = true;
+    assert(update_display_area_stable_diff(&hl, &test_gl16, MODE_GL16, area) == EPD_DRAW_OTHER_ERROR);
+    assert(static_black_scans == 2 && forgotten_waveforms == 2);
+    assert(back[0] == 0x80 && back[1] == 0xff && back[stride + 1] == 0x60 && back[stride + 4] == 0x09);
+    check_static_black = false;
+    const int before_recovery = full_draws;
+    assert(update_display_area_stable_diff(&hl, &test_gl16, MODE_GL16, area) == EPD_DRAW_SUCCESS);
+    assert(full_draws == before_recovery + 1 && !memcmp(front, back, pixels / 2));
+    // 连续正文翻页立即补偿；区外新黑与待擦黑都保持，且不消耗通用局刷计数。
+    // Consecutive body turns reinforce immediately; hold newly staged and soon-erased outside targets.
+    memset(back, 0xff, pixels / 2); memset(front, 0xff, pixels / 2);
+    const EpdRect body = {0, 81, height, width - 156};
+    back[0] = 0x00; front[0] = 0xf0;
+    back[1] = 0x06; front[1] = 0x60;
+    front[3] = back[3] = 0xfd; front[4] = 0xf0;
+    back[2 * stride + 10] = 0xfd; front[2 * stride + 14] = 0xfd;
+    front[stride - 1] = back[stride - 1] = 0xf0;
+    check_reader_black = true;
+    front[40] = 0x5f;
+    assert(update_display_area_reader_turn(&hl, &test_gl16, MODE_GL16, body, false) == EPD_DRAW_SUCCESS);
+    check_reader_black = false;
+    check_reader_background = true;
+    for (int f = 0; f < test_gl16_phases.phases; ++f) {
+        test_gl16_lut[f][0][0] &= 0x3f;
+        test_gl16_lut[f][14][3] &= 0xf3;
+        test_gl16_lut[f][13][3] &= 0xcf;
+    }
+    // 有背景仍按原表驱动正文 FF、77 等色；正文黑不借用专门给栏位补黑的 00。
+    // Keep equal body pairs such as FF and 77 on the original background table; black body pixels must not use chrome 00.
+    front[40] = 0x6f;
+    front[41] = back[41] = 0x70;
+    front[43] = back[43] = 0xfd;
+    assert(update_display_area_reader_turn(&hl, &test_gl16, MODE_GL16, body, true) == EPD_DRAW_SUCCESS);
+    assert(static_black_scans == 4 && back[0] == 0x00 && back[1] == 0x06 && back[40] == 0x6f);
+    check_reader_background = false;
+    test_gl16_lut[0][0][0] |= 0x40;
+    const int prior_full = full_draws;
+    front[40] = 0x5f;
+    assert(update_display_area_reader_turn(&hl, &test_gl16, MODE_GL16, body, true) == EPD_DRAW_SUCCESS);
+    assert(static_black_scans == 4 && full_draws == prior_full + 1);
+    // 一次普通 GL16 提交正文和请求的栏位；无关目标和失败帧均不回写。
+    // One GL16 scan commits body and requested bars; ignore unrelated targets and preserve the failed baseline.
+    check_joined = use_join_wave = true;
+    test_gl16_lut[0][0][0] &= 0x3f;
+    const EpdRect top = {0, 0, height, 80}, footer = {1, 1141, height - 2, 75};
+    for (int i = 0; i < 3; ++i) {
+        memset(back, 0xff, pixels / 2); memset(front, 0xff, pixels / 2);
+        bg_join_wave = i > 0;
+        back[0] = 0x00; front[0] = 0xf0;
+        back[1] = 0x06; front[1] = 0x60;
+        front[3] = back[3] = 0xfd; front[4] = 0xf0;
+        back[2 * stride + 10] = 0xfd; front[2 * stride + 14] = 0xfd;
+        front[40] = 0x50;
+        back[stride - 1] = 0xf0; front[stride - 1] = 0x60;
+        front[2 * stride - 1] = 0x0f;
+        if (i == 2) next_draw_error = EPD_DRAW_OTHER_ERROR;
+        const unsigned before = static_black_scans;
+        enum EpdDrawError result = EPD_DRAW_INVALID_CROP;
+        assert(update_display_reader_joined(&hl, body, top, footer, false, E0470_TURN_RTL, &result));
+        assert(static_black_scans == before + 1);
+        assert(result == (i == 2 ? EPD_DRAW_OTHER_ERROR : EPD_DRAW_SUCCESS));
+        assert(back[0] == (i == 2 ? 0 : 0xf0) && back[1] == (i == 2 ? 0x06 : 0x60));
+        assert(back[40] == (i == 2 ? 0xff : 0x5f) && back[stride - 1] == 0xf0);
+        assert(back[2 * stride - 1] == (i == 2 ? 0xff : 0x0f));
+    }
+    check_joined = bg_join_wave = use_join_wave = false;
+    assert(update_display_full(&hl) == EPD_DRAW_SUCCESS);
+    full_size_fb = false;
+    free(diff); free(back); free(front);
 }
 
 int main(void) {
@@ -281,6 +586,24 @@ int main(void) {
     assert(clears == 1 && clear_cycles == 1 && draws == 1 && white_baseline && correct_target_at_draw);
     assert(last_mode == MODE_GC16 && waveform_at_draw == &E0470_FULL_WAVEFORM &&
            hl.waveform == &E0470_WAVEFORM);
+
+    // 关机清白先于48相出图，失败仍保留完整重建请求。/ Shutdown clears before the 48-phase draw and retains full recovery on failure.
+    for (unsigned fail = 0; fail < 2; ++fail) {
+        memcpy(front, target, FB_BYTES);
+        memset(back, 0x55, FB_BYTES);
+        clears = draws = clear_cycles = 0;
+        const int prior_full = full_draws;
+        const enum EpdDrawError expected = fail ? EPD_DRAW_OTHER_ERROR : EPD_DRAW_SUCCESS;
+        next_draw_error = expected;
+        assert(update_display_full_clean(&hl) == expected);
+        assert(clears == 1 && clears_at_draw == 1 && draws == 1 && full_draws == prior_full + 1);
+        assert(white_baseline && correct_target_at_draw && !memcmp(front, target, FB_BYTES));
+        assert(last_mode == MODE_GC16 && waveform_at_draw == &E0470_FULL_WAVEFORM);
+        assert(hl.waveform == &E0470_WAVEFORM && !ota_display_depth);
+        assert(update_display_full(&hl) == EPD_DRAW_SUCCESS);
+        assert(clears == (fail ? 2 : 1) && !memcmp(back, target, FB_BYTES));
+        assert(waveform_at_draw == (fail ? &E0470_FULL_WAVEFORM : &E0470_WAVEFORM));
+    }
 
     // 撤回跟手滚动后，解锁的下一帧仍须全刷一次，随后恢复局部差分。
     // Removing follow scrolling must retain exactly one full update on the next wake frame, then resume local differences.
@@ -443,7 +766,38 @@ int main(void) {
         assert(update_display_mode_diff(&hl, MODE_GL16) == EPD_DRAW_SUCCESS);
         assert(clears == before_clears + 2);
     }
+    // 改动偏移必须清除旧位置，失败后重试仍重建完整基准。
+    // Offset changes must erase old positions; retries after failure still rebuild the complete baseline.
+    int prior_clears = clears, nx, ny;
+    display_apply_screen_offset(3, -5); epd_get_output_offset(&nx, &ny); assert(nx == -5 && ny == -3);
+    next_draw_error = EPD_DRAW_OTHER_ERROR;
+    assert(update_display_mode_diff(&hl, MODE_GL16) == EPD_DRAW_OTHER_ERROR);
+    assert(clears == prior_clears + 1);
+    assert(update_display_mode_diff(&hl, MODE_GL16) == EPD_DRAW_SUCCESS && clears == prior_clears + 2);
+    display_apply_screen_offset(3, -5);
+    assert(update_display_mode_diff(&hl, MODE_GL16) == EPD_DRAW_SUCCESS && clears == prior_clears + 2);
+    display_apply_screen_offset(33, 0); epd_get_output_offset(&nx, &ny); assert(nx == -5 && ny == -3);
+    display_apply_screen_offset(0, 0);
+    assert(update_display_mode_diff(&hl, MODE_GL16) == EPD_DRAW_SUCCESS && clears == prior_clears + 3);
     puts("power recovery: all 17 outputs reject missing rails without committing back; queued retries are bounded and recovery preserves the target until full output succeeds");
+    screen_offset_live_test();
+    for (int x = 0; x <= 8; x += 8) {
+        display_apply_screen_offset(x, 0);
+        int before = clears, before_draws = draws;
+        assert(update_display_boot_frame(&hl) == EPD_DRAW_SUCCESS);
+        assert(clears == before + 1 && draws == before_draws + 1 && white_baseline);
+        assert(update_display_mode_diff(&hl, MODE_GL16) == EPD_DRAW_SUCCESS && clears == before + 1);
+    }
+    display_apply_screen_offset(0, 0);
+    int before = clears, before_draws = draws;
+    power_failure = true;
+    assert(update_display_boot_frame(&hl) == DISPLAY_DRAW_POWER_NOT_READY);
+    assert(clears == before && draws == before_draws);
+    now_us += 1001000;
+    power_failure = false;
+    assert(update_display_mode_diff(&hl, MODE_GL16) == EPD_DRAW_SUCCESS && clears == before + 1);
+    puts("boot: one clear for centered and shifted starts; power rejection defers the baseline rebuild");
+    test_static_black();
 }
 
 // Continuous state is exercised separately with native-size buffers.

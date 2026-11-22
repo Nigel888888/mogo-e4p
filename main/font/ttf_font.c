@@ -38,25 +38,14 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-static void* ttf_malloc(size_t size, void* userdata) {
-    (void)userdata;
+static void* ttf_raster_alloc(size_t size) {
     return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
-static void ttf_free(void* ptr, void* userdata) {
-    (void)userdata;
-    heap_caps_free(ptr);
-}
-
-#define STBTT_malloc(x, u) ttf_malloc((x), (u))
-#define STBTT_free(x, u) ttf_free((x), (u))
+#define STB_GLYPH_ALLOC ttf_raster_alloc
+#define STB_GLYPH_FREE heap_caps_free
 #define STBTT_assert(x) do { if (!(x)) ESP_LOGE("ttf", "assert %s", #x); } while (0)
-#define STBTT_STATIC
-#define STB_TRUETYPE_IMPLEMENTATION
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "stb_truetype.h"
-#pragma GCC diagnostic pop
+#include "stb_glyph_raster.h"
 
 /* ---- 调参 / Tunables ---- */
 // 两档字号的像素高，对齐 ui_kit 正文/标题。/ Small/large px, matches ui_kit body/title.
@@ -1601,9 +1590,15 @@ static glyph_entry_t* rasterize_glyph(uint32_t codepoint, int pixel_height) {
             note_glyph_failure(codepoint, gid, pixel_height, TTF_FONT_FAIL_ALLOC);
             return NULL;
         }
-        stbtt_MakeGlyphBitmap(
-            &font_info, entry->bitmap, width, height, width, scale, scale, gid
-        );
+        stb_glyph_result_t raster = stb_glyph_make_bitmap(&font_info, gid, scale, x0, y0,
+                                                          width, height, entry->bitmap);
+        if (raster != STB_GLYPH_OK) {
+            heap_caps_free(entry->bitmap);
+            heap_caps_free(entry);
+            note_glyph_failure(codepoint, gid, pixel_height,
+                               raster == STB_GLYPH_NO_MEMORY ? TTF_FONT_FAIL_ALLOC : TTF_FONT_FAIL_EMPTY);
+            return NULL;
+        }
     }
 
     if (bitmap_bytes && s_stroke_adjust) {

@@ -16,6 +16,7 @@
 #include "sleep.h"
 #include "boot_state.h"
 #include "display.h"
+#include "display_orientation.h"
 #include "display_refresh.h"
 #include "device_power.h"
 #include "ble_page_turner.h"
@@ -39,7 +40,8 @@ static uint64_t wallpaper_key(void){
     if(app_settings_lock_style()==4)return lock_calendar_key();
     // 背景选择参与缓存身份，切换后不能复用另一种背景。/ Include the ticket background in the cache identity.
     if(app_settings_lock_style()==0)return app_settings_ticket_background()==APP_TICKET_BACKGROUND_COVER
-        ?UINT64_C(0x5449434b45543033):UINT64_C(0x5449434b45543032);
+        ?UINT64_C(0x5449434b45543035):UINT64_C(0x5449434b45543036);
+    if(app_settings_lock_style()==2)return UINT64_C(0x434f4c4c41474535);
     if(app_settings_lock_style()!=1 && app_settings_lock_style()!=3)return 0;
     const char *path=app_settings_lock_style()==3?app_settings_bookmark_path():app_settings_wallpaper_path();
     uint64_t key=UINT64_C(14695981039346656037);
@@ -53,6 +55,8 @@ static uint64_t wallpaper_key(void){
     if (app_settings_lock_style() == 1) {
         uint8_t mode = (uint8_t)app_settings_wallpaper_mode();
         key = (key ^ mode) * UINT64_C(1099511628211);
+        // 壁纸色调升级后不复用旧密码背景。/ Do not reuse pre-tone wallpaper PIN backgrounds.
+        key = (key ^ UINT64_C(0x57414c4c544f4e32)) * UINT64_C(1099511628211);
     }
     return key;
 }
@@ -144,9 +148,10 @@ void lock_screen_authenticate(EpdiyHighlevelState *hl,cst836u_handle_t touch,sc7
             if(pad.blocked&&lock_pin_available()&&now>=retry_at){ui_pinpad_reset(&pad,NULL,"请重新输入");ui_pinpad_paint(fb,&pad,ui_pinpad_entry_area());present(hl,ui_pinpad_entry_area());}
             app_touch_t sample={0};esp_err_t error=s31_input_read_touch(touch,&sample);
             bool down=error==ESP_OK&&sample.touched;
+            const bool mapped = !down || display_orientation_touch(&sample.x, &sample.y);
             if(draining){if(!down&&error==ESP_OK)draining=false;was_down=down;vTaskDelay(pdMS_TO_TICKS(5));continue;}
             if(down)latest=sample;else{latest.touched=false;latest.count=0;}
-            app_ctx_t ctx={.now_ms=now,.touch=&latest,.pressed=down&&!was_down,.released=!down&&was_down,.consumed=error!=ESP_OK};
+            app_ctx_t ctx={.now_ms=now,.touch=&latest,.pressed=down&&!was_down,.released=!down&&was_down,.consumed=error!=ESP_OK||!mapped};
             ui_gesture_event_t event;
             if(ui_gesture_feed(&gesture,&ctx,&event)){
                 active_at=now;EpdRect dirty;ui_pin_result_t r=ui_pinpad_handle(&pad,&event,&dirty);
@@ -160,7 +165,8 @@ void lock_screen_authenticate(EpdiyHighlevelState *hl,cst836u_handle_t touch,sc7
                     ui_pinpad_paint(fb,&pad,ui_pinpad_entry_area());present(hl,ui_pinpad_entry_area());
                 }
             }
-            was_down=down;vTaskDelay(pdMS_TO_TICKS(5));
+            if(error==ESP_OK)was_down=down;
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
         ui_pinpad_reset(&pad,NULL,"");waiting=true;
     }

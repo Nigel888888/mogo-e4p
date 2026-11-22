@@ -187,3 +187,10 @@ menu "Online update (OTA)"
             rejected. Must stay off for production releases.
 
 endmenu
+
+config MOGO_CLOUDZAO_TRANSFER
+    bool "CloudZao file reception"
+    default y
+    help
+        通过已连接的 WiFi 直连 CloudZao；未配置接入 ID 时隐藏传输入口。
+        Receive files directly over WiFi; hide the transfer entry without an integration ID.

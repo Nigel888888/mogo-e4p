@@ -76,6 +76,7 @@ static int power_pending;
 static struct {int x,y,count,error;} samples[128];static unsigned sample_count;
 static void add(int x,int y,int count,int error){samples[sample_count++]=(typeof(samples[0])){x,y,count,error};}
 static void tap(int x,int y){add(x,y,1,0);add(x,y,0,0);}
+static bool display_orientation_touch(uint16_t *x,uint16_t *y){(void)x;(void)y; return true; }
 static void correct(void){tap(158,862);tap(526,544);tap(526,862);tap(158,544);}
 void lock_pin_wipe(void *bytes,unsigned n){volatile uint8_t *p=bytes;while(n--)*p++=0;++wiped;}
 static bool lock_pin_available(void){return valid_storage;}
@@ -187,6 +188,16 @@ int main(void){
  ticket_background=0;
  selected_style=1;assert(!lock_screen_restore(f));
  wallpaper=LOCK_SCREEN_CACHE_PARENT "/a.jpg";lock_screen_save(framebuffer);assert(lock_screen_restore(f));
+ // 壁纸初版色调的PIN背景不能被复用。 / Reject the first-tone PIN background for the same wallpaper.
+ uint64_t old_key=UINT64_C(14695981039346656037);
+ for(const char *p=wallpaper;*p;++p)old_key=(old_key^(uint8_t)*p)*UINT64_C(1099511628211);
+ old_key=(old_key^app_settings_wallpaper_mode())*UINT64_C(1099511628211);
+ old_key=(old_key^UINT64_C(0x57414c4c544f4e45))*UINT64_C(1099511628211);
+ FILE *pre_tone=fopen(LOCK_ART_PATH,"r+b");assert(pre_tone);
+ art_header_t old_art;assert(fread(&old_art,1,sizeof(old_art),pre_tone)==sizeof(old_art));old_art.wallpaper=old_key;
+ assert(!fseek(pre_tone,0,SEEK_SET)&&fwrite(&old_art,1,sizeof(old_art),pre_tone)==sizeof(old_art)&&!fclose(pre_tone));
+ memset(f,0xee,FRAME_BYTES);assert(!lock_screen_restore(f)&&f[0]==0xee);
+ lock_screen_save(framebuffer);assert(lock_screen_restore(f));
  wallpaper=LOCK_SCREEN_CACHE_PARENT "/b.jpg";memset(f,0xee,FRAME_BYTES);assert(!lock_screen_restore(f)&&f[0]==0xee);
  lock_screen_save(framebuffer);assert(lock_screen_restore(f));
  FILE *image=fopen(wallpaper,"wb");assert(image);assert(fputs("new image",image)>=0&&fclose(image)==0);

@@ -217,13 +217,34 @@ static void streak_service_cases(void){
     simulate_restart();remove_slots();
     puts("PASS: month-midnight threshold splits, summary reboot, late storage merge and invalid-time suppression");
 }
-int main(void){model_cases();streak_cases();service_cases();streak_service_cases();assert(guards>=ends);return 0;}
+static void backup_cases(void) {
+    remove_slots(); simulate_restart(); clock_ms=civil(2026,11,4,12,0,0);
+    app_reading_journal_record("/sdcard/books/backup.epub","Backup",100,1,1200,3);
+    assert(app_reading_journal_next_scene());
+    unsigned scene=s_model.scene;
+    FILE *file=tmpfile(); assert(file && app_reading_journal_backup_write(file)==ESP_OK);
+    app_reading_journal_record("/sdcard/books/new.epub","New",200,0,600,2);
+    assert(s_model.count==2);
+    rewind(file); assert(app_reading_journal_backup_read(file,false)==ESP_OK && s_model.count==2);
+    guard_ok=false; rewind(file);
+    assert(app_reading_journal_backup_read(file,true)==ESP_FAIL && s_model.count==2);
+    guard_ok=true; rewind(file);
+    assert(app_reading_journal_backup_read(file,true)==ESP_OK && s_model.count==1 && s_model.scene==scene);
+    simulate_restart(); app_reading_journal_poll();
+    assert(s_model.count==1 && s_model.scene==scene && s_model.records->milliseconds==1200);
+    assert(fseek(file,5,SEEK_SET)==0 && fputc(0,file)==0); rewind(file);
+    assert(app_reading_journal_backup_read(file,true)==ESP_ERR_INVALID_RESPONSE && s_model.count==1);
+    assert(fclose(file)==0); simulate_restart(); remove_slots();
+    puts("PASS: journal backup round trip and reboot, validate-only, corrupt snapshot and failed write preservation");
+}
+int main(void){model_cases();streak_cases();service_cases();streak_service_cases();backup_cases();assert(guards>=ends);return 0;}
 '''
 
 with tempfile.TemporaryDirectory(prefix="reading-journal-") as directory:
     work = Path(directory)
     env, compiler = toolchain(work)
     (work / "esp_heap_caps.h").write_text("#pragma once\n#include <stddef.h>\n#define MALLOC_CAP_SPIRAM 1\n#define MALLOC_CAP_8BIT 2\nvoid *heap_caps_malloc(size_t,int);\nvoid *heap_caps_calloc(size_t,size_t,int);\n")
+    (work / "esp_err.h").write_text("#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n#define ESP_ERR_NO_MEM 0x101\n#define ESP_ERR_INVALID_STATE 0x103\n#define ESP_ERR_INVALID_RESPONSE 0x108\n")
     (work / "book_store.h").write_text("#pragma once\n#define ESP_OK 0\nint book_store_prepare_data(void);\n")
     (work / "epdiy.h").write_text("#pragma once\n#include <stdbool.h>\nbool epd_flash_begin(void);\nvoid epd_flash_end(void);\n")
     (work / "esp_timer.h").write_text("#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n")

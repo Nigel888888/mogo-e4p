@@ -41,6 +41,7 @@
 #include "app_registry.h"
 #include "app_components_mode.h"
 #include "weather_service.h"
+#include "esp_timer.h"
 #include "ui_weather.h"
 #include "reading_journal.h"
 #include "ui_reading_journal.h"
@@ -97,7 +98,9 @@ typedef struct {
 static home_cover_cache_t s_cover_cache[7];
 #define HOME_COVER_RESERVE (512u * 1024u)
 static int s_cover_next;
+#define HOME_BACKGROUND_QUIET_MS 1500
 static bool s_weather_tomorrow[APP_HOME_SLOT_COUNT];
+static int64_t s_background_after_ms;
 static unsigned s_widget_dirty;
 #define HOME_REGION_TOP 168
 #define HOME_REGION_HEIGHT ((UI_NAV_TOP - HOME_REGION_TOP) / APP_HOME_SLOT_COUNT)
@@ -379,10 +382,27 @@ static void draw_cover(uint8_t *fb,const home_book_t *item,EpdRect bounds,bool p
         if((uint64_t)w*box.height>(uint64_t)h*box.width)box.height=(uint64_t)box.width*h/w;
         else box.width=(uint64_t)box.height*w/h;
         box.x=bounds.x+(bounds.width-box.width)/2;box.y=bounds.y+bounds.height-box.height;
-        for(int y=0;y<box.height;++y)for(int x=0;x<box.width;++x) {
-            unsigned sx=(unsigned)x*w/box.width,sy=(unsigned)y*h/box.height;
-            uint8_t g=item->cover_fast?(item->cover[sy*((w+7)/8)+sx/8]&(1u<<(sx&7))?255:0):ui_image_dither_gray(ui_contrast_gray(item->cover[sy*w+sx]),box.x+x,box.y+y);
-            epd_draw_pixel(box.x+x,box.y+y,g,fb);
+        if (box.width > 0 && box.height > 0) {
+            if (item->cover_fast) {
+                const unsigned stride = (w + 7) / 8;
+                for (int y = 0; y < box.height; ++y) {
+                    const uint8_t *row = item->cover + ((unsigned)y * h / box.height) * stride;
+                    for (int x = 0; x < box.width; ++x) {
+                        const unsigned sx = (unsigned)x * w / box.width;
+                        epd_draw_pixel(box.x+x, box.y+y, row[sx/8] & (1u << (sx&7)) ? 255 : 0, fb);
+                    }
+                }
+            } else {
+                const uint8_t contrast = app_settings_system_contrast();
+                const image_gray_axis_t xs = image_gray_axis(w, box.width), ys = image_gray_axis(h, box.height);
+                for (int y = 0; y < box.height; ++y) {
+                    const image_gray_row_t row = image_gray_row(item->cover, w, ys, y);
+                    for (int x = 0; x < box.width; ++x) {
+                        const uint8_t tone = ui_image_cover_tone(image_gray_sample(row, xs, x), contrast);
+                        epd_draw_pixel(box.x+x, box.y+y, ui_image_dither_gray(tone, box.x+x, box.y+y), fb);
+                    }
+                }
+            }
         }
     } else ui_fill_rect_fast(box,0xe0,fb);
     // 错层纸页与按下外缘分开，避免反馈刷新改变装饰。/ Offset pages stay clear of the press outline.
@@ -492,7 +512,6 @@ static app_redraw_t redraw_widgets(app_home_widget_t widget) {
     }
     return s_widget_dirty?APP_REDRAW_AREA:APP_REDRAW_NONE;
 }
-static bool mini_scan_cancel(void *ctx) {return app_poll_main_navigation_from(ctx,0);}
 static app_redraw_t mini_select(unsigned index) {
     home_library_view_t v=home_library_view();
     if(index>=v.count || index==v.selected)return APP_REDRAW_NONE;
@@ -557,7 +576,10 @@ static bool present(app_ctx_t *ctx,app_redraw_t redraw) {
     guard_draw_result(ctx->hl,result);
     if(mini_painted&&result==EPD_DRAW_SUCCESS)mini_presented(ctx);
     if(redraw!=APP_REDRAW_AREA&&result==EPD_DRAW_SUCCESS)s_clock_minute=minute;
-    if(redraw!=APP_REDRAW_AREA)s_streak_pending=result!=EPD_DRAW_SUCCESS;
+    if(redraw!=APP_REDRAW_AREA) {
+        s_streak_pending=result!=EPD_DRAW_SUCCESS;
+        s_background_after_ms=esp_timer_get_time()/1000+HOME_BACKGROUND_QUIET_MS;
+    }
     return true;
 }
 static void refresh_excerpt(void) {book_excerpt_load(featured()->path,s_excerpt);}
@@ -600,9 +622,11 @@ static void on_media_lost(app_ctx_t *ctx) {
 static void on_media_ready(app_ctx_t *ctx) {(void)ctx;s_books_cache_valid=false;s_scan_pending=true;avatar_prepare_state();home_library_invalidate();}
 static app_redraw_t on_tick(app_ctx_t *ctx) {
     if(ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
+    const bool background_ready=ctx->now_ms>=s_background_after_ms &&
+        ctx->now_ms-ctx->last_input_ms>=HOME_BACKGROUND_QUIET_MS;
     if(app_home_has_widget(APP_HOME_WIDGET_MINI_LIBRARY)&&s_mini_motion&&ctx->now_ms>=s_mini_due) {
         if(s_mini_motion!=MINI_WAIT)return redraw_widgets(APP_HOME_WIDGET_MINI_LIBRARY);
-        if(home_library_poll(mini_scan_cancel,ctx)) {s_mini_motion=MINI_OPEN;s_mini_step=1;return redraw_widgets(APP_HOME_WIDGET_MINI_LIBRARY);}
+        if(home_library_poll()) {s_mini_motion=MINI_OPEN;s_mini_step=1;return redraw_widgets(APP_HOME_WIDGET_MINI_LIBRARY);}
         if(ctx->request_app)return APP_REDRAW_NONE;
     }
     bool journal_changed=app_reading_journal_poll();
@@ -616,7 +640,7 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
         for(unsigned slot=0;slot<APP_HOME_SLOT_COUNT;++slot)if(s_widget_dirty&(1u<<slot))s_area=home_region(slot);
         return APP_REDRAW_AREA;
     }
-    if(app_weather_poll(app_home_has_widget(APP_HOME_WIDGET_WEATHER))) {
+    if(background_ready&&app_home_has_widget(APP_HOME_WIDGET_WEATHER)&&app_weather_poll(true)) {
         app_redraw_t weather=redraw_widgets(APP_HOME_WIDGET_WEATHER);
         if(weather!=APP_REDRAW_NONE)return weather;
     }
@@ -640,9 +664,9 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
         s_cover_next=1;home_book_t *b=featured();
         if(b->path[0]&&!b->cover){int slot=b==&s_current?0:(int)(b-s_recent)+1;if(load_cover(b,slot))return redraw_widgets(APP_HOME_WIDGET_READING);if(s_cover_waiting)s_cover_next=0;}
     }
-    if(app_home_has_widget(APP_HOME_WIDGET_MINI_LIBRARY)&&s_mini_motion==MINI_IDLE) {
+    if(background_ready&&app_home_has_widget(APP_HOME_WIDGET_MINI_LIBRARY)&&s_mini_motion==MINI_IDLE) {
         if(home_library_needs_generation())home_cover_generation_begin();
-        if(home_library_poll(mini_scan_cancel,ctx))return redraw_widgets(APP_HOME_WIDGET_MINI_LIBRARY);
+        if(home_library_poll())return redraw_widgets(APP_HOME_WIDGET_MINI_LIBRARY);
         if(ctx->request_app)return APP_REDRAW_NONE;
     }
     if(ui_nav_clock_minute()!=s_clock_minute) {
@@ -683,9 +707,6 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
         if(restore){s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}
         return APP_REDRAW_NONE;
     }
-    /* 头像改为打开功能菜单入口：菜单含生词本等全部产品页。
-     * Avatar now opens the full function menu, which exposes the vocabulary notebook
-     * and every other product page. Settings stays reachable via the 4th bottom tab. */
     if(hit((EpdRect){588,88,60,60},x,y)){ctx->request_menu=true;return APP_REDRAW_NONE;}
     for(unsigned slot=0;slot<APP_HOME_SLOT_COUNT;++slot) {
         EpdRect region=home_region(slot);
@@ -736,7 +757,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
 static bool no_menu_handle(app_ctx_t *ctx) {(void)ctx;return false;}
 static bool main_page_visible(app_ctx_t *ctx) {(void)ctx;return true;}
 static display_rect_t area_hint(app_ctx_t *ctx) {(void)ctx;return display_rect_from_epd(s_area);}
-static void home_before_lock(app_ctx_t *ctx){(void)ctx;mini_cancel();app_weather_cancel_join();(void)app_reading_journal_flush();}
+static void home_before_lock(app_ctx_t *ctx){(void)ctx;mini_cancel();home_library_pause();app_weather_cancel();(void)app_reading_journal_flush();}
 static void home_exit(app_ctx_t *ctx){home_before_lock(ctx);home_library_leave();ui_weather_release();book_cover_jobs_cancel(s_cover_generation);s_cover_generation=0;}
 const app_desc_t app_dashboard={
     .title="首页 Home",.detail="继续阅读",.enter_full=false,.owns_keys=true,.menu_handle_enabled=no_menu_handle,

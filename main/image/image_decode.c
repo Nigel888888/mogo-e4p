@@ -44,6 +44,13 @@ static uint8_t luminance(uint8_t r, uint8_t g, uint8_t b) {
     return (uint8_t)(((unsigned)r * 77 + (unsigned)g * 150 + (unsigned)b * 29) >> 8);
 }
 
+// 大幅缩小时将两次取样拉开到目标像素覆盖范围内，降低细线漏采和摩尔纹。
+// Spread the two taps across the destination footprint on large reductions to reduce aliasing.
+static unsigned scale_gap(unsigned dst_n, unsigned src_n) {
+    const unsigned gap = src_n / (2u * dst_n);
+    return gap > 1 ? gap : 1;
+}
+
 // 目标下标映射回源窗口坐标：中心对齐，Q8 定点，整数部分进 *out_at、小数部分 0..255 进
 // *out_frac。原来每个目标像素直接取一个源像素，缩放后细节整块丢掉；中心对齐保证裁出来的
 // 窗口正落在目标上，不会差半个像素。
@@ -51,37 +58,39 @@ static uint8_t luminance(uint8_t r, uint8_t g, uint8_t b) {
 // integer part into *out_at and the 0..255 fraction into *out_frac. Sampling a single source pixel
 // per destination pixel dropped detail wholesale once scaled down; centre-aligning keeps the crop
 // window landing on the destination instead of half a pixel off.
-static void scale_axis(unsigned at, unsigned dst_n, unsigned src_n, int *out_at, int *out_frac) {
-    if (dst_n < 2 || src_n < 2) { *out_at = 0; *out_frac = 0; return; }
+static void scale_axis(unsigned at, unsigned dst_n, unsigned src_n, unsigned gap, int *out_at, int *out_frac) {
+    if (src_n < 2) { *out_at = 0; *out_frac = 0; return; }
     // 源坐标 = ((2·at + 1)·src_n − dst_n) / (2·dst_n)。/ Source = ((2*at + 1)*src_n - dst_n) / (2*dst_n).
     int64_t q = (((2 * (int64_t)at + 1) * src_n - (int64_t)dst_n) * 256) / (2 * (int64_t)dst_n);
+    if (gap > 1) q -= (int64_t)(gap - 2u) * 128;
     if (q < 0) q = 0;
     const int64_t last = (int64_t)src_n - 1;
     if ((q >> 8) > last) q = last << 8;
     *out_at = (int)(q >> 8);
-    *out_frac = (int)(q & 0xFF);
+    *out_frac = gap > 1 ? 128 : (int)(q & 0xFF);
 }
 
 typedef struct { uint16_t at; uint8_t frac; } scale_step_t;
 
 // 一根轴的映射表，放在 PSRAM：同一根轴上每个像素的权重都一样，算一次就够。
 // One axis's map, kept in PSRAM: the weights repeat along an axis, so they are computed once.
-static scale_step_t *scale_map(unsigned dst_n, unsigned src_n) {
+static scale_step_t *scale_map(unsigned dst_n, unsigned src_n, unsigned gap) {
     scale_step_t *map = cover_alloc(sizeof(scale_step_t) * (dst_n ? dst_n : 1));
     if (!map) return NULL;
     for (unsigned i = 0; i < dst_n; ++i) {
         int at = 0, frac = 0;
-        scale_axis(i, dst_n, src_n, &at, &frac);
+        scale_axis(i, dst_n, src_n, gap, &at, &frac);
         map[i].at = (uint16_t)at;
         map[i].frac = (uint8_t)frac;
     }
     return map;
 }
 
-// 取相邻的下一个源下标，到边界就停住，相当于把边缘像素拉出去用。
-// The next source index, clamped at the edge so the border pixel is stretched outwards.
-static inline int scale_next(int at, unsigned src_n) {
-    return (unsigned)(at + 1) < src_n ? at + 1 : at;
+// 第二个源下标在右侧取样，且不越过裁剪窗口边界。
+// The second tap is to the right, clamped to the crop window.
+static inline int scale_next(int at, unsigned src_n, unsigned gap) {
+    const unsigned next = (unsigned)at + gap;
+    return next < src_n ? (int)next : (int)src_n - 1;
 }
 
 // 四点双线性：a b 在上、c d 在下，fx 与 fy 是 0..255 的权重。
@@ -144,18 +153,28 @@ static bool resample_rgb565(const uint8_t *pixels, unsigned stride, unsigned wid
                             uint8_t *out) {
     if (!pixels || !out || !stride || !width || !height) return false;
     const book_crop_t crop = book_cover_crop(width, height, out_width, out_height);
-    scale_step_t *xmap = scale_map(out_width, crop.width);
-    scale_step_t *ymap = scale_map(out_height, crop.height);
+    if (crop.width == out_width && crop.height == out_height) {
+        for (unsigned y = 0; y < out_height; ++y) {
+            const uint8_t *row = pixels + (size_t)(crop.y + y) * stride * 2;
+            for (unsigned x = 0; x < out_width; ++x)
+                out[(size_t)y * out_width + x] = rgb565_gray(row, crop.x + x);
+            decode_yield(y);
+        }
+        return true;
+    }
+    const unsigned xgap = scale_gap(out_width, crop.width), ygap = scale_gap(out_height, crop.height);
+    scale_step_t *xmap = scale_map(out_width, crop.width, xgap);
+    scale_step_t *ymap = scale_map(out_height, crop.height, ygap);
     bool ok = false;
     if (xmap && ymap) {
         for (unsigned y = 0; y < out_height; ++y) {
             const int sy = ymap[y].at, fy = ymap[y].frac;
-            const int sy1 = scale_next(sy, crop.height);
+            const int sy1 = scale_next(sy, crop.height, ygap);
             const uint8_t *r0 = pixels + (size_t)(crop.y + (unsigned)sy) * stride * 2;
             const uint8_t *r1 = pixels + (size_t)(crop.y + (unsigned)sy1) * stride * 2;
             for (unsigned x = 0; x < out_width; ++x) {
                 const int sx = xmap[x].at, fx = xmap[x].frac;
-                const int sx1 = scale_next(sx, crop.width);
+                const int sx1 = scale_next(sx, crop.width, xgap);
                 out[y * out_width + x] = bilinear4(
                     rgb565_gray(r0, crop.x + (unsigned)sx), rgb565_gray(r0, crop.x + (unsigned)sx1),
                     rgb565_gray(r1, crop.x + (unsigned)sx), rgb565_gray(r1, crop.x + (unsigned)sx1),
@@ -177,18 +196,27 @@ static bool resample_gray8(const uint8_t *pixels, unsigned stride, unsigned widt
                            uint8_t *out) {
     if (!pixels || !out || !stride || !width || !height) return false;
     const book_crop_t crop = book_cover_crop(width, height, out_width, out_height);
-    scale_step_t *xmap = scale_map(out_width, crop.width);
-    scale_step_t *ymap = scale_map(out_height, crop.height);
+    if (crop.width == out_width && crop.height == out_height) {
+        for (unsigned y = 0; y < out_height; ++y) {
+            const uint8_t *row = pixels + (size_t)(crop.y + y) * stride;
+            memcpy(out + (size_t)y * out_width, row + crop.x, out_width);
+            decode_yield(y);
+        }
+        return true;
+    }
+    const unsigned xgap = scale_gap(out_width, crop.width), ygap = scale_gap(out_height, crop.height);
+    scale_step_t *xmap = scale_map(out_width, crop.width, xgap);
+    scale_step_t *ymap = scale_map(out_height, crop.height, ygap);
     bool ok = false;
     if (xmap && ymap) {
         for (unsigned y = 0; y < out_height; ++y) {
             const int sy = ymap[y].at, fy = ymap[y].frac;
-            const int sy1 = scale_next(sy, crop.height);
+            const int sy1 = scale_next(sy, crop.height, ygap);
             const uint8_t *r0 = pixels + (size_t)(crop.y + (unsigned)sy) * stride;
             const uint8_t *r1 = pixels + (size_t)(crop.y + (unsigned)sy1) * stride;
             for (unsigned x = 0; x < out_width; ++x) {
                 const int sx = xmap[x].at, fx = xmap[x].frac;
-                const int sx1 = scale_next(sx, crop.width);
+                const int sx1 = scale_next(sx, crop.width, xgap);
                 out[y * out_width + x] = bilinear4(
                     r0[crop.x + (unsigned)sx], r0[crop.x + (unsigned)sx1],
                     r1[crop.x + (unsigned)sx], r1[crop.x + (unsigned)sx1], fx, fy);
@@ -238,10 +266,9 @@ extern int jpegdec_gray_progressive(const uint8_t *data, int size, JPEG_DRAW_CAL
                                     void *user, int *drawn_width, int *drawn_height);
 
 // 渐进式只取 DC 扫描，JPEGDEC 因此固定输出 1/8 分辨率；平面尺寸由帧头算出，
-// 与小平面一起缩到目标尺寸。对封面（176×240）来说已经足够，也避开了整幅系数数组。
-// Progressive decoding reads the DC scan only, so JPEGDEC always emits 1/8 resolution. The plane
-// size comes from the frame header and is resampled to the requested size: plenty for a 176x240
-// cover, and it never holds the full coefficient array.
+// 将小平面缩放到目标尺寸，不分配全幅系数数组，放大不会恢复高频细节。
+// Progressive decoding reads only the DC scan, then rescales its 1/8 plane. Avoid a full-size
+// coefficient array; enlarging the plane cannot restore high-frequency detail.
 static bool jpegdec_gray(const uint8_t *data, size_t size, unsigned frame_width,
                          unsigned frame_height, unsigned out_width, unsigned out_height,
                          uint8_t *out) {
@@ -265,6 +292,16 @@ static bool jpegdec_gray(const uint8_t *data, size_t size, unsigned frame_width,
     }
     free(plane.plane);
     return ok;
+}
+
+// 先按目标裁剪比例选最大仍能保留两倍采样的 IDCT 缩放档。
+// Pick the largest IDCT reduction that still leaves twice the target's samples after cropping.
+static int jpeg_target_scale(unsigned width, unsigned height, unsigned out_width, unsigned out_height) {
+    const book_crop_t crop = book_cover_crop(width, height, out_width, out_height);
+    int scale = JPEG_IMAGE_SCALE_0;
+    while (scale < JPEG_IMAGE_SCALE_1_8 && (crop.width >> (scale + 2)) >= out_width &&
+           (crop.height >> (scale + 2)) >= out_height) ++scale;
+    return scale;
 }
 
 static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
@@ -298,8 +335,12 @@ static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
     // 保留原有小图输出的解码预算分界。/ Preserve the existing small-output decode budget threshold.
     size_t limit = out_width <= 176u && out_height <= 240u
         ? 3u * 1024u * 1024u : 6u * 1024u * 1024u;
+    // 软件 IDCT 直接输出足够重采样的尺寸，不先解一幅远大于目标的 RGB565。
+    // Ask the software IDCT for enough samples to rescale, rather than an oversized RGB565 frame.
+    const int first_scale = framed ? jpeg_target_scale(frame_width, frame_height, out_width, out_height)
+                                   : JPEG_IMAGE_SCALE_0;
     bool decoded = false;
-    for (int scale = JPEG_IMAGE_SCALE_0; scale <= JPEG_IMAGE_SCALE_1_8; ++scale) {
+    for (int scale = first_scale; scale <= JPEG_IMAGE_SCALE_1_8; ++scale) {
         cfg.out_scale = scale;
         if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK) return false;
         if (!info.width || !info.height || !info.output_len || info.output_len > limit) continue;
@@ -357,13 +398,16 @@ static bool png_gray_input_cancel(const uint8_t *data, size_t size, FILE *file, 
     if (depth == 16) png_set_strip_16(png);
     if (color == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
     if (color == PNG_COLOR_TYPE_GRAY && depth < 8) png_set_expand_gray_1_2_4_to_8(png);
-    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
-    if (color == PNG_COLOR_TYPE_GRAY || color == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
-    if (!(color & PNG_COLOR_MASK_ALPHA) && !png_get_valid(png, info, PNG_INFO_tRNS))
-        png_set_filler(png, 0xff, PNG_FILLER_AFTER);
+    const bool transparent = png_get_valid(png, info, PNG_INFO_tRNS) != 0;
+    const bool gray_only = color == PNG_COLOR_TYPE_GRAY && !transparent && !alpha;
+    if (transparent) png_set_tRNS_to_alpha(png);
+    if (!gray_only && (color == PNG_COLOR_TYPE_GRAY || color == PNG_COLOR_TYPE_GRAY_ALPHA)) png_set_gray_to_rgb(png);
+    const bool has_alpha = (color & PNG_COLOR_MASK_ALPHA) || transparent;
+    if (!gray_only && !has_alpha && alpha) png_set_filler(png, 0xff, PNG_FILLER_AFTER);
+    const unsigned channels = gray_only ? 1u : has_alpha || alpha ? 4u : 3u;
     png_read_update_info(png, info);
     png_size_t stride = png_get_rowbytes(png, info);
-    if (stride < width * 4 || stride > 65536) goto done;
+    if (stride < width * channels || stride > 65536) goto done;
     row = cover_alloc(stride);
     if (!row) goto done;
     unsigned next_y = 0;
@@ -371,42 +415,64 @@ static bool png_gray_input_cancel(const uint8_t *data, size_t size, FILE *file, 
     // The streaming reader applies the crop window to rows and columns alike: rows outside the
     // window are dropped and columns are sampled inside it.
     const book_crop_t crop = book_cover_crop(width, height, out_width, out_height);
-    if (crop.width && crop.height) {
-        xmap = scale_map(out_width, crop.width);
-        ymap = scale_map(out_height, crop.height);
+    const bool native = crop.width == out_width && crop.height == out_height;
+    // 保留文件流壁纸的旧采样，与书内 PNG 的新缩图策略分开。
+    // Preserve the existing file-stream wallpaper sampling; use wider taps for in-memory book art.
+    const unsigned xgap = file ? 1u : scale_gap(out_width, crop.width);
+    const unsigned ygap = file ? 1u : scale_gap(out_height, crop.height);
+    if (!native && crop.width && crop.height) {
+        xmap = scale_map(out_width, crop.width, xgap);
+        ymap = scale_map(out_height, crop.height, ygap);
         rows[0] = cover_alloc(crop.width);
         rows[1] = cover_alloc(crop.width);
         if (alpha) { masks[0] = cover_alloc(crop.width); masks[1] = cover_alloc(crop.width); }
     }
-    if (xmap && ymap && rows[0] && rows[1] && (!alpha || (masks[0] && masks[1]))) {
+    if (native || (xmap && ymap && rows[0] && rows[1] && (!alpha || (masks[0] && masks[1])))) {
         for (png_uint_32 y = 0; y < height; ++y) {
             if (cancelled && cancelled(context)) goto done;
             png_read_row(png, row, NULL);
             decode_yield((unsigned)y);
             const int wy = (int)y - (int)crop.y;
             if (wy < 0 || wy >= (int)crop.height) continue;
-            uint8_t *cur = rows[wy & 1];
-            for (unsigned x = 0; x < crop.width; ++x) {
-                const uint8_t *p = row + (size_t)(crop.x + x) * 4;
+            unsigned row_slot = (unsigned)wy & 1u;
+            if (!native) {
+                if (next_y == out_height) continue;
+                const int sy = ymap[next_y].at, sy1 = scale_next(sy, crop.height, ygap);
+                if (wy != sy && wy != sy1) continue;
+                // 间隔采样的两行可能同奇偶，但目标行之间不共用源行。
+                // Spaced taps may have the same parity, but share no rows with the next output.
+                if (ygap > 1) row_slot = wy != sy;
+            }
+            uint8_t *cur = native ? out + (size_t)wy * out_width : rows[row_slot];
+            uint8_t *mask = alpha ? (native ? alpha + (size_t)wy * out_width : masks[row_slot]) : NULL;
+            // 无透明度的灰度PNG不用扩成RGBA再转回；原尺寸直接落目标行，不计算缩放权重。
+            // Opaque grayscale PNG stays grayscale; native-size rows go straight to output without scaling weights.
+            if (gray_only) memcpy(cur, row + crop.x, crop.width);
+            else for (unsigned x = 0; x < crop.width; ++x) {
+                const uint8_t *p = row + (size_t)(crop.x + x) * channels;
                 const uint8_t gray = luminance(p[0], p[1], p[2]);
                 // 透明层保留预乘灰度与独立alpha，避免缩放后出现白边。/ Preserve premultiplied gray and alpha for layers, avoiding white scaling fringes.
-                cur[x] = (uint8_t)(((unsigned)gray * p[3] + (alpha ? 0 : 255u * (255u - p[3])) + 127u) / 255u);
-                if (alpha) masks[wy & 1][x] = p[3];
+                const unsigned a = channels == 4 ? p[3] : 255u;
+                cur[x] = a == 255 ? gray : (uint8_t)(((unsigned)gray * a + (alpha ? 0 : 255u * (255u - a)) + 127u) / 255u);
+                if (mask) mask[x] = (uint8_t)a;
             }
+            if (native) { ++next_y; continue; }
             // 两行都齐了的目标行可以一次输出完：同一源行可能对应多个目标行（放大时）。
             // Every destination row whose two source rows are now present can be emitted: one source
             // row may serve several destination rows when scaling up.
             while (next_y < out_height) {
                 const int sy = ymap[next_y].at, fy = ymap[next_y].frac;
-                const int sy1 = scale_next(sy, crop.height);
+                const int sy1 = scale_next(sy, crop.height, ygap);
                 if (wy < sy1) break;
-                const uint8_t *r0 = rows[sy & 1], *r1 = rows[sy1 & 1];
+                const unsigned i0 = ygap > 1 ? 0u : (unsigned)sy & 1u;
+                const unsigned i1 = ygap > 1 ? 1u : (unsigned)sy1 & 1u;
+                const uint8_t *r0 = rows[i0], *r1 = rows[i1];
                 for (unsigned x = 0; x < out_width; ++x) {
                     const int sx = xmap[x].at, fx = xmap[x].frac;
-                    const int sx1 = scale_next(sx, crop.width);
+                    const int sx1 = scale_next(sx, crop.width, xgap);
                     out[next_y * out_width + x] = bilinear4(r0[sx], r0[sx1], r1[sx], r1[sx1], fx, fy);
-                    if (alpha) alpha[next_y * out_width + x] = bilinear4(masks[sy & 1][sx], masks[sy & 1][sx1],
-                        masks[sy1 & 1][sx], masks[sy1 & 1][sx1], fx, fy);
+                    if (alpha) alpha[next_y * out_width + x] = bilinear4(masks[i0][sx], masks[i0][sx1],
+                        masks[i1][sx], masks[i1][sx1], fx, fy);
                 }
                 ++next_y;
             }

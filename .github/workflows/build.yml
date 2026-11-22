@@ -9,10 +9,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 需要写权限把失败日志推回仓库，方便直接读；被仓库策略降级时 push 失败不影响主流程。
-    # Write access pushes the failure log back to the repo; a policy downgrade only fails that push.
-    permissions:
-      contents: write
     # 钉在 v6.1 发布点。release-v6.1 分支会继续演进，LCD LL 接口已经变过一次。
     # Pin to the v6.1 release. The release-v6.1 branch keeps moving; the LCD LL API already changed once.
     container: espressif/idf:v6.1
@@ -25,75 +21,14 @@ jobs:
         shell: bash
         run: |
           . $IDF_PATH/export.sh
-          set -o pipefail
-          BUILD_RC=0
-          idf.py --preview -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci" set-target esp32s31 2>&1 | tee build-log.txt || BUILD_RC=$?
-          if [ "$BUILD_RC" -eq 0 ]; then
-            idf.py --preview -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci" build 2>&1 | tee -a build-log.txt || BUILD_RC=$?
-          fi
-          # 失败时把关键行写进 Summary 面板，不必翻整页日志。
-          # On failure, put the key lines in the Summary panel so the log tail need not be hunted.
-          {
-            echo "### Build diagnostics (exit=$BUILD_RC)"
-            echo '```'
-            grep -nE "error:|FAILED|undefined reference|overflowed|No space|cannot find|CMake Error|No such file" build-log.txt | tail -120 || true
-            echo '```'
-            echo "### Last 100 lines of build-log.txt"
-            echo '```'
-            tail -100 build-log.txt || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit "$BUILD_RC"
+          idf.py --preview -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci" set-target esp32s31
+          idf.py --preview -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.ci" build
 
       - name: size
         shell: bash
         run: |
           . $IDF_PATH/export.sh
           idf.py --preview size
-      # 生词本定制：保存可刷机固件。放在回归测试之前，确保测试失败也能取到固件。
-      - name: Save firmware artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mogo-vocabulary-firmware
-          if-no-files-found: error
-          path: |
-            build/Read_Pico.bin
-            build/bootloader/bootloader.bin
-            build/partition_table/partition-table.bin
-            build/ota_data_initial.bin
-            build/flasher_args.json
-            build/flash_args
-            build/config/sdkconfig.h
-            build/project_description.json
-
-      # 完整日志留档：失败时也能下载，不依赖页面滚动。
-      # Keep the full log: downloadable on failure without scrolling the page.
-      - name: Save build log artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          if-no-files-found: warn
-          path: build-log.txt
-
-      # 推到独立分支，避免再触发 main 的 workflow 形成循环。
-      # Push to a side branch so it cannot retrigger the main workflow.
-      - name: Push build log to branch
-        if: always()
-        shell: bash
-        run: |
-          # The log is already uploaded as an artifact; pushing it to a side
-          # branch is best-effort and must never fail an otherwise good build.
-          if git rev-parse --git-dir >/dev/null 2>&1; then
-            git config user.name  "workbuddy-ci" || true
-            git config user.email "workbuddy-ci@users.noreply.github.com" || true
-            git add -f build-log.txt || true
-            git commit -m "ci: capture build log" || true
-            git push origin HEAD:ci-build-log || true
-          else
-            echo "Not inside a git checkout; skipping build-log branch push."
-          fi
 
       - name: Prepare strict host compiler
         shell: bash
@@ -129,7 +64,7 @@ jobs:
           python3 tools/test_book_toc.py
           python3 tools/vertical_punctuation_host_test.py
           python3 tools/vertical_number_host_test.py
-          cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-omit-frame-pointer -Imain/book -Imain -Itools/book_layout_stubs -Itools/book_source_host_stubs tools/book_layout_host_test.c main/book/reader_session.c main/book/book_layout.c main/book/html_text.c -o build/book-tests/layout
+          cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-omit-frame-pointer -Imain/book -Imain -Itools/book_layout_stubs -Itools/book_source_host_stubs tools/book_layout_host_test.c main/book/reader_session.c main/book/book_layout.c main/book/book_hyphen_en.c main/book/html_text.c -o build/book-tests/layout
           build/book-tests/layout
       - name: Preserve host regression diagnostics
         if: failure()

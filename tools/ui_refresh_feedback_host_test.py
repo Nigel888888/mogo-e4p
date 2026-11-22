@@ -16,8 +16,9 @@ def function(path, name):
 
 
 shelf = r'''
-#define READER_WIDTH 684
-#define READER_HEIGHT 1216
+static int reader_width = 684, reader_height = 1216;
+#define READER_WIDTH reader_width
+#define READER_HEIGHT reader_height
 #include <assert.h>
 #include <stdbool.h>
 static bool reader_orientation_sync(void){return false;}
@@ -178,6 +179,8 @@ static void draw_reader(uint8_t *fb,unsigned page){*fb=(uint8_t)page;}
 static EpdRect ui_rect_union(EpdRect a,EpdRect b){(void)b;return a;}
 static enum EpdDrawError record(int kind,enum EpdDrawMode mode,EpdRect area){assert(trace_count<256);trace_route[trace_count]=kind;trace_mode[trace_count]=mode;trace_area[trace_count++]=area;++pushes;route=kind;pushed_mode=mode;pushed_area=area;return (enum EpdDrawError)test_push_error;}
 static enum EpdDrawError update_display_area_diff_with(void *hl,const int *wave,enum EpdDrawMode mode,EpdRect area){(void)hl;trace_wave[trace_count]=*wave;return record(DIFF,mode,area);}
+static enum EpdDrawError update_display_area_stable_diff(void *hl,const int *wave,enum EpdDrawMode mode,EpdRect area){return update_display_area_diff_with(hl,wave,mode,area);}
+static enum EpdDrawError update_display_area_reader_turn(void *hl,const int *wave,enum EpdDrawMode mode,EpdRect area,bool full_body){(void)hl;trace_wave[trace_count]=*wave;return record(full_body?AREA:DIFF,mode,area);}
 static enum EpdDrawError update_display_area_with(void *hl,const int *wave,enum EpdDrawMode mode,EpdRect area){(void)hl;trace_wave[trace_count]=*wave;return record(AREA,mode,area);}
 static enum EpdDrawError update_display_area_full_with(void *hl,const int *wave,enum EpdDrawMode mode,EpdRect area){(void)hl;trace_wave[trace_count]=*wave;return record(LOCAL_FULL,mode,area);}
 static enum EpdDrawError update_display_with(void *hl,const int *wave,enum EpdDrawMode mode){(void)hl;(void)wave;return record(WHOLE,mode,(EpdRect){0});}
@@ -186,6 +189,7 @@ static enum EpdDrawError update_display_full(void *hl){(void)hl;return record(FU
 static enum EpdDrawError update_display_reader_image_gray(void *hl){(void)hl;return record(READER_IMAGE_GRAY,MODE_GC16,(EpdRect){0});}
 static enum EpdDrawError update_display_fast_page(void *hl){(void)hl;return record(FAST,MODE_GL16,(EpdRect){0});}
 static enum EpdDrawError update_display_mode_diff(void *hl,enum EpdDrawMode mode){(void)hl;return record(READER,mode,(EpdRect){0});}
+static bool update_display_reader_joined(void *hl,EpdRect body,EpdRect top,EpdRect footer,bool water,int dir,enum EpdDrawError *result){(void)hl;(void)body;(void)top;(void)footer;(void)water;(void)dir;(void)result;return false;}
 static enum EpdDrawError update_display_water_turn(void *hl,EpdRect area,int dir){(void)hl;(void)dir;assert(test_tick_us==E0470_TURN_FAST_TICK_US);return record(WATER,MODE_GL16,area);}
 '''
 shelf += f'\n#include "{root / "main/book/reader_turn.c"}"\n'
@@ -403,6 +407,23 @@ int main(void){
    app_redraw_t redraw=turn_page(&ctx,1);trace_count=0;present(&ctx,redraw);
    assert(trace_route[0]==(policy?LOCAL_FULL:WATER));
  }
+ // 同一水波纹设置下，左右横屏都只生成普通翻页，回竖屏立即恢复动画。
+ // A single saved ripple setting produces ordinary turns in either landscape and restores portrait ripple.
+ test_full_pages=0;test_effect=1;
+ for(int orientation=0;orientation<4;++orientation){
+   bool landscape=orientation%2!=0;
+   reader_width=landscape?1216:684;reader_height=landscape?684:1216;
+   const int dir=orientation<2?1:-1;
+   s_page=dir>0?0:1;trace_count=0;present(&ctx,paint_reading(&ctx,MODE_GL16));
+   app_redraw_t redraw=turn_page(&ctx,dir);
+   assert(redraw==APP_REDRAW_AREA&&s_reader_turn_pending&&s_water_turn_pending==!landscape);
+   int sets=test_tick_sets;trace_count=0;
+   assert(present(&ctx,redraw)&&test_tick_sets==sets+(landscape?0:2));
+   if(landscape)assert(trace_route[0]==DIFF&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM);
+   else assert(trace_route[0]==WATER);
+   assert(test_effect==1);
+ }
+ reader_width=684;reader_height=1216;
  test_full_pages=0;test_effect=0;s_page=0;test_types[0][0]=1;test_image.gray=NULL;
  trace_count=0;present(&ctx,paint_reading(&ctx,MODE_GL16));assert(!s_reader_text_frame);
  assert(turn_page(&ctx,1)==APP_REDRAW_AREA&&!s_reader_turn_pending);
@@ -684,8 +705,14 @@ from run_reader_baseline import toolchain
 shelf = position_state(page=0) + shelf
 with tempfile.TemporaryDirectory() as folder:
     env, _ = toolchain(Path(folder))
-    units = (("status", status),) if "--status-only" in sys.argv else (("nav-modes", navigation),) if "--nav-only" in sys.argv else (
-        ("shelf", shelf), ("status", status), ("nav-modes", navigation), ("image-bw", image_bw))
+    if "--reader-only" in sys.argv:
+        units = (("shelf", shelf),)
+    elif "--status-only" in sys.argv:
+        units = (("status", status),)
+    elif "--nav-only" in sys.argv:
+        units = (("nav-modes", navigation),)
+    else:
+        units = (("shelf", shelf), ("status", status), ("nav-modes", navigation), ("image-bw", image_bw))
     for name, unit in units:
         source, binary = Path(folder) / (name + ".c"), Path(folder) / name
         source.write_text(unit)

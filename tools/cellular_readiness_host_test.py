@@ -15,6 +15,7 @@ MODEM = ROOT / "main/services/cellular/uart_eth_modem.cc"
 
 MODEL = r'''
 #include <atomic>
+#define ESP_ERR_NO_MEM 0x101
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -65,7 +66,8 @@ public:
     static SimCardState ParseSimCardState(const std::string&, esp_err_t);
     SimCardState CheckSimCard();
     esp_err_t RunNormalModeInitSequence();
-    esp_err_t AtDetect() { return ESP_OK; }
+    esp_err_t detect_error = ESP_OK;
+    esp_err_t AtDetect() { return detect_error; }
     esp_err_t ConfigureInternalSim() { return ESP_OK; }
     esp_err_t SendAt(const std::string& cmd, std::string& response, unsigned timeout = 1000) {
         response = "OK\r\n";
@@ -100,6 +102,11 @@ static void reset(UartEthModem& modem) {
 
 CASES = r'''
 int main() {
+    UartEthModem no_memory;
+    no_memory.detect_error = ESP_ERR_NO_MEM;
+    assert(no_memory.RunNormalModeInitSequence() == ESP_ERR_NO_MEM);
+    assert(no_memory.detail.find("内存不足") != std::string::npos);
+
     using State = SimCardState;
     using Event = UartEthModem::UartEthModemEvent;
     const auto parse = [&](const char* text, int result = ESP_OK) {

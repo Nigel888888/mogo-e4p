@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define LOCK_IMAGES_MAX 64
 #define LOCK_IMAGE_REQUESTS 8
 #define LOCK_THUMB_WIDTH 160
 #define LOCK_THUMB_HEIGHT 284

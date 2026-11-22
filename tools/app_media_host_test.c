@@ -51,7 +51,9 @@ int ttf_font_open(const char *path) {
 }
 int ttf_font_open_builtin(void) { event('B'); builtin = font_ready = true; return ESP_OK; }
 void ui_avatar_invalidate(void) { event('A'); }
+bool home_library_quiesce(unsigned timeout){assert(timeout==0);return true;}
 bool book_cover_jobs_quiesce(unsigned timeout_ms) { assert(timeout_ms == 0); event('Q'); return quiesce_ok; }
+bool shutdown_wallpaper_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 bool lock_images_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 void lock_images_close(void){event('T');}
 bool ui_avatar_quiesce(unsigned timeout_ms) { assert(timeout_ms == 0); event('V'); return avatar_ok; }

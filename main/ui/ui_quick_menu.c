@@ -219,9 +219,9 @@ bool ui_quick_menu_draw_notice(uint8_t *fb, const ui_quick_menu_t *menu, EpdRect
     if (!fb || !menu || !dirty) return false;
     *dirty = (EpdRect){40, ui_quick_menu_height(menu) - 50, epd_rotated_display_width() - 80, 32};
     ui_fill_rect_fast(*dirty, UI_GRAY_WHITE, fb);
-    if (menu->rotation_notice)
+    if (menu->network_notice || menu->rotation_notice)
         ui_text_fixed_vc(fb, epd_rotated_display_width() / 2, dirty->y + 16, 20,
-            "仅阅读正文支持自动旋转", EPD_DRAW_ALIGN_CENTER, false);
+            menu->network_notice ? menu->network_notice : "仅阅读正文支持自动旋转", EPD_DRAW_ALIGN_CENTER, false);
     return true;
 }
 
@@ -261,7 +261,7 @@ void ui_quick_menu_draw(uint8_t *fb,const ui_quick_menu_t *menu,bool wifi,bool b
         draw_fl_row(fb, menu, UI_QUICK_CTL_BRIGHTNESS);
         draw_fl_row(fb, menu, UI_QUICK_CTL_CCT);
     }
-    if (menu->rotation_notice) { EpdRect dirty; (void)ui_quick_menu_draw_notice(fb, menu, &dirty); }
+    if (menu->rotation_notice || menu->network_notice) { EpdRect dirty; (void)ui_quick_menu_draw_notice(fb, menu, &dirty); }
     ui_fill_round_rect(fb, (EpdRect){width / 2 - 26, layer_height - 24, 52, 6}, 3, UI_GRAY_BLACK);
     // 只画遮罩内的双像素轮廓，顶部直角、底部圆角，不越过下层边界。
     // Draw a two-pixel outline within the mask: square top, rounded bottom, no underlay leakage.

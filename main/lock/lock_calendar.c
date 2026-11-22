@@ -28,6 +28,12 @@ uint64_t lock_calendar_key(void) {
     return date_key(&date,valid);
 }
 uint64_t lock_calendar_frame_key(void) { return s_frame_key?s_frame_key:lock_calendar_key(); }
+bool lock_calendar_draw_variant(uint8_t *fb, bool month) {
+    if (!fb) return false;
+    calendar_date_t date; bool valid = today(&date);
+    ui_calendar_draw(fb, valid ? &date : NULL, month);
+    return true;
+}
 bool lock_calendar_draw(uint8_t *fb) {
     if(!fb)return false;
     calendar_date_t date;bool valid=today(&date);

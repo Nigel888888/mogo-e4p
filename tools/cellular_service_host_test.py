@@ -29,6 +29,14 @@ constexpr int BOARD_CELLULAR_MRDY_GPIO = 60, BOARD_CELLULAR_SRDY_GPIO = 3, UART_
 static bool setting_enabled;
 static int64_t now_us;
 static int next_start_result, next_stop_result;
+static bool ble_in_use, ble_paused;
+static esp_err_t ble_pt_cellular_acquire() {
+    assert(!ble_paused);
+    if (ble_in_use) return MEMORY_PEAK_CONFLICT;
+    ble_paused = true;
+    return ESP_OK;
+}
+static void ble_pt_cellular_release() { assert(ble_paused); ble_paused = false; }
 static unsigned creations, starts, stops;
 static int64_t esp_timer_get_time() { return now_us; }
 static int esp_netif_init() { return ESP_OK; }
@@ -56,10 +64,11 @@ public:
         assert(cfg.uart_num == 2 && cfg.baud_rate == 2000000); ++creations;
     }
     void SetNetworkEventCallback(decltype(callback) cb) { callback = cb; }
-    int Start() { ++starts; return next_start_result; }
+    int Start(memory_peak_token_t *peak) {
+        (void)peak; ++starts; return next_start_result; }
     int Stop() { ++stops; initialized = false; return next_stop_result; }
     bool IsInitialized() const { return initialized; }
-    int GetSignalStrength() { return 18; }
+    int GetSignalStrength() const { return 18; }
     void *GetNetif() { return nullptr; }
 };
 '''
@@ -69,19 +78,23 @@ int main() {
     using Event = UartEthModem::UartEthModemEvent;
     cellular_service_status_t status;
     cellular_service_init();
-    assert(creations == 1 && starts == 1);
+    assert(creations == 1 && starts == 1 && ble_paused);
     assert(cellular_service_set_enabled(true) == ESP_ERR_INVALID_STATE);
     s_service.modem->callback(Event::ErrorNoSim, "");
     cellular_service_get_status(&status);
     assert(status.capability_known && status.capable && !status.enabled && !status.ready);
-    cellular_service_poll();
-    assert(!s_service.modem && stops == 1 && !setting_enabled);
+    cellular_service_poll(true);
+    assert(!s_service.modem && stops == 1 && !setting_enabled && !ble_paused);
+    ble_in_use = true;
+    assert(cellular_service_set_enabled(true) == MEMORY_PEAK_CONFLICT);
+    assert(starts == 1 && !setting_enabled && !s_service.modem && !ble_paused);
+    ble_in_use = false;
     assert(cellular_service_set_enabled(true) == ESP_OK);
     assert(creations == 2 && starts == 2 && setting_enabled);
     assert(cellular_service_set_enabled(true) == ESP_OK && starts == 2);
     s_service.modem->initialized = true;
     s_service.modem->callback(Event::ErrorSimNotReady, "SIM 需要 PIN 解锁");
-    cellular_service_poll();
+    cellular_service_poll(true);
     cellular_service_get_status(&status);
     assert(status.state == CELLULAR_SERVICE_SIM_NOT_READY && !status.ready);
     assert(!strcmp(status.detail, "SIM 需要 PIN 解锁") && status.signal_strength == 18);
@@ -91,13 +104,22 @@ int main() {
     s_service.modem->callback(Event::Connected, "");
     assert(cellular_service_ready() && cellular_service_enabled());
     next_stop_result = ESP_FAIL;
-    assert(!cellular_service_pause_for_sleep() && s_service.modem && !s_service.paused);
+    assert(!cellular_service_pause_for_sleep() && s_service.modem && !s_service.paused && ble_paused);
     next_stop_result = ESP_OK;
-    assert(cellular_service_pause_for_sleep() && !s_service.modem && setting_enabled);
+    assert(cellular_service_pause_for_sleep() && !s_service.modem && setting_enabled && !ble_paused);
     cellular_service_get_status(&status);
     assert(status.enabled && !status.ready);
     assert(cellular_service_pause_for_sleep());
     cellular_service_resume_after_sleep();
+    assert(starts == 2 && !s_service.modem);
+    now_us += 1;
+    cellular_service_poll(false);
+    assert(starts == 2 && !s_service.modem);
+    now_us += kRetryIntervalUs - 1;
+    cellular_service_poll(true);
+    assert(starts == 2);
+    now_us += 1;
+    cellular_service_poll(true);
     assert(creations == 3 && starts == 3 && s_service.modem && setting_enabled);
     cellular_service_resume_after_sleep();
     assert(starts == 3);
@@ -109,20 +131,73 @@ int main() {
     next_start_result = ESP_ERR_NO_MEM;
     assert(cellular_service_set_enabled(true) == ESP_ERR_NO_MEM);
     cellular_service_get_status(&status);
-    assert(status.state == CELLULAR_SERVICE_ERROR && !status.ready && !s_service.modem);
+    assert(status.state == CELLULAR_SERVICE_ERROR && !status.ready && !s_service.modem && !ble_paused);
+    next_stop_result = ESP_FAIL;
+    assert(cellular_service_set_enabled(true) == ESP_ERR_NO_MEM && s_service.modem && ble_paused);
+    next_stop_result = ESP_OK;
+    cellular_service_poll(true);
+    assert(!s_service.modem && !ble_paused);
     next_start_result = ESP_OK;
     assert(cellular_service_set_enabled(false) == ESP_OK);
+    ble_in_use = true;
     cellular_service_init();
+    assert(!s_service.modem && !ble_paused);
+    now_us += kRetryIntervalUs - 1;
+    cellular_service_poll(true); assert(!s_service.modem);
+    ble_in_use = false;
+    ++now_us;
+    cellular_service_poll(true); assert(s_service.modem && ble_paused);
     now_us += 15000000;
-    cellular_service_poll();
+    cellular_service_poll(true);
     cellular_service_get_status(&status);
     assert(status.capability_known && !status.capable && !s_service.modem);
     assert(cellular_service_set_enabled(true) == ESP_ERR_NOT_SUPPORTED);
     // AT detection failure does not expose mobile controls on a Wi-Fi-only board.
     cellular_service_init();
     s_service.modem->callback(Event::ErrorInitFailed, "Modem not detected (AT no response)");
-    cellular_service_poll();
-    assert(!cellular_service_capable() && !s_service.modem);
+    cellular_service_poll(true);
+    cellular_service_get_status(&status);
+    assert(!cellular_service_capable() && !s_service.modem && !status.running);
+    assert(status.state == CELLULAR_SERVICE_STOPPED && status.startup_failed);
+    assert(cellular_service_set_enabled(false) == ESP_OK);
+    cellular_service_get_status(&status);
+    assert(!status.startup_failed);
+
+    cellular_service_init();
+    assert(cellular_service_start_temporary() == ESP_ERR_INVALID_STATE);
+    s_service.modem->callback(Event::Connecting, "");
+    cellular_service_poll(true);
+    const unsigned before_temporary = starts;
+    assert(!s_service.modem && !setting_enabled && !ble_paused);
+    ble_in_use = true;
+    assert(cellular_service_start_temporary() == MEMORY_PEAK_CONFLICT && starts == before_temporary);
+    ble_in_use = false;
+    assert(cellular_service_start_temporary() == ESP_OK && s_service.modem && ble_paused);
+    s_service.modem->callback(Event::Connecting, "");
+    cellular_service_poll(true);
+    assert(s_service.modem && !setting_enabled && !cellular_service_enabled());
+    assert(cellular_service_start_temporary() == ESP_OK && starts == before_temporary + 1);
+    s_service.modem->callback(Event::Connected, "");
+    cellular_service_poll(true);
+    assert(cellular_service_ready() && !cellular_service_enabled() && !setting_enabled);
+    s_service.modem->callback(Event::ErrorInitFailed, "Modem not detected (AT no response)");
+    cellular_service_poll(true);
+    cellular_service_get_status(&status);
+    assert(status.capable && status.state == CELLULAR_SERVICE_ERROR && !status.ready && status.running);
+    assert(cellular_service_stop_temporary() && !s_service.modem && !ble_paused);
+    now_us += kRetryIntervalUs;
+    cellular_service_poll(true);
+    assert(!s_service.modem && !setting_enabled && starts == before_temporary + 1);
+
+    assert(cellular_service_start_temporary() == ESP_OK);
+    s_service.modem->callback(Event::ErrorNoSim, "");
+    cellular_service_poll(true);
+    cellular_service_get_status(&status);
+    assert(status.state == CELLULAR_SERVICE_NO_SIM && status.running);
+    assert(cellular_service_stop_temporary() && !cellular_service_enabled() && !setting_enabled && !ble_paused);
+    assert(cellular_service_set_enabled(true) == ESP_OK && setting_enabled && ble_paused);
+    assert(cellular_service_stop_temporary() && s_service.modem && setting_enabled && ble_paused);
+    assert(cellular_service_set_enabled(false) == ESP_OK && !setting_enabled && !ble_paused);
     puts("PASS: cellular capability, radio lifecycle, error states and sleep restoration");
 }
 

@@ -13,7 +13,6 @@
 
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -24,7 +23,6 @@
 #include "ui_builtin_image.h"
 #include "app_content_open.h"
 #include "boot_state.h"
-#include "lock_screen.h"
 #include "lock_pin.h"
 #include "ttf_font.h"
 #include "book_store.h"
@@ -143,15 +141,14 @@ static void glyph_failure_note(uint32_t codepoint, int gid, int pixel_height,
     fclose(f);
 }
 
-// 缓存验证失败时继续原开机路径，不假设未知屏幕已经全白。
-// A rejected cache keeps the original startup path; never assume an unknown panel is white.
-static bool restore_retained_lock(EpdiyHighlevelState *hl,uint8_t *framebuffer) {
-    board_sd_info_t info;
-    for(unsigned wait=0;wait<150 && board_sd_get_info(&info)==ESP_ERR_NOT_FINISHED;++wait)
-        vTaskDelay(pdMS_TO_TICKS(20));
-    if(!lock_screen_restore(framebuffer))return false;
-    memcpy(hl->back_fb,framebuffer,(size_t)epd_width()*epd_height()/2);
-    return true;
+// 定时关机关机图与锁屏缓存不同；冷启动总是从一次物理清白重建基准。
+// The timed-shutdown image differs from the lock cache; rebuild the optical baseline with one clear at boot.
+static void present_boot_frame(EpdiyHighlevelState *hl, uint8_t *framebuffer, bool resuming) {
+    epd_poweron();
+    if (!resuming) board_i2c_census_take();
+    epd_hl_set_all_white(hl);
+    (void)ui_builtin_image_draw(framebuffer, UI_BUILTIN_IMAGE_LOADING);
+    update_display_boot_frame(hl);
 }
 
 void app_main(void) {
@@ -170,6 +167,9 @@ void app_main(void) {
 #endif
     ESP_LOGI(TAG, "startup reset=%d stack=%u", (int)reset, (unsigned)uxTaskGetStackHighWaterMark(NULL));
     app_settings_init();
+    int screen_x, screen_y;
+    app_settings_screen_offset(&screen_x, &screen_y);
+    display_apply_screen_offset(screen_x, screen_y);
     mm_init();
     mm_set_clean_callback(app_lifecycle_memory_clean);
     // 在大缓冲和字体之前读取小型锁屏设置；读取失败不阻塞，之后的检查仍可重试。
@@ -219,21 +219,8 @@ void app_main(void) {
     EpdiyHighlevelState hl = hw.hl;
     uint8_t* framebuffer = hw.framebuffer;
 
-    // 深睡保留屏幕已有画面：验证缓存后同时恢复前后帧，省去清白和开机图两次推屏。
-    // Deep sleep retains the panel image: validate its cache and restore both references, skipping white erase and splash output.
     const bool resuming = pico_boot_has_resume();
-    bool restored_lock = false;
-    if(resuming && vcom_ok && !lock_pin_enabled() && pico_boot_resume_frame_cached()) {
-        restored_lock=restore_retained_lock(&hl,framebuffer);
-    }
-    if(!restored_lock) {
-        epd_poweron();
-        if(!resuming)board_i2c_census_take();
-        epd_clear();
-        epd_hl_set_all_white(&hl);
-        (void)ui_builtin_image_draw(framebuffer, UI_BUILTIN_IMAGE_LOADING);
-        update_display_from_white(&hl);
-    }
+    present_boot_frame(&hl, framebuffer, resuming);
     rp_boot_mark("splash");
 
     ttf_font_set_failure_hook(glyph_failure_note);

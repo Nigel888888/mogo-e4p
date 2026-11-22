@@ -26,7 +26,6 @@ static unsigned builds, excerpts, closes;
 static int build_failures;
 static esp_err_t read_error, title_error;
 static book_kind_t kind = BOOK_KIND_EPUB;
-static bool mark_chapter_start;
 static const char *html, *title, *expected_anchor;
 static size_t expected_source, expected_chapter;
 static const html_run_t *layout_runs;
@@ -82,10 +81,8 @@ esp_err_t book_chapter_load_blocks_target(size_t chapter, const char *anchor,
     assert(source == expected_source && session.position.chapter == 7 && session.position.page == 3);
     if (read_error) return read_error;
     html_font_map_t fonts = {.resolve = resolve_font};
-    esp_err_t result = html_to_blocks_with_css_target(html, strlen(html), NULL, 0, &fonts,
-                                                      anchor, source, offset, out);
-    if (result == ESP_OK && mark_chapter_start && out->count) out->blocks[0].chapter_start = true;
-    return result;
+    return html_to_blocks_with_css_target(html, strlen(html), NULL, 0, &fonts,
+                                         anchor, source, offset, out);
 }
 void book_layout_set_runs(const html_run_t *runs, size_t count) {
     (void)count; assert(!runs || (locked && !prefetch_borrowed)); layout_runs = runs;
@@ -163,11 +160,6 @@ static void heading_cases(void) {
     c = (reader_chapter_t){0};
     assert(reader_chapter_read(&c, expected_chapter, NULL, SIZE_MAX, 294, 294) == ESP_OK);
     assert(!c.lead_height); html_text_free(&c.content);
-    // EPUB 的已确认章节起点可能不是语义 h1；它仍须和题头折叠，不能在正文里再出现一份。
-    // An EPUB body chapter boundary may lack a semantic h1; it must still fold with the chrome heading.
-    title = "出发"; html = "<p>出发</p><p>正文</p>"; mark_chapter_start = true;
-    c = read_candidate(); assert(c.lead_skip == c.content.blocks[1].offset && c.lead_height == 294);
-    html_text_free(&c.content); mark_chapter_start = false;
 }
 int main(void) {
     assert(reader_session_open(&session, "test.epub") == ESP_OK);

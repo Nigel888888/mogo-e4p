@@ -23,7 +23,7 @@ unit = r'''
 #define BOOK_COVER_H 240
 #define BOOK_AUTO_COVER_VERSION 1
 #define COVER_CACHE_MAGIC 1234
-#define COVER_CACHE_SCHEMA 1
+#define COVER_CACHE_SCHEMA 4
 #define ESP_OK 0
 #define ESP_ERR_NOT_FOUND 2
 #define ESP_ERR_NO_MEM 3
@@ -43,7 +43,7 @@ static bool book_image_dimensions(const uint8_t *data,size_t bytes,bool png,unsi
 static bool book_image_grayscale(const uint8_t *data,size_t bytes,bool png,unsigned w,unsigned h,uint8_t *out){(void)png;assert(data&&bytes==1&&w&&h&&w<=176&&h<=240);++decoded;if(decode_fail)return false;memset(out,61,w*h);return true;}
 static bool book_auto_cover_render(const char *p,const char *t,const char *a,unsigned w,unsigned h,uint8_t *out){(void)p;(void)t;(void)a;assert(w==176&&h==240);memset(out,191,w*h);return true;}
 '''
-for name in ('cover_hash', 'cover_cache_key', 'book_cover_load_list_gray_impl', 'book_cover_load_list_gray'):
+for name in ('cover_hash', 'cover_cache_key', 'cover_schema_matches', 'book_cover_load_list_gray_impl', 'book_cover_load_list_gray'):
     unit += function(name, source) + '\n'
 unit += r'''
 int main(int argc,char **argv){
@@ -54,6 +54,9 @@ int main(int argc,char **argv){
  for(unsigned i=w*h;i<sizeof(out);++i)assert(out[i]==0xab);
  for(int i=0;i<30;++i)assert(book_cover_load_list_gray(path,"title","author",out,false,&pending,&w,&h)&&w==120&&h==240&&requests==1);
  cover_cache_header_t key;assert(cover_cache_key(path,"title","author",cache,sizeof(cache),&key));strcpy(strrchr(cache,'.'),"-list.bin");
+ f=fopen(cache,"r+b");assert(f);assert(fread(&key,1,sizeof(key),f)==sizeof(key));key.schema=3;rewind(f);assert(fwrite(&key,1,sizeof(key),f)==sizeof(key)&&!fclose(f));
+ assert(book_cover_load_list_gray(path,"title","author",out,false,&pending,&w,&h)&&!pending&&w==120&&h==240&&requests==1);
+ assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h)&&!pending&&w==120&&h==240&&requests==2);
  f=fopen(cache,"r+b");assert(f);assert(fread(&key,1,sizeof(key),f)==sizeof(key));key.width=0;rewind(f);assert(fwrite(&key,1,sizeof(key),f)==sizeof(key)&&!fclose(f));
  assert(!book_cover_load_list_gray(path,"title","author",out,false,&pending,&w,&h)&&pending);
  source_w=1000;source_h=250;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h)&&w==176&&h==44);assert(!remove(cache));
@@ -67,7 +70,7 @@ int main(int argc,char **argv){
  puts("PASS: uncropped wide/tall/square covers, exact cache dimensions, 30 warm reads, corrupt metadata, 1.5MiB reserve, OOM/decode failure retry and generated fallback bounds");
 }
 '''
-with tempfile.TemporaryDirectory(prefix='plc-', dir='/private/tmp') as folder:
+with tempfile.TemporaryDirectory(prefix='plc-', dir='/tmp') as folder:
     p = Path(folder)
     unit = unit.replace('/sdcard/.readpico', str(p/'card'))
     (p/'test.c').write_text(unit)

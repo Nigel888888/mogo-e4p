@@ -9,4 +9,6 @@ void pico_ota_auto_poll(bool idle);
 bool pico_ota_auto_pending(void);
 void pico_ota_auto_acknowledge(void);
 /// 切页、锁屏与关机前仅取消自动任务，不干预手动升级。/ Cancel only automatic work before navigation, lock or shutdown.
+/// 导航只通知只读任务取消，不等无线；睡眠/关机用同步交还入口。/ Navigation cancels read-only work without waiting; sleep/shutdown still join.
+void pico_ota_auto_request_cancel(void);
 void pico_ota_auto_cancel(void);

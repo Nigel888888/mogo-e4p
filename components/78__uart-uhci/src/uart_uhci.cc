@@ -7,7 +7,6 @@
 #include "uart_uhci.h"
 
 #include <cstring>
-#include <vector>
 #include "esp_log.h"
 #include "esp_idf_version.h"
 #include "esp_check.h"
@@ -19,9 +18,17 @@
 #include "esp_private/gdma_link.h"
 #include "esp_private/periph_ctrl.h"
 #include "esp_private/esp_cache_private.h"
+#include "hal/dma_types.h"
 #include "hal/uhci_ll.h"
 #include "hal/uart_ll.h"
 #include "soc/soc_caps.h"
+
+#if CONFIG_IDF_TARGET_ESP32S31 && CONFIG_SPIRAM && SOC_PSRAM_DMA_CAPABLE
+#include "esp_private/esp_psram_mspi.h"
+#define UHCI_RX_PSRAM_SUPPORTED 1
+#else
+#define UHCI_RX_PSRAM_SUPPORTED 0
+#endif
 
 static const char* kTag = "UartUhci";
 
@@ -177,7 +184,8 @@ esp_err_t UartUhci::InitGdma(const Config& config) {
     rx_alloc.direction = GDMA_CHANNEL_DIRECTION_RX;
     ESP_RETURN_ON_ERROR(gdma_new_ahb_channel(&rx_alloc, &rx_dma_chan_), kTag, "RX DMA alloc failed");
 #endif
-    gdma_connect(rx_dma_chan_, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_UHCI, 0));
+    ESP_RETURN_ON_ERROR(gdma_connect(rx_dma_chan_, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_UHCI, 0)),
+                        kTag, "RX DMA connect failed");
 
     gdma_transfer_config_t transfer_cfg = {};
     transfer_cfg.max_data_burst_size = config.dma_burst_size;
@@ -185,7 +193,8 @@ esp_err_t UartUhci::InitGdma(const Config& config) {
     ESP_RETURN_ON_ERROR(gdma_config_transfer(rx_dma_chan_, &transfer_cfg), kTag, "RX DMA config failed");
 
     // Get RX alignment constraints
-    gdma_get_alignment_constraints(rx_dma_chan_, &rx_int_mem_align_, &rx_ext_mem_align_);
+    ESP_RETURN_ON_ERROR(gdma_get_alignment_constraints(rx_dma_chan_, &rx_int_mem_align_, &rx_ext_mem_align_),
+                        kTag, "RX DMA alignment unavailable");
 
     // Create RX DMA link list with buffer pool size and owner checking enabled
     // Each buffer gets one DMA node, owner mechanism manages buffer availability
@@ -227,36 +236,45 @@ void UartUhci::DeinitGdma() {
 
 esp_err_t UartUhci::InitRxBufferPool(const BufferPoolConfig& config) {
     rx_pool_size_ = config.buffer_count;
-    rx_buffer_size_ = config.buffer_size;
-
-    // Calculate alignment requirements
-    size_t max_align = MAX_OF(MAX_OF(rx_int_mem_align_, rx_ext_mem_align_), int_mem_cache_line_);
-    if (max_align == 0) max_align = 4;
-
-    // Align buffer size
-    size_t aligned_size = ALIGN_UP(config.buffer_size, max_align);
-    rx_buffer_size_ = aligned_size;
-    rx_cache_line_ = int_mem_cache_line_;
-
-    // Allocate buffer descriptor array
+    // 只有数据可用外存：描述符仍由 ISR 和 DMA 使用片内存储。
+    // Only payloads may use PSRAM; ISR metadata and DMA descriptors remain internal.
     rx_buffer_pool_ = static_cast<RxBuffer*>(heap_caps_calloc(rx_pool_size_, sizeof(RxBuffer), MALLOC_CAP_INTERNAL));
     ESP_RETURN_ON_FALSE(rx_buffer_pool_, ESP_ERR_NO_MEM, kTag, "failed to allocate buffer pool descriptors");
 
-    // Allocate individual buffers (buffer[i] will be mounted to DMA node[i])
-    for (size_t i = 0; i < rx_pool_size_; i++) {
-        rx_buffer_pool_[i].data = static_cast<uint8_t*>(
-            heap_caps_aligned_alloc(max_align, aligned_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-        ESP_RETURN_ON_FALSE(rx_buffer_pool_[i].data, ESP_ERR_NO_MEM, kTag,
-                            "failed to allocate buffer %d", i);
-
-        rx_buffer_pool_[i].capacity = aligned_size;
-        rx_buffer_pool_[i].size = 0;
-        rx_buffer_pool_[i].index = i;
-    }
-
-    ESP_LOGD(kTag, "RX buffer pool: %d buffers x %d bytes (aligned to %d)",
-             rx_pool_size_, aligned_size, max_align);
-
+    const auto allocate_payloads = [&](bool external) {
+        const size_t cache_line = external ? ext_mem_cache_line_ : int_mem_cache_line_;
+        const size_t min_align = external ? rx_ext_mem_align_ : rx_int_mem_align_;
+        const size_t alignment = MAX_OF(4u, MAX_OF(min_align, cache_line));
+        // GDMA 用超大对齐值表示该通道不能访问外存；每块也必须能装入一个描述符。
+        // GDMA uses an oversized alignment to indicate inaccessible memory; keep one descriptor per buffer.
+        if (alignment > DMA_DESCRIPTOR_BUFFER_MAX_SIZE || config.buffer_size > DMA_DESCRIPTOR_BUFFER_MAX_SIZE)
+            return false;
+        const size_t capacity = ALIGN_UP(config.buffer_size, alignment);
+        if (capacity > DMA_DESCRIPTOR_BUFFER_MAX_SIZE) return false;
+        const uint32_t caps = MALLOC_CAP_DMA | (external ? MALLOC_CAP_SPIRAM : MALLOC_CAP_INTERNAL);
+        for (size_t i = 0; i < rx_pool_size_; i++) {
+            auto* data = static_cast<uint8_t*>(heap_caps_aligned_alloc(alignment, capacity, caps));
+            if (!data) {
+                // 回退前释放整组已分配数据，不混用缓存属性不同的缓冲。
+                // Return the partial pool before falling back; do not mix cache domains.
+                for (size_t j = 0; j < i; j++) {
+                    heap_caps_free(rx_buffer_pool_[j].data);
+                    rx_buffer_pool_[j] = {};
+                }
+                return false;
+            }
+            rx_buffer_pool_[i] = {data, capacity, 0, static_cast<uint32_t>(i)};
+        }
+        rx_payload_psram_ = external;
+        rx_payload_align_ = alignment;
+        rx_cache_line_ = cache_line;
+        rx_buffer_size_ = capacity;
+        return true;
+    };
+#if UHCI_RX_PSRAM_SUPPORTED
+    if (config.prefer_psram && rx_ext_mem_align_ && ext_mem_cache_line_ && allocate_payloads(true)) return ESP_OK;
+#endif
+    ESP_RETURN_ON_FALSE(allocate_payloads(false), ESP_ERR_NO_MEM, kTag, "failed to allocate DRAM RX payloads");
     return ESP_OK;
 }
 
@@ -273,6 +291,9 @@ void UartUhci::DeinitRxBufferPool() {
 
     rx_pool_size_ = 0;
     rx_buffer_size_ = 0;
+    rx_payload_psram_ = false;
+    rx_payload_align_ = 0;
+    rx_cache_line_ = 0;
 }
 
 void UartUhci::SetRxCallback(RxCallback callback, void* user_data) {
@@ -285,7 +306,7 @@ void UartUhci::SetOverflowCallback(OverflowCallback callback, void* user_data) {
     overflow_callback_user_data_ = user_data;
 }
 
-void UartUhci::RemountAndRestartDma(bool flush_uart_fifo) {
+esp_err_t UartUhci::RemountAndRestartDma(bool flush_uart_fifo) {
     // Re-mount all buffers to DMA link list and restart
     // This is used both for initial start and recovery from overflow
 
@@ -296,24 +317,26 @@ void UartUhci::RemountAndRestartDma(bool flush_uart_fifo) {
         uart_ll_rxfifo_rst(hw);
     }
 
-    std::vector<gdma_buffer_mount_config_t> mount_configs(rx_pool_size_);
+    ESP_RETURN_ON_ERROR(gdma_reset(rx_dma_chan_), kTag, "RX DMA reset failed");
     for (size_t i = 0; i < rx_pool_size_; i++) {
         RxBuffer* buf = &rx_buffer_pool_[i];
         buf->size = 0;
-
-        mount_configs[i].buffer = buf->data;
-        mount_configs[i].length = buf->capacity;
-        mount_configs[i].flags.mark_eof = 1;    // Trigger callback when this buffer is filled
+        // 挂载前先清掉旧缓存行，DMA 写完后再同步；运行中 CPU 不写入数据区。
+        // Invalidate old cache lines before mounting, then sync on completion; the CPU only reads payloads.
+        if (rx_cache_line_) {
+            ESP_RETURN_ON_ERROR(esp_cache_msync(buf->data, buf->capacity, ESP_CACHE_MSYNC_FLAG_DIR_M2C),
+                                kTag, "RX cache invalidation before DMA failed");
+        }
+        gdma_buffer_mount_config_t mount = {};
+        mount.buffer = buf->data;
+        mount.length = buf->capacity;
+        mount.buffer_alignment = rx_payload_align_;
+        mount.flags.mark_eof = 1;
+        ESP_RETURN_ON_ERROR(gdma_link_mount_buffers(rx_dma_link_, i, &mount, 1, nullptr),
+                            kTag, "RX DMA mount failed");
     }
-
-    last_rx_buf_idx_ = -1;  // Reset buffer sequence tracking
-
-    // Mount all buffers and start DMA
-    // Owner is set to DMA for all nodes by gdma_link_mount_buffers
-    gdma_link_mount_buffers(rx_dma_link_, 0, mount_configs.data(), rx_pool_size_, nullptr);
-
-    gdma_reset(rx_dma_chan_);
-    gdma_start(rx_dma_chan_, rx_dma_link_head_addr_);
+    last_rx_buf_idx_ = -1;
+    return gdma_start(rx_dma_chan_, rx_dma_link_head_addr_);
 }
 
 esp_err_t UartUhci::StartReceive() {
@@ -330,7 +353,12 @@ esp_err_t UartUhci::StartReceive() {
     buffer_overflow_.store(false);  // Clear overflow flag
 
     // Mount all buffers and start DMA
-    RemountAndRestartDma();
+    const esp_err_t err = RemountAndRestartDma();
+    if (err != ESP_OK) {
+        rx_running_.store(false);
+        if (pm_lock_) esp_pm_lock_release(pm_lock_);
+        return err;
+    }
 
     ESP_LOGD(kTag, "RX started with %d buffers", rx_pool_size_);
     return ESP_OK;
@@ -386,7 +414,7 @@ void UartUhci::ReturnBuffer(RxBuffer* buffer) {
 
                 // Re-mount all buffers and restart DMA
                 // Flush UART FIFO to discard stale/incomplete data from overflow period
-                RemountAndRestartDma(true);
+                if (RemountAndRestartDma(true) != ESP_OK) StopReceive();
             }
             // If not all returned, don't call gdma_append - wait for more buffers
         } else {
@@ -427,7 +455,7 @@ void UartUhci::RecoverOverflowIfReady() {
     }
 
     buffer_overflow_.store(false);
-    RemountAndRestartDma(true);
+    if (RemountAndRestartDma(true) != ESP_OK) StopReceive();
 }
 
 esp_err_t UartUhci::Transmit(const uint8_t* buffer, size_t size) {
@@ -530,10 +558,19 @@ bool UartUhci::HandleGdmaRxDone(uintptr_t desc_addr, bool is_normal_eof) {
 
         buf->size = rx_size;
 
-        // Sync cache if needed
+#if UHCI_RX_PSRAM_SUPPORTED
+        // 遵循 SDK UHCI 的外存写入屏障，再失效 CPU 缓存行。
+        // Follow the SDK UHCI's external write barrier before invalidating CPU cache lines.
+        if (rx_payload_psram_) esp_psram_mspi_mb();
+#endif
         if (rx_cache_line_ > 0) {
             size_t sync_size = ALIGN_UP(rx_size, rx_cache_line_);
-            esp_cache_msync(buf->data, sync_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+            if (esp_cache_msync(buf->data, sync_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C) != ESP_OK) {
+                ESP_DRAM_LOGW(kTag, "RX cache sync failed on buffer %d", buf_idx);
+                last_rx_buf_idx_ = buf_idx;
+                ReturnBufferFromISR(buf);
+                continue;
+            }
         }
 
         // Update last processed buffer index

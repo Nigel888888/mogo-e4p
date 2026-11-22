@@ -12,14 +12,14 @@
 #include "display_normalize.h"
 #include "e0470_epaper_waveform.h"
 
-const EpdWaveform E0470_WAVEFORM = {1}, E0470_FULL_WAVEFORM = {2},
-    E0470_FOLLOW_WAVEFORM = {3};
+const EpdWaveform E0470_WAVEFORM = {.num_modes=1}, E0470_FULL_WAVEFORM = {.num_modes=2},
+    E0470_FOLLOW_WAVEFORM = {.num_modes=3};
 static unsigned present_depth, completed_presentations;
 bool display_present_begin(void) { ++present_depth; return true; }
 void display_present_end(bool held) { assert(held && present_depth == 1); --present_depth; ++completed_presentations; }
 
-static const EpdWaveform text = {4}, page = {5}, image = {6},
-    normalize = {7}, normalize_gray = {8}, background = {9};
+static const EpdWaveform text = {.num_modes=4}, page = {.num_modes=5}, image = {.num_modes=6},
+    normalize = {.num_modes=7}, normalize_gray = {.num_modes=8}, background = {.num_modes=9};
 static bool use_background;
 const EpdWaveform* display_reader_text_waveform(void) { return &text; }
 const EpdWaveform* display_reader_page_waveform(void) { return &page; }
@@ -48,7 +48,7 @@ enum EpdDrawError update_display_area_diff_padded(EpdiyHighlevelState *s, const 
                                                  enum EpdDrawMode m, EpdRect a, int x, int y) {
     (void)s;(void)w;(void)m;(void)a;(void)x;(void)y;assert(!"unexpected padded output");return EPD_DRAW_INVALID_CROP;
 }
-enum call_kind { AREA, DIFF, FULL_AREA, WHOLE, WHOLE_DIFF, FULL, IMAGE_GRAY, FAST, WATER, TICK };
+enum call_kind { AREA, DIFF, FULL_AREA, WHOLE, WHOLE_DIFF, FULL, IMAGE_GRAY, FAST, WATER, TICK, JOINED };
 typedef struct {
     enum call_kind kind;
     const EpdWaveform *wave;
@@ -62,6 +62,8 @@ static enum EpdDrawError errors[16];
 static size_t outputs;
 static bool complete_refresh_pending;
 static int tick;
+static bool join_admitted;
+static EpdRect join_top, join_footer;
 static uint8_t front[4] = {1, 2, 3, 4}, back[4] = {4, 3, 2, 1};
 static EpdiyHighlevelState hl = {.front_fb = front, .back_fb = back};
 static const EpdRect none = {0};
@@ -80,6 +82,11 @@ enum EpdDrawError name(EpdiyHighlevelState *state, const EpdWaveform *wave, \
 }
 AREA_OUTPUT(update_display_area_with, AREA)
 AREA_OUTPUT(update_display_area_diff_with, DIFF)
+AREA_OUTPUT(update_display_area_stable_diff, DIFF)
+enum EpdDrawError update_display_area_reader_turn(EpdiyHighlevelState *s, const EpdWaveform *w,
+    enum EpdDrawMode m, EpdRect a, bool full_body) {
+    return record(s, full_body ? AREA : DIFF, w, m, a);
+}
 AREA_OUTPUT(update_display_area_full_with, FULL_AREA)
 enum EpdDrawError update_display_with(EpdiyHighlevelState *s, const EpdWaveform *w, enum EpdDrawMode m) {
     return record(s, WHOLE, w, m, none);
@@ -101,6 +108,14 @@ enum EpdDrawError update_display_reader_image_gray(EpdiyHighlevelState *s) {
     return record(s, IMAGE_GRAY, &E0470_FULL_WAVEFORM, MODE_GC16, none);
 }
 enum EpdDrawError update_display_fast_page(EpdiyHighlevelState *s) { return record(s, FAST, NULL, 0, none); }
+bool update_display_reader_joined(EpdiyHighlevelState* state, EpdRect body, EpdRect top, EpdRect footer,
+                                    bool ripple, e0470_turn_dir_t dir, enum EpdDrawError* result) {
+    if (!join_admitted) return false;
+    if (ripple) assert(tick == E0470_TURN_FAST_TICK_US);
+    join_top = top; join_footer = footer;
+    *result = record(state, JOINED, NULL, ripple ? dir : MODE_GL16, body);
+    return true;
+}
 enum EpdDrawError update_display_water_turn(EpdiyHighlevelState *s, EpdRect a, e0470_turn_dir_t d) {
     return record(s, WATER, NULL, d, a);
 }
@@ -115,6 +130,7 @@ static reader_present_request_t reset(void) {
     memset(errors, 0, sizeof(errors));
     tick = 13579;
     use_background = false;
+    join_admitted = false;
     return (reader_present_request_t){
         .refresh = READER_PRESENT_AREA, .mode = MODE_GL16, .page_mode = MODE_DU,
         .status_area = {0, 0, 684, 160}, .area = {1, 2, 3, 4}, .body_area = {5, 6, 7, 8}, .footer_area = {9, 10, 11, 12},
@@ -141,6 +157,29 @@ int main(void) {
     expect(0, DIFF, &text, MODE_GL16, probe.area);
     expect(1, DIFF, &E0470_WAVEFORM, MODE_GL16, probe.footer_area);
     expect(2, DIFF, &E0470_WAVEFORM, MODE_GL16, probe.status_area);
+    for (int water = 0; water < 2; ++water) for (int scenario = 0; scenario < 4; ++scenario) {
+        probe = reset();
+        join_admitted = true;
+        probe.area = probe.body_area;
+        probe.water_turn_pending = water;
+        probe.status_pending = scenario != 1;
+        probe.footer_pending = scenario != 2;
+        probe.footer_strong = scenario == 0;
+        if (scenario == 3) errors[0] = EPD_DRAW_OTHER_ERROR;
+        probe_out = reader_present_output(&hl, &probe);
+        assert(outputs == 1 && count == (water ? 3u : 1u) && tick == 13579);
+        expect(water, JOINED, NULL, water ? E0470_TURN_BTT : MODE_GL16, probe.body_area);
+        const EpdRect top = probe.status_pending ? probe.status_area : none;
+        const EpdRect footer = probe.footer_pending ? probe.footer_area : none;
+        assert(!memcmp(&join_top, &top, sizeof(top)) && !memcmp(&join_footer, &footer, sizeof(footer)));
+        assert(probe_out.error == errors[0]);
+        assert(probe_out.status_updated == (scenario != 3 && probe.status_pending));
+        assert(probe_out.footer_updated == (scenario != 3 && probe.footer_pending));
+    }
+    probe = reset(); probe.area = probe.body_area;
+    probe.footer_pending = probe.status_pending = true;
+    probe_out = reader_present_output(&hl, &probe);
+    assert(probe_out.error == EPD_DRAW_SUCCESS && outputs == 3);
     reader_present_request_t r = reset();
     reader_present_result_t out = reader_present_output(&hl, &r);
     assert(out.error == 0 && !out.tools_band && !out.footer_updated && count == 1);
@@ -180,7 +219,7 @@ int main(void) {
             assert(calls[i++].kind == TICK);
             expect(i++, WATER, NULL, E0470_TURN_BTT, r.area);
             assert(calls[i++].kind == TICK && tick == 13579);
-        } else expect(i++, DIFF, &text, MODE_GL16, r.area);
+        } else expect(i++, bg ? AREA : DIFF, bg ? &background : &text, MODE_GL16, r.area);
         if (!full && strong) expect(i++, DIFF, &E0470_WAVEFORM, MODE_GL16, r.footer_area);
         else if (!full) expect(i++, AREA, &E0470_FOLLOW_WAVEFORM, MODE_DU, r.footer_area);
         if (status) expect(i++, DIFF, &E0470_WAVEFORM, MODE_GL16, r.status_area);
@@ -196,6 +235,26 @@ int main(void) {
         assert(out.error == EPD_DRAW_OTHER_ERROR && outputs == (size_t)failure + 1);
         assert(!out.status_updated && out.footer_updated == (failure > 1));
         assert(tick == 13579 && count == outputs + (water ? 2u : 0u));
+    }
+    // 横屏忽略残留的动画，普通正文与插图均保留原路径和扫描节拍。
+    // Landscape ignores a stale animation and keeps ordinary text/image paths and pacing.
+    for (int dir = E0470_TURN_LTR; dir <= E0470_TURN_RTL; ++dir) {
+        r = reset(); r.screen_area = (EpdRect){0, 0, 1216, 684};
+        r.water_dir = (e0470_turn_dir_t)dir;
+        r.water_turn_pending = r.water_effect = true;
+        out = reader_present_output(&hl, &r);
+        assert(out.error == EPD_DRAW_SUCCESS && count == 1 && tick == 13579);
+        expect(0, DIFF, &text, MODE_GL16, r.area);
+        r.image_gray_refresh = r.image_page = true;
+        count = outputs = 0;
+        out = reader_present_output(&hl, &r);
+        assert(out.error == EPD_DRAW_SUCCESS && count == 1 && tick == 13579);
+        expect(0, AREA, &E0470_FULL_WAVEFORM, MODE_GC16, r.body_area);
+        r.refresh = READER_PRESENT_PAGE;
+        count = outputs = 0;
+        out = reader_present_output(&hl, &r);
+        assert(out.error == EPD_DRAW_SUCCESS && count == 1 && tick == 13579);
+        expect(0, WHOLE, &E0470_FULL_WAVEFORM, MODE_GC16, none);
     }
     // 插图正文也优先输出，保留原完整灰阶或插图差分出口。
     // Illustration bodies also present first while retaining full-gray or image-differential output.

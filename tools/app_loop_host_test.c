@@ -3,6 +3,7 @@
  * English: Run the real loop with deterministic touch and task-delay exit.
  */
 #include "app_loop.h"
+#include "home_components.h"
 #include "platform/s31_input.h"
 #include "ui_gesture.h"
 #include "ui_menu.h"
@@ -83,6 +84,9 @@ static int reader_returns;
 static char reader_return_path[64];
 static bool transfer_returns;
 bool app_book_reader_body_visible(void) {return reader_body;}
+bool app_book_reader_keys_active(void) {return reader_body;}
+static int reader_up_presses;
+app_redraw_t app_book_up_key_action(app_ctx_t *ctx) { (void)ctx; ++reader_up_presses; return APP_REDRAW_NONE; }
 bool app_book_resume_context(char *p,size_t c) {
     if (!reader_resume_ok || !p || strlen(reader_resume_path) >= c) return false;
     memcpy(p, reader_resume_path, strlen(reader_resume_path) + 1);
@@ -103,7 +107,7 @@ static app_redraw_t auto_update_return_tick(app_ctx_t *c) {
 }
 static int power_open_draws, power_controls_draws, power_final_draws;
 static int power_trigger_step = -1, shutdowns, restarts;
-static bool staged_shutdown;
+static bool staged_shutdown,light_only_shutdown,shutdown_draw_fails,shutdown_handoff_fails;
 int64_t esp_timer_get_time(void);
 static bool power_tap_during_draw;
 static bool power_drag_during_draw;
@@ -214,7 +218,8 @@ static bool media_test, sd_font, saved_sd_font;
 static bool mounted_steps[32], present_steps[32];
 static int media_lost, media_ready, builtin_opens, font_opens, probes, remounts, loss_step;
 static bool fl_ready, fl_on;
-static bool up_key_bound, up_key_steps[32];
+static app_reader_key_action_t key_actions[3], key_hold_action, key_double_action, up_key_action;
+static bool up_key_steps[32];
 static uint8_t fl_bri=40, fl_cct=50;
 static int fl_applies, fl_control_draws, fl_sweep_draws, fl_drag_pushes, fl_white_pushes, fl_gray_pushes, fl_key_gl, quick_gl_height;
 int E0470_WAVEFORM;
@@ -241,6 +246,13 @@ enum EpdDrawError update_display_area_diff_with(EpdiyHighlevelState*h,const void
     if (a.height==UI_QUICK_HEIGHT||a.height==UI_QUICK_FRONTLIGHT_HEIGHT) {assert(a.x==0&&a.y==0&&a.width==684);++quick_du;}
     if (a.y==1120) assert(w==&E0470_FOLLOW_WAVEFORM&&m==MODE_DU&&a.height==48&&a.width==50);
     return update_display_area_with(h,w,m,a);
+}
+enum EpdDrawError update_display_area_stable_diff(EpdiyHighlevelState*h,const void*w,int m,EpdRect a) {
+    return update_display_area_diff_with(h, w, m, a);
+}
+enum EpdDrawError update_display_area_reader_turn(EpdiyHighlevelState*h,const void*w,int m,EpdRect a, bool full_body) {
+    (void)full_body;
+    return update_display_area_diff_with(h, w, m, a);
 }
 enum EpdDrawError update_display_area_diff_padded(EpdiyHighlevelState*h,const void*w,int m,EpdRect a,
                                                   int pad_lines,int pad_col_bytes) {
@@ -359,6 +371,7 @@ void display_request_full_refresh(void) {++wake_clean_requests;}
 void guard_draw_result(EpdiyHighlevelState* h,enum EpdDrawError e) {(void)h;assert(e==0);}
 enum EpdDrawError update_display_area_with(EpdiyHighlevelState*h,const void*w,int m,EpdRect a) {(void)h;(void)w;last_du_area=a;nav_area_draws+=nav_armed!=NULL;nav_armed=NULL;if(m==MODE_DU)du_areas++;else if(m==MODE_GL16)gl_areas++;return 0;}
 enum EpdDrawError update_display_full(EpdiyHighlevelState*h) {(void)h;fulls++;nav_full_arms+=nav_armed!=NULL;nav_armed=NULL;return 0;}
+bool app_shutdown_present(EpdiyHighlevelState *hl){++power_final_draws;guard_draw_result(hl,update_display_full(hl));return !shutdown_draw_fails;}
 enum EpdDrawError update_display_mode(EpdiyHighlevelState*h,int m) {(void)h;(void)m;mode++;return 0;}
 enum EpdDrawError update_display_mode_diff(EpdiyHighlevelState*h,int m) {(void)h;(void)m;mode++;return 0;}
 enum EpdDrawError update_display_fast_page(EpdiyHighlevelState*h) {(void)h;mode++;nav_draws+=nav_armed!=NULL;nav_armed=NULL;return 0;}
@@ -384,16 +397,19 @@ device_power_key_action_t device_power_take_key_action(void) {
 void enter_lock_and_sleep(EpdiyHighlevelState*h,int64_t*t,void*a,void*tp,bool reader,bool light_only) {(void)tp;(void)h;(void)t;(void)a;(void)reader;(void)light_only;assert(!nav_armed);++idle_locks;lock_due=false;time_offset+=1000000;}
 void app_lock_feedback(EpdiyHighlevelState*h) {(void)h;++lock_feedback_calls;if(feedback_enabled){assert(!before_locks&&!idle_locks);++lock_badges;}}
 void app_lock_wait_key_idle(int ms) {(void)ms;}
-esp_err_t app_enter_host_sleep(app_sleep_mode_t mode) {assert(mode==APP_SLEEP_OFF);++shutdowns;longjmp(done,1);}
+esp_err_t app_enter_host_sleep(app_sleep_mode_t mode) {assert(mode==APP_SLEEP_OFF);++shutdowns;if(shutdown_handoff_fails)return ESP_ERR_INVALID_STATE;longjmp(done,1);}
 void app_restart_host(void) {++restarts;longjmp(done,1);}
 void epd_poweroff(void) {}
 const char* app_settings_font_path(void) {return "builtin";}
 bool app_settings_reader_power_turn(void) {return false;}
 // 默认不绑定；前光回归按主循环帧注入真实上键按下/抬起。
 // Unbound by default; frontlight regressions inject up-key press/release levels by loop frame.
-app_reader_key_action_t app_settings_reader_up_action(void) {return up_key_bound?APP_READER_KEY_FRONTLIGHT:APP_READER_KEY_NONE;}
+app_reader_key_action_t app_settings_reader_key_action(unsigned key) {return key_actions[key];}
+app_reader_key_action_t app_settings_reader_hold_action(void) {return key_hold_action;}
+app_reader_key_action_t app_settings_reader_double_action(void) {return key_double_action;}
+app_reader_key_action_t app_settings_reader_up_action(void) {return up_key_action;}
 esp_err_t board_read_up_key(bool* pressed) {*pressed=up_key_steps[step];return ESP_OK;}
-app_shutdown_style_t app_settings_shutdown_style(void) {return staged_shutdown ? APP_SHUTDOWN_STAGED : APP_SHUTDOWN_FULL;}
+app_shutdown_style_t app_settings_shutdown_style(void) {return light_only_shutdown ? APP_SHUTDOWN_LIGHT : staged_shutdown ? APP_SHUTDOWN_STAGED : APP_SHUTDOWN_FULL;}
 bool ttf_font_path_is_builtin(const char*p) {(void)p;return !font_due&&!saved_sd_font;}
 bool ttf_font_ready(void) {return true;}
 bool ttf_font_is_builtin(void) {return !sd_font;}
@@ -442,6 +458,7 @@ static app_redraw_t gesture(app_ctx_t*c,const ui_gesture_event_t*e) {
     if(e->type==UI_GESTURE_PRESS&&home_on_touch)c->request_return=true;
     return response;
 }
+static bool page_modal_visible(app_ctx_t *ctx) { (void)ctx; return true; }
 static app_redraw_t key(app_ctx_t*c,int k) {keys[k]++;if(home_on_key)c->request_return=true;return APP_REDRAW_NONE;}
 static app_redraw_t tick(app_ctx_t*c) {
     ticks++;tick_consumed[step]=c->consumed;
@@ -451,8 +468,23 @@ static app_redraw_t tick(app_ctx_t*c) {
     if(home_on_tick){c->request_return=true;home_on_tick=false;}
     return full_tick ? APP_REDRAW_FULL : APP_REDRAW_NONE;
 }
+// 模拟采样事务先开始、主循环读队列后才发布，再与抬手帧一起回放。
+// Model a sample that starts before the loop polls, publishes afterwards, and replays with the lift.
+static app_redraw_t queue_touch_lift(app_ctx_t *c) {
+    (void)c;
+    if (step == sample_count - 2) {
+        const int64_t now = esp_timer_get_time() / 1000;
+        touch_sampler_test_push(now - 1, 550, 950, 1);
+        touch_sampler_test_push(now + 5, 0, 0, 0);
+    }
+    return APP_REDRAW_NONE;
+}
 static app_redraw_t consume_power(app_ctx_t*c) {(void)c;lock_due=false;return APP_REDRAW_DONE;}
+static unsigned weather_background_polls, weather_background_cancels;
+static bool weather_widget_enabled, weather_background_pending;
 static void reset(void) {
+    weather_background_polls=weather_background_cancels=0;
+    weather_widget_enabled=weather_background_pending=false;
     screen_disabled=false;
     key_sampling=key_sampler_started=false;key_sampler_starts=key_sampler_enables=0;
 #ifdef POWER_KEY_SAMPLER_USB_TEST
@@ -462,7 +494,7 @@ static void reset(void) {
     network_test=false;network_cached=network_shown=false;memset(network_samples,0,sizeof(network_samples));
     battery_refreshes=battery_status_draws=0;memset(battery_samples,0,sizeof(battery_samples));
     quick_button_draws=quick_status_draws=quick_press_draws=quick_recent_requests=base_renders=0;
-    power_open_draws=power_controls_draws=power_final_draws=shutdowns=restarts=0;power_trigger_step=-1;staged_shutdown=false;
+    power_open_draws=power_controls_draws=power_final_draws=shutdowns=restarts=0;power_trigger_step=-1;staged_shutdown=light_only_shutdown=shutdown_draw_fails=shutdown_handoff_fails=false;
     last_du_area=(EpdRect){0};
     ble_enabled=saved_wifi=upload_busy=click_enabled=click_active=false;
     transfer_status=(wifi_transfer_status_t){0};
@@ -479,7 +511,10 @@ static void reset(void) {
     transfer_returns=false;
     haptic_pulses=haptic_stops=0;
     fl_ready=fl_on=false;fl_bri=40;fl_cct=50;fl_applies=fl_control_draws=fl_sweep_draws=fl_drag_pushes=fl_white_pushes=fl_gray_pushes=fl_key_gl=quick_gl_height=0;
-    up_key_bound=false;memset(up_key_steps,0,sizeof(up_key_steps));
+    for (unsigned i = 0; i < 3; ++i) key_actions[i] = APP_READER_KEY_NONE;
+    key_hold_action = key_double_action = up_key_action = APP_READER_KEY_NONE;
+    reader_up_presses = 0;
+    memset(up_key_steps,0,sizeof(up_key_steps));
     main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
     nav_arms=nav_draws=nav_full_arms=nav_area_draws=0;nav_armed=NULL;
     main_source_visible=main_target_visible=true;
@@ -767,7 +802,25 @@ static void test_auto_lock_network_sessions(void) {
     puts("PASS: network-only WiFi preserves 1/5/10-minute reader/page lock deadlines; file sessions and OTA remain protected");
 }
 
+static app_redraw_t weather_leave_on_tick(app_ctx_t *ctx) {
+    if (weather_background_pending) ctx->request_app = &app_book;
+    return APP_REDRAW_NONE;
+}
 int main(void) {
+    for (int policy=0;policy<5;++policy) {
+        reset();enable_main_tabs();time_step=1000000;
+        weather_widget_enabled=policy!=3;
+        start_second=policy!=1;start_book=policy==2;
+        if (policy==4) transfer_status=(wifi_transfer_status_t){.state=WIFI_TRANSFER_READY};
+        for(int i=0;i<15;++i)add(0,0,0,0);
+        run();assert((weather_background_polls>0)==(policy==0));
+    }
+    reset();enable_main_tabs();start_second=weather_widget_enabled=true;time_step=1000000;
+    second.on_tick=weather_leave_on_tick;
+    for(int i=0;i<15;++i)add(0,0,0,0);
+    run();assert(weather_background_polls==1 && weather_background_cancels==1);
+
+
     test_auto_lock_network_sessions();
     test_panel_key_replay();
     test_screen_touch_lock();
@@ -1166,7 +1219,7 @@ int main(void) {
     // 真实上键关灯后，手动/自动锁屏的快捷层重置都不得把开灯缓存写回设置。
     // After a real up-key switch-off, manual/idle lock resets must not persist the stale on preview.
     for (unsigned idle = 0; idle < 2; ++idle) {
-        reset();fl_ready=fl_on=up_key_bound=true;time_step=100000;
+        reset();fl_ready=fl_on=true;up_key_action=APP_READER_KEY_FRONTLIGHT;time_step=100000;
         // 上键轮询时钟跨 app_loop_run 保留，后续场景必须继续向前。
         // Up-key polling retains its clock across app_loop_run, so later scenarios must advance it.
         time_offset=(int64_t)(idle+1)*1000000000000LL;
@@ -1201,10 +1254,21 @@ int main(void) {
     run();assert(!idle_locks);
     touch_sampler_test_enable(false);
     puts("touch replay: the timestamp stays full width across the 49.7-day wrap and never fakes an idle timeout");
+    // 实时取新帧或复用按下帧时都不能把手势时间推到积压样本之后。
+    // Neither a fresh nor a reused live press may advance gesture time past a buffered sample.
+    for (int reuse = 0; reuse <= 1; ++reuse) {
+        reset();first.on_gesture=gesture;first.on_tick=queue_touch_lift;
+        touch_sampler_test_enable(true);
+        touch_sampler_test_push(5,550,950,1);
+        for (int i = 0; i < 2 + reuse; ++i) add(0,0,0,0);
+        run();
+        assert(events[UI_GESTURE_PRESS]==1 && events[UI_GESTURE_CANCEL]==0 && events[UI_GESTURE_TAP]==1);
+        touch_sampler_test_enable(false);
+    }
     // 反馈必须早于页面保存/后台收尾；下一页与自动休眠不显示主动锁屏徽标。
     // Acknowledgement precedes saves/joins; consumed page turns and idle sleep omit it.
     for(int policy=0;policy<3;++policy){
-        reset();main_fast=policy==1;main_water=policy==2;feedback_enabled=true;
+        reset();main_fast=policy==1;main_water=policy==2;feedback_enabled=true;light_only_shutdown=true;
         first.on_before_lock=before_lock;lock_due=true;time_step=3000000;
         add(0,0,0,0);add(0,0,0,0);run();
         assert(lock_badges==1&&lock_feedback_calls==1&&before_locks==1&&idle_locks==1);
@@ -1221,6 +1285,16 @@ int main(void) {
     reset();power_trigger_step=1;time_step=3000000;staged_shutdown=true;
     add(0,0,0,0);add(0,0,0,0);add(UI_POWER_THUMB_X,UI_POWER_THUMB_Y,1,0);add(UI_POWER_THUMB_X+UI_POWER_SLIDE_RANGE,UI_POWER_THUMB_Y,1,0);add(0,0,0,0);add(0,0,0,0);run();
     assert(power_open_draws==1&&shutdowns==1&&power_final_draws==1&&!restarts&&!idle_locks&&!wake_clean_requests);
+    // 推屏失败不下电；断电失败重新绘制原页并继续响应，不重新退出/打开页面。
+    // Presentation failure blocks off; failed handoff repaints and resumes the same page without reopening it.
+    for(unsigned fault=0;fault<2;++fault){
+        reset();power_trigger_step=1;time_step=3000000;
+        shutdown_draw_fails=fault==0;shutdown_handoff_fails=fault==1;
+        add(0,0,0,0);add(0,0,0,0);add(UI_POWER_THUMB_X,UI_POWER_THUMB_Y,1,0);
+        add(UI_POWER_THUMB_X+UI_POWER_SLIDE_RANGE,UI_POWER_THUMB_Y,1,0);add(0,0,0,0);add(0,0,0,0);run();
+        assert(power_final_draws==1&&shutdowns==(int)fault&&!restarts&&!idle_locks);
+        assert(base_renders==2&&!exits&&enters==1&&ticks>=2);
+    }
     reset();power_trigger_step=1;time_step=3000000;
     add(0,0,0,0);add(0,0,0,0);add(UI_POWER_RESTART_X,UI_POWER_BUTTON_Y,1,0);add(0,0,0,0);run();
     assert(restarts==1&&!shutdowns&&power_final_draws==1);
@@ -1273,6 +1347,62 @@ int main(void) {
     add(0,0,0,0);add(240,1500,1,0);add(240,1500,1,0);add(240,1500,1,0);add(0,0,0,0);run();assert(root_key_taps==0&&fulls==2&&!keys[1]);
     reset();enable_main_tabs();first.owns_keys=true;first.on_main_key=root_key_tap;first.on_tick=root_disappears;root_key_taps=0;time_step=100000;
     add(0,0,0,0);add(240,1500,1,0);add(240,1500,1,0);add(0,0,0,0);run();assert(root_key_taps==0&&!keys[1]);
+    // 非阅读页的全局绑定抢占同一个手势，但不夺走未绑定手势。
+    // Outside reading, global bindings take only their mapped gesture; unmapped gestures fall through.
+    reset();start_second=true;second.owns_keys=true;time_step=100000;
+    key_actions[UI_KEY_1]=APP_READER_KEY_HOME;
+    add(0,0,0,0);add(80,1500,1,0);add(0,0,0,0);run();
+    assert(enters==2&&!keys[UI_KEY_1]);
+    reset();first.owns_keys=true;time_step=100000;fl_ready=true;
+    key_actions[UI_KEY_3]=APP_READER_KEY_FRONTLIGHT;
+    add(0,0,0,0);add(400,1500,1,0);add(0,0,0,0);run();
+    assert(fl_on&&fl_applies==1&&!keys[UI_KEY_3]);
+    reset();first.owns_keys=true;time_step=100000;
+    key_actions[UI_KEY_2]=APP_READER_KEY_REFRESH;
+    add(0,0,0,0);add(240,1500,1,0);add(0,0,0,0);run();
+    assert(fulls==2&&!keys[UI_KEY_2]);
+    reset();enable_main_tabs();start_second=true;second.owns_keys=true;time_step=300000;
+    key_hold_action=APP_READER_KEY_HOME;
+    add(0,0,0,0);add(240,1500,1,0);add(240,1500,1,0);add(240,1500,1,0);add(0,0,0,0);run();
+    assert(enters==2&&fulls==1&&!keys[UI_KEY_2]);
+    for(int replay=0;replay<2;++replay) {
+        reset();first.owns_keys=true;time_step=100000;fl_ready=true;
+        key_actions[UI_KEY_2]=APP_READER_KEY_REFRESH;
+        key_double_action=APP_READER_KEY_FRONTLIGHT;
+        touch_sampler_test_enable(replay);
+        if(replay) {
+            touch_sampler_test_push(100,240,1500,1);touch_sampler_test_push(150,0,0,0);
+            touch_sampler_test_push(220,240,1500,1);touch_sampler_test_push(270,0,0,0);
+        }
+        add(0,0,0,0);add(replay?0:240,1500,!replay,0);add(0,0,0,0);
+        add(replay?0:240,1500,!replay,0);add(0,0,0,0);run();
+        touch_sampler_test_enable(false);
+        assert(fl_on&&fl_applies==1&&fulls==1&&!keys[UI_KEY_2]);
+    }
+    reset();first.owns_keys=true;time_step=100000;fl_ready=true;
+    key_double_action=APP_READER_KEY_FRONTLIGHT;
+    add(0,0,0,0);add(240,1500,1,0);
+    for(unsigned i=0;i<7;++i)add(0,0,0,0);
+    run();assert(!fl_applies&&keys[UI_KEY_2]==1);
+    for(unsigned reader=0;reader<2;++reader) {
+        reset();start_book=reader;reader_body=reader;time_step=100000;
+        up_key_action=APP_READER_KEY_REFRESH;up_key_steps[3]=true;
+        for(unsigned i=0;i<7;++i)add(0,0,0,0);
+        run();assert(fulls==2-(int)reader&&reader_up_presses==(int)reader);
+    }
+    reset();first.holds_pmu=true;time_step=100000;
+    up_key_action=APP_READER_KEY_REFRESH;up_key_steps[3]=true;
+    for(unsigned i=0;i<7;++i)add(0,0,0,0);
+    run();assert(fulls==1);
+    reset();first.owns_keys=true;first.modal_input_owned=page_modal_visible;time_step=100000;fl_ready=true;
+    key_actions[UI_KEY_1]=APP_READER_KEY_HOME;
+    key_actions[UI_KEY_2]=APP_READER_KEY_REFRESH;
+    key_actions[UI_KEY_3]=APP_READER_KEY_FRONTLIGHT;
+    up_key_action=APP_READER_KEY_REFRESH;up_key_steps[3]=true;
+    add(0,0,0,0);add(80,1500,1,0);add(0,0,0,0);add(240,1500,1,0);
+    add(0,0,0,0);add(400,1500,1,0);add(0,0,0,0);run();
+    assert(enters==1&&fulls==1&&!fl_applies&&keys[UI_KEY_1]==1&&keys[UI_KEY_2]==1&&keys[UI_KEY_3]==1);
+    puts("PASS: global key mappings on ordinary pages, double-click suppression, native fallback, and reader/PMU ownership");
     puts("app_loop: 50 scheduler scenarios passed, including automatic lock, save callback, input reset and busy guards");
     return 0;
 }
@@ -1288,9 +1418,15 @@ uint32_t ble_pt_input_serial(void){return 0;}
 
 void crash_note_log(void){}
 
+void app_weather_background_poll(void) { ++weather_background_polls; weather_background_pending = true; }
+void app_weather_background_pause(void) {
+    if (weather_background_pending) { ++weather_background_cancels; weather_background_pending = false; }
+}
+bool app_home_has_widget(app_home_widget_t widget) { return weather_widget_enabled && widget == APP_HOME_WIDGET_WEATHER; }
 void app_time_service_poll(bool idle) { (void)idle; }
 void app_time_service_cancel(void) {}
 void pico_ota_auto_poll(bool idle) { (void)idle; }
+void pico_ota_auto_request_cancel(void) {}
 void pico_ota_auto_cancel(void) {}
 bool pico_ota_auto_pending(void) { return auto_update_pending; }
 void pico_ota_auto_acknowledge(void) { auto_update_pending=false; ++auto_update_acks; }
@@ -1300,16 +1436,22 @@ bool app_device_settings_offer_update(bool already_in_settings) { (void)already_
 void rp_boot_mark(const char *name) { (void)name; }
 
 void ui_avatar_invalidate(void) {}
+bool home_library_quiesce(unsigned timeout){(void)timeout;return true;}
 bool book_cover_jobs_quiesce(unsigned timeout){(void)timeout;return true;}
 void book_lock_collage_invalidate(void) {}
 
 bool ble_pt_connected(void) { return false; }
+const char *ble_pt_enable_block_reason(void) { return NULL; }
 
 // 调度回归链接真实生命周期服务；失败组合由独立生命周期测试控制。
 // Scheduler regressions link the actual lifecycle service; dedicated lifecycle tests control failure combinations.
-bool wifi_transfer_pause_for_sleep(void) { return true; }
+bool network_service_pause_for_sleep(void) { return true; }
+void network_service_resume_after_sleep(void) {}
+bool shutdown_wallpaper_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 bool lock_images_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 void lock_images_close(void){}
 bool ui_avatar_quiesce(unsigned timeout) { (void)timeout; return true; }
 esp_err_t ble_pt_stop(uint32_t timeout) { (void)timeout; return ESP_OK; }
 esp_err_t ble_pt_stop_for_sleep(uint32_t timeout) { (void)timeout; return ESP_OK; }
+
+bool app_device_settings_navigation_busy(void) { return false; }

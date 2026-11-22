@@ -5,9 +5,11 @@
  */
 #include "lock_style_images.h"
 #include "image_decode.h"
+#include "ui_image_dither.h"
 #include "book_lock_bookmark.h"
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,8 +26,10 @@
 #define CACHE_DIR LOCK_THUMB_ROOT "/thumbnails"
 #define RAM_SLOTS 12
 #define DISK_SLOTS 128
-#define CACHE_VERSION 2
+#define BOOKMARK_CACHE_VERSION 2
+#define WALLPAPER_CACHE_VERSION 4
 #define CACHE_MAGIC UINT32_C(0x4c544831)
+#define LOCK_SCAN_INITIAL_CAPACITY 64u
 typedef struct {
     uint32_t magic, version, width, height, bookmark, bytes;
     uint64_t key, checksum;
@@ -76,7 +80,7 @@ static bool identity(const char *path, bool bookmark, bool large, cache_header_t
         (strcasecmp(ext,".png") && strcasecmp(ext,".jpg") && strcasecmp(ext,".jpeg")) ||
         stat(path,&st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t)st.st_size > BOOK_IMAGE_FILE_MAX) return false;
     uint64_t key=source_key(path,&st);
-    *h=(cache_header_t){.magic=CACHE_MAGIC,.version=CACHE_VERSION,.width=large?342:160,
+    *h=(cache_header_t){.magic=CACHE_MAGIC,.version=bookmark?BOOKMARK_CACHE_VERSION:WALLPAPER_CACHE_VERSION,.width=large?342:160,
         .height=large?608:284,.bookmark=bookmark,.key=key};
     h->bytes=h->width*h->height/2;
     // 128个直接映射槽位限制磁盘增长；完整身份校验使碰撞只导致重建，不会串图。
@@ -121,8 +125,19 @@ static uint8_t *load_image(const char *path,bool bookmark,bool large,unsigned ge
     bool ok=gray&&!cancelled(&generation) && (bookmark
         ? book_lock_bookmark_thumbnail(path,h.width,h.height,gray,cancelled,&generation)
         : book_image_file_grayscale_cancel(path,!strcasecmp(ext,".png"),h.width,h.height,gray,cancelled,&generation));
-    if(ok) for(unsigned i=0;i<h.width*h.height;i+=2)
-        pixels[i/2]=(uint8_t)(((gray[i]+8u)/17u)|(((gray[i+1]+8u)/17u)<<4));
+    if (ok && bookmark) {
+        for (unsigned i = 0; i < h.width * h.height; i += 2)
+            pixels[i / 2] = (uint8_t)(((gray[i] + 8u) / 17u) | (((gray[i + 1] + 8u) / 17u) << 4));
+    } else if (ok) {
+        for (unsigned y = 0; y < h.height; ++y) {
+            for (unsigned x = 0; x < h.width; x += 2) {
+                size_t i = (size_t)y * h.width + x;
+                unsigned lo = ui_image_dither_gray(ui_image_wallpaper_tone(gray[i]), x, y) / 17u;
+                unsigned hi = ui_image_dither_gray(ui_image_wallpaper_tone(gray[i + 1]), x + 1, y) / 17u;
+                pixels[i / 2] = (uint8_t)(lo | (hi << 4));
+            }
+        }
+    }
     free(gray);
     // 不发布解码中被替换的文件，也不让取消/半写结果成为缓存。
     // Reject sources replaced during decoding and never cache cancelled/partial output.
@@ -135,28 +150,42 @@ static int compare_items(const void *a,const void *b) {
     const lock_image_item_t *x=a,*y=b;
     int order=strcasecmp(x->name,y->name);return order?order:strcmp(x->path,y->path);
 }
+static bool scan_grow(lock_image_item_t **items,size_t *capacity,int count) {
+    if ((size_t)count<*capacity) return true;
+    if (count==INT32_MAX||*capacity>SIZE_MAX/(2u*sizeof(**items))) return false;
+    size_t next=*capacity*2u;
+    lock_image_item_t *grown=heap_caps_realloc(*items,next*sizeof(**items),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if (!grown) return false;
+    memset(grown+*capacity,0,(next-*capacity)*sizeof(*grown));
+    *items=grown;*capacity=next;return true;
+}
 static lock_image_item_t *scan_images(unsigned generation,int *count) {
     *count=0;
-    lock_image_item_t *items=heap_caps_calloc(LOCK_IMAGES_MAX,sizeof(*items),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    size_t capacity=LOCK_SCAN_INITIAL_CAPACITY;
+    lock_image_item_t *items=heap_caps_calloc(capacity,sizeof(*items),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if(!items)return NULL;
     const char *roots[]={"/sdcard/pictures","/sdcard/images","/sdcard"};
     for(unsigned r=0;r<3&&!cancelled(&generation);++r){
         DIR *dir=opendir(roots[r]);if(!dir)continue;
         struct dirent *e;
-        while(*count<LOCK_IMAGES_MAX&&!cancelled(&generation)&&(e=readdir(dir))){
+        bool complete=true;
+        while(!cancelled(&generation)&&(e=readdir(dir))){
             const char *ext=strrchr(e->d_name,'.');
             if(e->d_name[0]=='.'||!ext||(strcasecmp(ext,".png")&&strcasecmp(ext,".jpg")&&strcasecmp(ext,".jpeg")))continue;
-            lock_image_item_t *item=&items[*count];
-            if(snprintf(item->path,sizeof(item->path),"%s/%s",roots[r],e->d_name)>=(int)sizeof(item->path))continue;
+            lock_image_item_t candidate={0};
+            if(snprintf(candidate.path,sizeof(candidate.path),"%s/%s",roots[r],e->d_name)>=(int)sizeof(candidate.path))continue;
             struct stat st;
-            if(stat(item->path,&st)||!S_ISREG(st.st_mode)||st.st_size<=0||(uint64_t)st.st_size>BOOK_IMAGE_FILE_MAX)continue;
-            item->key=source_key(item->path,&st);
-            snprintf(item->name,sizeof(item->name),"%.*s",(int)sizeof(item->name)-1,e->d_name);
-            size_t length=strlen(item->name);
-            if(strlen(e->d_name)>length){while(length&&((unsigned char)e->d_name[length]&0xc0)==0x80)--length;item->name[length]=0;}
+            if(stat(candidate.path,&st)||!S_ISREG(st.st_mode)||st.st_size<=0||(uint64_t)st.st_size>BOOK_IMAGE_FILE_MAX)continue;
+            candidate.key=source_key(candidate.path,&st);
+            snprintf(candidate.name,sizeof(candidate.name),"%.*s",(int)sizeof(candidate.name)-1,e->d_name);
+            size_t length=strlen(candidate.name);
+            if(strlen(e->d_name)>length){while(length&&((unsigned char)e->d_name[length]&0xc0)==0x80)--length;candidate.name[length]=0;}
+            if(!scan_grow(&items,&capacity,*count)){complete=false;break;}
+            items[*count]=candidate;
             ++*count;
         }
         closedir(dir);
+        if(!complete)break;
     }
     qsort(items,*count,sizeof(*items),compare_items);
     return items;

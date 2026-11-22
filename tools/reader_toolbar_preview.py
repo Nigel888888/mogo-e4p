@@ -272,7 +272,7 @@ static inline tinfl_status tinfl_decompress(tinfl_decompressor *s,const unsigned
                             '-Wno-unused-function', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                             '-I'+str(work), '-I'+str(ROOT/'main'), '-I'+str(ROOT/'main/font'),
                             '-I'+str(ROOT/'main/ui'), '-I'+str(ROOT/'main/settings'), '-I'+str(ROOT/'main/diagnostics')]
-        units = [work/'test.c', work/'assets.c', ROOT/'main/book/book_layout.c'] + [ROOT/'main/font'/name for name in (
+        units = [work/'test.c', work/'assets.c', ROOT/'main/book/book_layout.c', ROOT/'main/book/book_hyphen_en.c'] + [ROOT/'main/font'/name for name in (
             'ttf_font.c', 'ttf_font_source.c', 'ttf_block_cache.c', 'ttf_glyph_cache.c', 'ui_font.c', 'ui_hanzi.c')]
         linker = '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections'
         subprocess.run(flags+list(map(str, units))+[linker, '-lm', '-lz', '-o', str(work/'test')], env=env, check=True)

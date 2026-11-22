@@ -15,7 +15,20 @@ def unit(assets=None):
     code=native.unit().split('typedef struct {char path[288];',1)[0]
     code+='\n#define HOST_ASSETS '+json.dumps(str(assets.resolve()) if assets else '')+'\n'
     code+='\n'+re.sub(r'^#(?:include|pragma)[^\n]*\n','',(ROOT/'main/services/lock_style_images.h').read_text(),flags=re.M)
+    settings_header=(ROOT/'main/settings/settings.h').read_text()
+    code+='\n'+settings_header[settings_header.index('typedef enum {\n    APP_OFF_SYSTEM'):settings_header.index('/// 与浅睡锁屏独立')]
     code+=r'''
+static app_shutdown_wallpaper_t off_value={.show_hint=1};
+static bool off_job,off_ready,off_result_ok=true,off_commit_failure;
+static unsigned off_requests,off_cancels;
+static const app_shutdown_wallpaper_t *app_settings_shutdown_wallpaper(void){return &off_value;}
+static bool app_settings_set_shutdown_wallpaper(const app_shutdown_wallpaper_t *v){if(off_commit_failure)return false;off_value=*v;return true;}
+static bool mm_free(void *p){free(p);return true;}
+static void shutdown_wallpaper_cancel(void){++off_cancels;off_job=off_ready=false;}
+static app_shutdown_wallpaper_t off_candidate;
+static void shutdown_wallpaper_request(const app_shutdown_wallpaper_t *v,bool rebuild){off_candidate=*v;off_candidate.image_id=42;off_job=true;off_ready=false;++off_requests;(void)rebuild;}
+static bool shutdown_wallpaper_take(app_shutdown_wallpaper_t *v,bool *ok,uint8_t **thumb){if(!off_job||!off_ready)return false;off_job=false;*v=off_candidate;*ok=off_result_ok;*thumb=*ok?malloc(160*284/2):NULL;if(*thumb)memset(*thumb,0x99,160*284/2);return true;}
+static const char *shutdown_wallpaper_error(void){return "TF卡未就绪";}
 #define APP_BOOKMARK_MODE_CROP 0
 static unsigned bookmark_prepares;static bool bookmark_prepare_crop;
 static void book_lock_bookmark_prepare_mode(const char *path,bool crop_to_fill){
@@ -143,12 +156,40 @@ int main(int argc,char **argv){
    if(tab==1||tab==4)assert(tap(36,762));
    ui_lock_style_render(fb);char file[1024];snprintf(file,sizeof(file),"%s/inline-%d-%u.raw",argv[1],tab,font_percent);save(file,fb);
   }
-  assert(tap(246,440)&&s_tab==4);unsigned before=writes;
+  off_value.fit=0;unsigned lock_before=selected_style,writes_before=writes;
+  assert(tap(352,148)&&s_off_tab&&selected_style==lock_before&&writes==writes_before);
+  assert(tap(36,258)&&s_off_browse==APP_OFF_CUSTOM);
+  assert(tap(36,758)&&off_job&&selected_style==lock_before);
+  off_ready=true;ui_lock_style_tick(12000);pump();
+  assert(off_value.style==APP_OFF_CUSTOM&&off_value.image_id==42&&!s_off_loading);
+  ui_lock_style_render(fb);char off_file[1024];snprintf(off_file,sizeof(off_file),"%s/shutdown-custom-%u.raw",argv[1],font_percent);save(off_file,fb);
+  unsigned ticket_before=ticket_choice,calendar_before=calendar_choice;
+  for(int mode=1;mode<5;++mode){
+   EpdRect r=off_style_rect(mode);assert(tap(r.x,r.y)&&s_off_browse==off_values[mode]);
+   if(mode==1||mode==3){
+    unsigned original=off_value.style;assert(original!=off_values[mode]);
+    assert(tap(352,762)&&off_value.style==off_values[mode]);
+    if(mode==1)assert(off_value.ticket_background==1);else assert(off_value.calendar_style==1);
+    off_commit_failure=true;assert(tap(36,762));off_commit_failure=false;
+    assert((mode==1?off_value.ticket_background:off_value.calendar_style)==1);
+   }else assert(off_value.style==off_values[mode]);
+   assert(ticket_choice==ticket_before&&calendar_choice==calendar_before&&selected_style==lock_before);
+   ui_lock_style_render(fb);snprintf(off_file,sizeof(off_file),"%s/shutdown-%d-%u.raw",argv[1],mode,font_percent);save(off_file,fb);
+  }
+  assert(tap(36,258)&&off_value.style==APP_OFF_SYSTEM);
+  unsigned hint=off_value.show_hint;assert(tap(524,623)&&off_value.show_hint!=hint);
+  assert(tap(528,110)&&off_job);off_commit_failure=true;off_ready=true;ui_lock_style_tick(12500);
+  assert(off_value.fit==0&&strstr(s_notice,"设置保存失败")&&strstr(s_notice,"保留原选择"));off_commit_failure=false;
+  assert(tap(36,758)&&off_job);off_result_ok=false;off_ready=true;ui_lock_style_tick(12600);
+  assert(off_value.style==APP_OFF_SYSTEM&&strstr(s_notice,"TF卡未就绪"));off_result_ok=true;
+  assert(tap(36,758)&&off_job);assert(tap(36,148)&&!s_off_tab&&!off_job);
+  assert(selected_style==lock_before&&writes==writes_before);
+  assert(tap(246,468)&&s_tab==4);unsigned before=writes;
   assert(!tap(35,762)&&!tap(648,762)&&writes==before);
   assert(tap(352,762)&&selected_style==4&&calendar_choice==1);
   failed_save=true;assert(tap(36,762)&&calendar_choice==1&&strstr(s_notice,"保存失败"));failed_save=false;
-  assert(tap(246,202)&&s_tab==1);assert(tap(352,762)&&selected_style==0&&ticket_choice==1);
-  assert(tap(36,202)&&s_tab==0);assert(tap(528,110)&&wallpaper_mode==1);
+  assert(tap(246,258)&&s_tab==1);assert(tap(352,762)&&selected_style==0&&ticket_choice==1);
+  assert(tap(36,258)&&s_tab==0);assert(tap(528,110)&&wallpaper_mode==1);
   failed_save=true;assert(tap(398,110)&&wallpaper_mode==1&&strstr(s_notice,"保存失败"));failed_save=false;
   assert(tap(398,110)&&wallpaper_mode==0);assert(tap(36,758)&&selected_style==1);
   before=writes;assert(hold(36,758)&&s_preview==0&&writes==before);ui_lock_style_render(fb);
@@ -161,7 +202,7 @@ int main(int argc,char **argv){
   assert(tap(246,758)&&s_pending==-1&&strstr(wallpaper,"04.png"));before=writes;ui_lock_style_tick(3500);assert(writes==before);
   images_fail=true;assert(tap(36,758)&&strstr(s_notice,"无法加载")&&writes==before);images_fail=false;
   images_ready=false;assert(tap(36,758)&&s_pending==3);images_ready=true;ui_lock_style_tick(4000);assert(selected_style==1&&strstr(wallpaper,"03.png"));
-  assert(tap(36,440)&&s_tab==3);assert(image_count()==7);unsigned prepared=bookmark_prepares;
+  assert(tap(36,468)&&s_tab==3);assert(image_count()==7);unsigned prepared=bookmark_prepares;
   assert(tap(36,758)&&selected_style==3&&bookmark_prepares==prepared+1);
   assert(tap(528,110)&&bookmark_mode==1);
   assert(bookmark_prepares==prepared+2&&!bookmark_prepare_crop);
@@ -169,7 +210,7 @@ int main(int argc,char **argv){
   assert(tap(398,110)&&bookmark_mode==0&&bookmark_prepares==prepared+3&&bookmark_prepare_crop);
   for(int i=0;i<8;++i)ui_lock_style_tick(5000+i*200);
   ++revision;assert(!ui_lock_style_tick(7000)); // 不可见预读完成不得刷新。 / Completed invisible prefetch must not refresh.
-  assert(tap(36,202));images_ready=false;complete_during_state=true;
+  assert(tap(36,258));images_ready=false;complete_during_state=true;
   request_images();assert(ui_lock_style_tick(7300)); // 状态快照与最后完成竞争时仍能观察到结果。 / Final worker completion racing the snapshot stays observable.
   ui_lock_style_media_lost();assert(!s_items&&!s_count&&s_preview==-1&&s_pending==-1);ui_lock_style_render(fb);
   ui_lock_style_media_ready();ui_lock_style_tick(6000);assert(s_count==7);ui_lock_style_close();

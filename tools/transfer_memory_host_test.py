@@ -11,6 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     production = (ROOT / "components/wifi_transfer/wifi_transfer.c").read_text()
+    stage_prefix = production[production.index("#define TRANSFER_MEDIA_NAME_MAX "):
+                              production.index("static size_t book_upload_name_limit(")]
+    stage_check = production[production.index("static bool book_staging_name("):
+                             production.index("/* ---- 请求与存储")]
     send_json = production[production.index("static esp_err_t send_json("):
                            production.index("static esp_err_t file_response(")]
     listing = production[production.index("#define TRANSFER_FILE_PAGE_SIZE"):
@@ -22,6 +26,7 @@ def main():
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -82,7 +87,7 @@ static esp_err_t httpd_resp_sendstr(httpd_req_t *req, const char *body) {
     ++responses; return ESP_OK;
 }
 '''
-    harness += send_json + listing
+    harness += stage_prefix + "\n" + stage_check + send_json + listing
     harness += r'''
 int main(int argc, char **argv) {
     char path[512];

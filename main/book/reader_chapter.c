@@ -59,24 +59,10 @@ esp_err_t reader_chapter_read(reader_chapter_t *out, size_t chapter, const char 
             }
         }
         size_t skip_blocks = 0;
-        size_t heading_blocks = 0;
-        if (book_kind() == BOOK_KIND_TXT) {
-            // TXT 第一章有时从文件零点开始，标题前带分隔线；仅把确认的装饰行带过题头，
-            // 普通序言仍留在正文中，避免把未知 Part 的开场误当标题。
-            // A TXT first chapter may start at byte zero with separator lines before its title.
-            // Fold only confirmed decorative lines; ordinary prefaces stay in the body.
-            while (skip_blocks < out->content.count && skip_blocks < 4 &&
-                   out->content.blocks[skip_blocks].auxiliary) ++skip_blocks;
-            if (skip_blocks == out->content.count ||
-                !(out->content.blocks[skip_blocks].heading ||
-                  out->content.blocks[skip_blocks].chapter_start)) skip_blocks = 0;
-        }
         // 最多看四个块：标题可能被拆成"第一章"、"出发"、"——副标题"这样几块。
         // Up to four blocks: a heading can arrive split across several.
-        while (skip_blocks < out->content.count && heading_blocks < 4 &&
-               (out->content.blocks[skip_blocks].heading ||
-                out->content.blocks[skip_blocks].chapter_start) &&
-               out->content.blocks[skip_blocks].image < 0) {
+        while (skip_blocks < out->content.count && skip_blocks < 4 &&
+               out->content.blocks[skip_blocks].heading && out->content.blocks[skip_blocks].image < 0) {
             char body_heading[128] = {0};
             size_t len = out->content.blocks[skip_blocks].len;
             if (len >= sizeof(body_heading)) break;
@@ -85,14 +71,7 @@ esp_err_t reader_chapter_read(reader_chapter_t *out, size_t chapter, const char 
             const char *trimmed = body_heading;
             while (*trimmed == ' ' || *trimmed == '\t') ++trimmed;
             if (!heading_text_matches(trimmed, toc_title, heading, label)) break;
-            ++skip_blocks; ++heading_blocks;
-        }
-        if (!heading_blocks && book_kind() == BOOK_KIND_TXT) {
-            skip_blocks = 0;
-            heading[0] = label[0] = 0;
-        } else if (heading_blocks && book_kind() == BOOK_KIND_TXT) {
-            while (skip_blocks < out->content.count && out->content.blocks[skip_blocks].auxiliary)
-                ++skip_blocks;
+            ++skip_blocks;
         }
         if (skip_blocks) out->lead_skip = skip_blocks < out->content.count ? out->content.blocks[skip_blocks].offset : out->content.len;
         // 首块是插图时不预留题头：那页整页留给插图，标题在它后面才排。
@@ -103,7 +82,7 @@ esp_err_t reader_chapter_read(reader_chapter_t *out, size_t chapter, const char 
         if (skip_blocks < out->content.count && out->content.blocks[skip_blocks].image >= 0) {
             out->lead_skip = 0;
             out->lead_height = 0;
-        } else if (book_kind() != BOOK_KIND_TXT || heading_blocks) {
+        } else {
             out->lead_height = body_height > (int)heading_height
                 ? heading_height : 0;
         }

@@ -60,6 +60,17 @@ enum EpdDrawError e0470_page_turn_with_waveform_compact(
     const EpdWaveform* waveform, unsigned bands
 );
 
+/// 阅读左右揭页可在原节拍内补强正文带外不变的纯黑和纯白，不回写外侧帧缓冲。
+/// Horizontal reader reveals can reinforce stable black and white outside the body within existing ticks, without committing outside buffers.
+enum EpdDrawError e0470_page_turn_reader(EpdiyHighlevelState* hl, EpdRect body,
+    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned chrome_pushes);
+
+/// 同一个揭页内更新指定栏位；正文为逻辑坐标，栏位为已校验的原生坐标，零矩形跳过。
+/// Present specified bars within one reveal; body is logical, bars are validated native bounds, and zero rectangles are skipped.
+/// scanned 区分开扫前拒绝与扫描失败。/ scanned distinguishes pre-scan rejection from output failure.
+enum EpdDrawError e0470_page_turn_reader_joined(EpdiyHighlevelState* hl, EpdRect body,
+    e0470_turn_dir_t dir, const EpdWaveform* waveform, unsigned chrome_pushes, const EpdRect chrome[2], bool* scanned);
+
 /// 倒置竖屏的上下柔和区与中间校准区同时逐相输出；区域须全逻辑宽、32列对齐。
 /// Inverted portrait: output soft chrome and calibrated middle art in the same phases; full logical width and 32-column alignment are required.
 /// 不错相、不改灰阶序列；仅临时2048B PSRAM，成功后一次提交真实back，失败留给调用方恢复。

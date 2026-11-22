@@ -30,6 +30,8 @@ typedef struct {
 
 static inline void network_service_init(void) {}
 static inline void network_service_poll(void) {}
+bool network_service_pause_for_sleep(void);
+void network_service_resume_after_sleep(void);
 
 static inline void network_service_get_status(network_status_t *out) {
     wifi_transfer_status_t wifi = {0};

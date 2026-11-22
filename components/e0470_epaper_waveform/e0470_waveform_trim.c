@@ -10,29 +10,21 @@
 
 #include "e0470_waveform_trim.h"
 
-#include <string.h>
-
-#include "epdiy.h"
+#include <stddef.h>
 
 #define MAX_PHASES 64
 
 // 表的字节布局：data[frame][to][from/4]，每字节高位起 4 个 2bit 动作。
 // / Table layout: data[frame][to][from/4], four 2-bit actions MSB-first.
-static inline int lut_get(const uint8_t (*data)[16][4], int f, int to, int from) {
-    return (data[f][to][from / 4] >> (6 - 2 * (from % 4))) & 3;
+static void unpack_sequence(
+    const uint8_t (*data)[16][4], int phases, int to, int group, int shift, uint8_t *seq
+) {
+    for (int f = 0; f < phases; f++) seq[f] = (uint8_t)((data[f][to][group] >> shift) & 3);
 }
 
-static inline void lut_set(uint8_t (*data)[16][4], int f, int to, int from, int v) {
-    const int shift = 6 - 2 * (from % 4);
-    data[f][to][from / 4] = (uint8_t)((data[f][to][from / 4] & ~(3 << shift)) | (v << shift));
-}
-
-// 一对 (from, to) 裁完之后的序列，先攒起来，等知道最长的一条再统一右对齐。
-// / Hold each trimmed (from, to) sequence until the longest is known, then right-align.
 typedef struct {
-    uint8_t seq[MAX_PHASES];
-    int len;
-} trimmed_seq_t;
+    int keep_e, keep_s, tail_start, len;
+} trimmed_span_t;
 
 static int run_length(const uint8_t* seq, int start, int end, int value) {
     int n = 0;
@@ -40,14 +32,9 @@ static int run_length(const uint8_t* seq, int start, int end, int value) {
     return n;
 }
 
-// 把一条序列按骨架拆开再拼回去。to=15 的饱和极性是白（0b10），其余是黑（0b01），
-// 擦除极性总是饱和的反面。没有擦除段（例如从白压到黑）的序列 e=0，逻辑照样成立。
-// / Split a sequence on the skeleton and rebuild. to=15 sat is white (0b10),
-// else black (0b01); erase is the opposite of sat. No erase (e.g. white→black)
-// means e=0; the same logic still holds.
-static void trim_one(
-    const uint8_t* seq, int phases, int to, const e0470_trim_t* trim, trimmed_seq_t* out
-) {
+// to=15 的饱和极性是白（0b10），其余是黑（0b01）；擦除极性总是反面。
+// Saturation is white (0b10) for to=15, otherwise black (0b01); erase is the opposite.
+static trimmed_span_t trim_one(const uint8_t* seq, int phases, int to, const e0470_trim_t* trim) {
     const int sat = to == 15 ? 2 : 1;
     const int erase = to == 15 ? 1 : 2;
 
@@ -55,55 +42,64 @@ static void trim_one(
     while (a < phases && seq[a] == 0) a++;
     int z = phases;
     while (z > a && seq[z - 1] == 0) z--;
-    out->len = 0;
-    if (a >= z) return;  // 全保持（GL16 的白到白） / All-hold (GL16 white-to-white)
+    if (a == z) return (trimmed_span_t){0};  // 全保持 / All-hold
 
-    int e = run_length(seq, a, z, erase);
-    int s = run_length(seq, a + e, z, sat);
-    int keep_e = e < trim->erase_max ? e : trim->erase_max;
+    const int e = run_length(seq, a, z, erase);
+    const int s = run_length(seq, a + e, z, sat);
+    const int keep_e = e < trim->erase_max ? e : trim->erase_max;
     const int want_cut = to == 15 ? trim->white_sat_cut : trim->sat_cut;
     int cut_s = want_cut < s - 1 ? want_cut : s - 1;
     if (cut_s < 0) cut_s = 0;
-    int keep_s = s - cut_s;
-
-    int n = 0;
-    for (int i = 0; i < keep_e; i++) out->seq[n++] = (uint8_t)erase;
-    for (int i = 0; i < keep_s; i++) out->seq[n++] = (uint8_t)sat;
-    for (int i = a + e + s; i < z; i++) out->seq[n++] = seq[i];
-    out->len = n;
+    const int keep_s = s - cut_s;
+    const int tail = a + e + s;
+    return (trimmed_span_t){.keep_e = keep_e, .keep_s = keep_s, .tail_start = tail,
+                            .len = keep_e + keep_s + z - tail};
 }
 
 int e0470_waveform_trim(
     const EpdWaveformPhases* src, const e0470_trim_t* trim, uint8_t (*dst_data)[16][4]
 ) {
-    if (src == NULL || trim == NULL || dst_data == NULL) return 0;
-    if (src->phases <= 0 || src->phases > MAX_PHASES) return 0;
+    if (src == NULL || src->luts == NULL || trim == NULL || dst_data == NULL) return 0;
+    const int src_phases = src->phases;
+    if (src_phases <= 0 || src_phases > MAX_PHASES) return 0;
     if (trim->erase_max < 0 || trim->sat_cut < 0 || trim->white_sat_cut < 0 || trim->hold < 1) {
         return 0;
     }
 
     const uint8_t(*data)[16][4] = (const uint8_t(*)[16][4])src->luts;
-    static trimmed_seq_t seqs[16][16];
+    uint8_t seq[MAX_PHASES];
     int longest = 0;
 
+    // 先量长度并校验输出，再逐组重算；不常驻保存全部 256 条轨迹。
+    // Measure lengths and validate the output first, then recompute by group without retaining all 256 tracks.
     for (int to = 0; to < 16; to++) {
-        for (int from = 0; from < 16; from++) {
-            uint8_t seq[MAX_PHASES];
-            for (int f = 0; f < src->phases; f++) seq[f] = (uint8_t)lut_get(data, f, to, from);
-            trim_one(seq, src->phases, to, trim, &seqs[to][from]);
-            if (seqs[to][from].len > longest) longest = seqs[to][from].len;
+        for (int group = 0; group < 4; group++) {
+            for (int shift = 6; shift >= 0; shift -= 2) {
+                unpack_sequence(data, src_phases, to, group, shift, seq);
+                const int len = trim_one(seq, src_phases, to, trim).len;
+                if (len > longest) longest = len;
+            }
         }
     }
 
+    if (trim->hold > src_phases - longest) return 0;
     const int phases = longest + trim->hold;
-    if (phases > src->phases) return 0;  // 只允许变短，调用方按 src->phases 给的缓冲 / Shorter only; caller sized dst to src->phases
-
-    memset(dst_data, 0, (size_t)phases * 16 * 4);
     for (int to = 0; to < 16; to++) {
-        for (int from = 0; from < 16; from++) {
-            const trimmed_seq_t* t = &seqs[to][from];
-            const int start = longest - t->len;  // 右对齐到保持相之前 / Right-align before the hold phases
-            for (int i = 0; i < t->len; i++) lut_set(dst_data, start + i, to, from, t->seq[i]);
+        const int sat = to == 15 ? 2 : 1;
+        const int erase = to == 15 ? 1 : 2;
+        for (int group = 0; group < 4; group++) {
+            // 每组四条轨迹写成一个字节；读完该组再写，允许源和目标为同一张表。
+            // Pack four tracks into one byte; finish reading the group before writing, allowing in-place use.
+            uint8_t packed[MAX_PHASES] = {0};
+            for (int shift = 6; shift >= 0; shift -= 2) {
+                unpack_sequence(data, src_phases, to, group, shift, seq);
+                const trimmed_span_t t = trim_one(seq, src_phases, to, trim);
+                int f = longest - t.len;
+                for (int i = 0; i < t.keep_e; i++) packed[f++] |= (uint8_t)(erase << shift);
+                for (int i = 0; i < t.keep_s; i++) packed[f++] |= (uint8_t)(sat << shift);
+                for (int i = t.tail_start; f < longest; i++) packed[f++] |= (uint8_t)(seq[i] << shift);
+            }
+            for (int f = 0; f < phases; f++) dst_data[f][to][group] = packed[f];
         }
     }
     return phases;
