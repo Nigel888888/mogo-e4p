@@ -87,8 +87,8 @@ int main(void){
  assert(event(UI_GESTURE_RELEASE,15,30)==APP_REDRAW_NONE&&queries==before+1);
  ready=true;assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_view.loading);
  /* 存句动作扩句并写入好句集。/ Collect-sentence action expands and saves a quote. */
- size_t gc=0;const book_layout_glyph_t *gg=book_layout_glyphs(0,&gc);bool first=false;
- assert(dictionary_handle(gg,gc,360,660,&first));
+ ui_gesture_event_t quote_ev={.type=UI_GESTURE_TAP,.x0=360,.y0=660,.x=360,.y=660};bool quote_handled=false;
+ assert(dictionary_gesture(&ctx,&quote_ev,&quote_handled)==APP_REDRAW_PAGE);
  assert(s_quote_saved&&strstr(s_reader_notice,"好句集"));
  assert(event(UI_GESTURE_SWIPE_L,15,30)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);
  assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);
