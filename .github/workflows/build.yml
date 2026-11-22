@@ -83,11 +83,17 @@ jobs:
         if: always()
         shell: bash
         run: |
-          git config user.name  "workbuddy-ci"
-          git config user.email "workbuddy-ci@users.noreply.github.com"
-          git add -f build-log.txt || true
-          git commit -m "ci: capture build log" || true
-          git push origin HEAD:ci-build-log || true
+          # The log is already uploaded as an artifact; pushing it to a side
+          # branch is best-effort and must never fail an otherwise good build.
+          if git rev-parse --git-dir >/dev/null 2>&1; then
+            git config user.name  "workbuddy-ci" || true
+            git config user.email "workbuddy-ci@users.noreply.github.com" || true
+            git add -f build-log.txt || true
+            git commit -m "ci: capture build log" || true
+            git push origin HEAD:ci-build-log || true
+          else
+            echo "Not inside a git checkout; skipping build-log branch push."
+          fi
 
       - name: Prepare strict host compiler
         shell: bash
