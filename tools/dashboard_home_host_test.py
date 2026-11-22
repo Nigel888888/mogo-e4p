@@ -45,7 +45,7 @@ enum EpdFontFlags {EPD_DRAW_ALIGN_LEFT, EPD_DRAW_ALIGN_CENTER, EPD_DRAW_ALIGN_RI
 typedef enum {APP_REDRAW_NONE, APP_REDRAW_AREA, APP_REDRAW_PAGE, APP_REDRAW_FULL} app_redraw_t;
 typedef struct {int x,y,width,height;} EpdRect;
 typedef struct {bool touched;} touch_t;
-typedef struct {bool consumed;touch_t *touch;uint8_t *fb;void *hl;int64_t now_ms;void *request_app;} app_ctx_t;
+typedef struct {bool consumed;touch_t *touch;uint8_t *fb;void *hl;int64_t now_ms;void *request_app;bool request_menu;} app_ctx_t;
 enum {UI_GESTURE_PRESS, UI_GESTURE_MOVE, UI_GESTURE_TAP, UI_GESTURE_LONG_PRESS,
       UI_GESTURE_SWIPE_L, UI_GESTURE_SWIPE_R, UI_GESTURE_SWIPE_U, UI_GESTURE_CANCEL};
 typedef struct {int type,x0,y0,x,y;} ui_gesture_event_t;
