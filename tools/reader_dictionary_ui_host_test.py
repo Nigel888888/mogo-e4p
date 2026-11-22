@@ -40,7 +40,6 @@ static char s_reader_notice[128];static int64_t s_reader_notice_until;
 static int64_t esp_timer_get_time(void){return 0;}
 static bool s_quote_saved;
 bool book_quotes_save(const char *text,const char *book,uint32_t chapter){(void)text;(void)book;(void)chapter;s_quote_saved=true;return true;}
-bool reader_selection_expand_sentence(reader_selection_t *s,const char *text,size_t length,const book_layout_glyph_t *g,size_t count){(void)s;(void)text;(void)length;(void)g;(void)count;return true;}
 static int64_t s_dictionary_notice_until;
 static unsigned generation=1,queries,cancels,draws;static bool pending,ready,map_missing;
 static book_layout_glyph_t glyphs[]={{0,3,10,20,30,40},{3,3,40,20,30,40},{6,3,70,20,30,40},{9,3,100,20,30,40}};
