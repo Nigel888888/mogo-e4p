@@ -29,6 +29,18 @@ jobs:
         run: |
           . $IDF_PATH/export.sh
           idf.py --preview size
+      - name: Preserve firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mogo-vocabulary-firmware
+          path: |
+            build/Read_Pico.bin
+            build/Read_Pico.map
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/ota_data_initial.bin
+            build/flash_args
+          if-no-files-found: error
 
       - name: Prepare strict host compiler
         shell: bash
