@@ -94,7 +94,7 @@ int main(void){
  assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);
  assert(event(UI_GESTURE_TAP,15,30)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);
  /* 版式与存储变化会让已显示选区失效。/ Stale layout and USB changes dismiss the sheet. */
- ++generation;ready=true;assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_selection.active&&!pending);
+ ++generation;ready=true;assert(dictionary_tick(&ctx)==APP_REDRAW_NONE&&!s_dictionary_selection.active&&!pending);
  --generation;assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);storage=true;
  assert(dictionary_tick(&ctx)==APP_REDRAW_PAGE&&!s_dictionary_selection.active);storage=false;
  assert(event(UI_GESTURE_LONG_PRESS,15,30)==APP_REDRAW_PAGE);active_font="changed.ttf";
